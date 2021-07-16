@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"sort"
 
-	"github.com/kiali/kiali/kubernetes/monitoringdashboards/v1alpha1"
+	"github.com/kiali/kiali/config/dashboards"
 	"github.com/kiali/kiali/prometheus"
 )
 
@@ -15,6 +15,8 @@ type DashboardQuery struct {
 	LabelsFilters     map[string]string
 	AdditionalLabels  []Aggregation
 	RawDataAggregator string
+	Workload          string
+	WorkloadType      string
 }
 
 // FillDefaults fills the struct with default parameters
@@ -23,15 +25,17 @@ func (q *DashboardQuery) FillDefaults() {
 	q.RawDataAggregator = "sum"
 }
 
-// MonitoringDashboard is the model representing custom monitoring dashboard, transformed from MonitoringDashboard k8s resource
+// MonitoringDashboard is the model representing custom monitoring dashboard, transformed from MonitoringDashboard config resource
 type MonitoringDashboard struct {
+	Name          string         `json:"name"`
 	Title         string         `json:"title"`
 	Charts        []Chart        `json:"charts"`
 	Aggregations  []Aggregation  `json:"aggregations"`
 	ExternalLinks []ExternalLink `json:"externalLinks"`
+	Rows          int            `json:"rows"`
 }
 
-// Chart is the model representing a custom chart, transformed from charts in MonitoringDashboard k8s resource
+// Chart is the model representing a custom chart, transformed from charts in MonitoringDashboard config resource
 type Chart struct {
 	Name           string   `json:"name"`
 	Unit           string   `json:"unit"`
@@ -45,8 +49,8 @@ type Chart struct {
 	Error          string   `json:"error"`
 }
 
-// ConvertChart converts a k8s chart (from MonitoringDashboard k8s resource) into this models chart
-func ConvertChart(from v1alpha1.MonitoringDashboardChart) Chart {
+// ConvertChart converts a config chart (from MonitoringDashboard config resource) into this models chart
+func ConvertChart(from dashboards.MonitoringDashboardChart) Chart {
 	return Chart{
 		Name:           from.Name,
 		Unit:           from.Unit,
@@ -60,16 +64,16 @@ func ConvertChart(from v1alpha1.MonitoringDashboardChart) Chart {
 	}
 }
 
-// Aggregation is the model representing label's allowed aggregation, transformed from aggregation in MonitoringDashboard k8s resource
+// Aggregation is the model representing label's allowed aggregation, transformed from aggregation in MonitoringDashboard config resource
 type Aggregation struct {
 	Label           string `json:"label"`
 	DisplayName     string `json:"displayName"`
 	SingleSelection bool   `json:"singleSelection"`
 }
 
-// ConvertAggregations converts a k8s aggregations (from MonitoringDashboard k8s resource) into this models aggregations
+// ConvertAggregations converts a config aggregations (from MonitoringDashboard config resource) into this models aggregations
 // Results are sorted by DisplayName
-func ConvertAggregations(from v1alpha1.MonitoringDashboardSpec) []Aggregation {
+func ConvertAggregations(from dashboards.MonitoringDashboard) []Aggregation {
 	uniqueAggs := make(map[string]Aggregation)
 	for _, item := range from.Items {
 		for _, agg := range item.Chart.Aggregations {
@@ -88,9 +92,9 @@ func ConvertAggregations(from v1alpha1.MonitoringDashboardSpec) []Aggregation {
 
 // ExternalLink provides links to external dashboards (e.g. to Grafana)
 type ExternalLink struct {
-	URL       string                                            `json:"url"`
-	Name      string                                            `json:"name"`
-	Variables v1alpha1.MonitoringDashboardExternalLinkVariables `json:"variables"`
+	URL       string                                              `json:"url"`
+	Name      string                                              `json:"name"`
+	Variables dashboards.MonitoringDashboardExternalLinkVariables `json:"variables"`
 }
 
 // Runtime holds the runtime title and associated dashboard template(s)
@@ -149,9 +153,21 @@ func buildIstioAggregations(local, remote string) []Aggregation {
 
 // PrepareIstioDashboard prepares the Istio dashboard title and aggregations dynamically for input values
 func PrepareIstioDashboard(direction, local, remote string) MonitoringDashboard {
+	// Istio dashboards are predefined
+	// It uses two rows by default, columns are defined using the spans of the charts
 	return MonitoringDashboard{
 		Title:        fmt.Sprintf("%s Metrics", direction),
 		Aggregations: buildIstioAggregations(local, remote),
 		Charts:       []Chart{},
+		Rows:         2, // Rows layout used for Inbound Metrics and Outbound Metrics
 	}
+}
+
+func GetDashboardAnnotation(annotations map[string]string) map[string]string {
+	filtered := make(map[string]string)
+	// Parse only annotations used by Kiali
+	if da, ok := annotations[dashboards.DashboardTemplateAnnotation]; ok {
+		filtered[dashboards.DashboardTemplateAnnotation] = da
+	}
+	return filtered
 }
