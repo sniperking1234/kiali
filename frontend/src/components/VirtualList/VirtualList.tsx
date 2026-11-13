@@ -1,0 +1,362 @@
+import * as React from 'react';
+import type { IRow, ISortBy, OnSort, SortByDirection, ThProps } from '@patternfly/react-table';
+import { Caption, Table, TableGridBreakpoint, Tbody, Td, Th, Thead, Tr } from '@patternfly/react-table';
+import { HistoryManager, URLParam } from '../../app/History';
+import type { RenderResource, Resource, ResourceType } from './Config';
+import { config } from './Config';
+import { VirtualItem } from './VirtualItem';
+import { EmptyState, EmptyStateBody, EmptyStateVariant } from '@patternfly/react-core';
+import { CubesIcon, PlusCircleIcon, SearchIcon } from '@patternfly/react-icons';
+import type { KialiAppState } from '../../store/Store';
+import { activeNamespacesSelector, languageSelector } from '../../store/Selectors';
+import { connect } from 'react-redux';
+import type { Namespace } from '../../types/Namespace';
+import type { SortField } from '../../types/SortFilters';
+import type { NamespaceInfo } from '../../types/NamespaceInfo';
+import { currentSortField } from '../FilterList/FilterHelper';
+import { sortFields } from '../../pages/Namespaces/Sorts';
+import type { StatefulFiltersRef } from '../Filters/StatefulFilters';
+import { FilterSelected } from '../Filters/StatefulFilters';
+import { kialiStyle } from 'styles/StyleUtils';
+import type { SortableTh } from 'components/Table/SimpleTable';
+import { StickyTableScrollContainer } from 'components/Table/StickyTableScrollContainer';
+import { classes } from 'typestyle';
+import { ManualRefreshEmptyState } from 'components/Refresh/ManualRefreshEmptyState';
+import { t } from 'utils/I18nUtils';
+import { RefreshIntervalManual } from 'config/Config';
+import type { IntervalInMilliseconds } from 'types/Common';
+import { contrastContentNest } from 'styles/ThemeSurfaces';
+
+const emptyStyle = kialiStyle({
+  borderBottom: 0
+});
+
+const outerContainerStyle = kialiStyle({
+  display: 'flex',
+  flex: 1,
+  flexDirection: 'column',
+  minHeight: 0,
+  width: '100%'
+});
+
+const innerScrollContainerStyle = kialiStyle({
+  flex: 1,
+  overflow: 'auto',
+  paddingRight: '0.5rem',
+  $nest: {
+    '& td, & th': {
+      whiteSpace: 'nowrap'
+    }
+  }
+});
+
+const tableContrastStyle = kialiStyle({
+  $nest: contrastContentNest()
+});
+
+// ******************************
+// VirtualList and its associated classes are intended to be used for main list pages: Applications,
+// Workloads, Services and Istio Config. They share common style and filter integration. They have
+// have limitations in scenarios where different personalization is needed (columns style, or layout).
+// For a secondary list, rendered inside a detail page, it is recommended the imple be based on a
+// Table component, such as in WorkloadServices, WorkloadPods, ServiceInfoWorkload, IstioConfigSubList,
+// or TrafficListComponent.
+// ******************************
+
+type Direction = 'asc' | 'desc' | undefined;
+
+type ReduxProps = { activeNamespaces: Namespace[]; language: string };
+
+type VirtualListProps<R> = ReduxProps & {
+  actions?: JSX.Element[];
+  children?: React.ReactNode;
+  className?: any;
+  /** Optional column order (stable column ids: column name, case-insensitive). Used e.g. for namespaces list. */
+  columnOrder?: string[];
+  emptyState?: React.ReactNode;
+  /** Optional hidden column ids (stable column name, case-insensitive). */
+  hiddenColumns?: string[];
+  loaded?: boolean;
+  onResize?: (height: number) => void;
+  refreshInterval?: IntervalInMilliseconds;
+  rows: R[];
+  sort?: (sortField: SortField<NamespaceInfo>, isAscending: boolean) => void;
+  statefulProps?: StatefulFiltersRef;
+  type: string;
+};
+
+type VirtualListState<R extends RenderResource> = {
+  columns: ResourceType<R>[];
+  conf: Resource;
+  sortBy: {
+    direction: Direction;
+    index: number;
+  };
+};
+
+class VirtualListComponent<R extends RenderResource> extends React.Component<VirtualListProps<R>, VirtualListState<R>> {
+  private outerDivRef = React.createRef<HTMLDivElement>();
+  private resizeObserver: ResizeObserver | undefined;
+  private statefulFilters: StatefulFiltersRef = React.createRef();
+
+  constructor(props: VirtualListProps<R>) {
+    super(props);
+    const conf = config[props.type] as Resource;
+    const columns = this.getColumns(props.type);
+    let index = -1;
+    const sortParam = HistoryManager.getParam(URLParam.SORT);
+
+    if (sortParam) {
+      index = conf.columns.findIndex(column => column.param === sortParam);
+    }
+
+    this.state = {
+      sortBy: {
+        index,
+        direction: HistoryManager.getParam(URLParam.DIRECTION) as Direction
+      },
+      columns,
+      conf
+    };
+  }
+
+  private static getColumnId(column: { id?: string; name: string }): string {
+    return (column.id ?? column.name.toLowerCase()).toLowerCase();
+  }
+
+  onSort = (_event: React.MouseEvent, index: number, direction: SortByDirection): void => {
+    this.setState({
+      sortBy: {
+        index,
+        direction
+      }
+    });
+
+    if (direction) {
+      HistoryManager.setParam(URLParam.DIRECTION, direction);
+    }
+
+    HistoryManager.setParam(URLParam.SORT, String(this.state.columns[index].param));
+    this.props.sort && this.props.sort(currentSortField(sortFields), direction === 'asc');
+  };
+
+  componentDidMount(): void {
+    this.notifyResize();
+    if (this.outerDivRef.current && typeof ResizeObserver !== 'undefined') {
+      this.resizeObserver = new ResizeObserver(() => this.notifyResize());
+      this.resizeObserver.observe(this.outerDivRef.current);
+    } else {
+      window.addEventListener('resize', this.notifyResize);
+    }
+  }
+
+  componentWillUnmount(): void {
+    this.resizeObserver?.disconnect();
+    window.removeEventListener('resize', this.notifyResize);
+  }
+
+  componentDidUpdate(): void {
+    const columns = this.getColumns(this.props.type);
+    const prev = this.state.columns;
+    const lengthChanged = columns.length !== prev.length;
+    const orderChanged =
+      columns.length === prev.length && columns.some((col, i) => (prev[i] && col.title !== prev[i].title) || !prev[i]);
+    if (lengthChanged || orderChanged) {
+      this.setState({ columns });
+    }
+  }
+
+  render(): React.ReactNode {
+    const { rows } = this.props;
+    const { sortBy, columns, conf } = this.state;
+
+    const typeDisplay = this.props.type === 'istio' ? t('Istio Config') : this.props.type;
+
+    const childrenWithProps = React.Children.map(this.props.children, child => {
+      // Checking isValidElement is the safe way and avoids a TS error too.
+      if (React.isValidElement(child)) {
+        // If parent provides a ref to StatefulFilters, use it so row renderers (e.g. label click) can add/remove filters.
+        const refToUse = this.props.statefulProps ?? this.statefulFilters;
+        return React.cloneElement(child, { ref: refToUse } as React.Attributes);
+      }
+
+      return child;
+    });
+
+    const rowItems: IRow[] = rows.map((row, index) => {
+      return (
+        <VirtualItem
+          key={`vItem_${index}`}
+          item={row}
+          index={index}
+          columns={this.state.columns}
+          config={conf}
+          statefulFilterProps={this.props.statefulProps ? this.props.statefulProps : this.statefulFilters}
+          action={this.props.actions && this.props.actions[index] ? this.props.actions[index] : undefined}
+        />
+      );
+    });
+
+    const table = (
+      <Table
+        className={tableContrastStyle}
+        gridBreakPoint={TableGridBreakpoint.none}
+        role="presentation"
+        isStickyHeader
+      >
+        {conf.caption && <Caption>{conf.caption}</Caption>}
+        <Thead>
+          <Tr>
+            {columns.map((column, index) => {
+              const title = column.title ? t(column.title) : column.title;
+
+              return (
+                <Th
+                  key={`column_${index}`}
+                  dataLabel={title}
+                  info={column.info}
+                  sort={this.getSortParams(column, index, sortBy, this.onSort)}
+                  width={column.width}
+                  textCenter={column.textCenter}
+                >
+                  {title}
+                </Th>
+              );
+            })}
+          </Tr>
+        </Thead>
+
+        <Tbody>
+          {this.props.rows.length > 0 ? (
+            rowItems
+          ) : (
+            <Tr className={emptyStyle}>
+              <Td colSpan={columns.length}>{this.renderEmptyState(typeDisplay)}</Td>
+            </Tr>
+          )}
+        </Tbody>
+      </Table>
+    );
+
+    const isManualRefresh = this.props.refreshInterval === RefreshIntervalManual && !this.props.loaded;
+
+    return (
+      <div ref={this.outerDivRef} className={classes(outerContainerStyle, this.props.className)}>
+        {childrenWithProps}
+        {isManualRefresh ? (
+          <ManualRefreshEmptyState />
+        ) : (
+          <StickyTableScrollContainer className={innerScrollContainerStyle} contentVersion={this.props.rows.length}>
+            {table}
+          </StickyTableScrollContainer>
+        )}
+      </div>
+    );
+  }
+  private notifyResize = (): void => {
+    if (this.props.onResize && this.outerDivRef.current) {
+      this.props.onResize(this.outerDivRef.current.clientHeight);
+    }
+  };
+
+  private getColumns = (type: string): ResourceType<R>[] => {
+    let columns = [] as ResourceType<R>[];
+    const conf = config[type] as Resource;
+
+    if (conf.columns) {
+      const hiddenSet = this.props.hiddenColumns?.map(h => h.toLowerCase()) ?? [];
+      columns = conf.columns.filter(
+        info => hiddenSet.length === 0 || !hiddenSet.includes(VirtualListComponent.getColumnId(info))
+      );
+      if (this.props.columnOrder && this.props.columnOrder.length > 0) {
+        const orderMap = new Map(this.props.columnOrder.map((id, i) => [id.toLowerCase(), i]));
+        columns.sort((a, b) => {
+          const ai = orderMap.get(VirtualListComponent.getColumnId(a)) ?? Number.MAX_SAFE_INTEGER;
+          const bi = orderMap.get(VirtualListComponent.getColumnId(b)) ?? Number.MAX_SAFE_INTEGER;
+          return ai - bi;
+        });
+      }
+    }
+
+    if (this.props.actions) {
+      columns.push({
+        title: '',
+        name: '',
+        sortable: false
+      });
+    }
+
+    return columns;
+  };
+
+  private getSortParams = (
+    column: SortableTh,
+    index: number,
+    sortBy: ISortBy,
+    onSort: OnSort
+  ): ThProps['sort'] | undefined => {
+    return column.sortable
+      ? {
+          sortBy: sortBy,
+          onSort: onSort,
+          columnIndex: index
+        }
+      : undefined;
+  };
+
+  private renderEmptyState = (typeDisplay: string): React.ReactNode => {
+    // Custom empty state provided by parent
+    if (this.props.emptyState) {
+      return this.props.emptyState;
+    }
+
+    // No namespace selected
+    if (this.props.activeNamespaces.length === 0) {
+      return (
+        <EmptyState
+          headingLevel="h5"
+          icon={PlusCircleIcon}
+          titleText={t('No namespace is selected')}
+          variant={EmptyStateVariant.full}
+        >
+          <EmptyStateBody>{t('Select a namespace to view {{type}}.', { type: typeDisplay })}</EmptyStateBody>
+        </EmptyState>
+      );
+    }
+
+    // Filters applied but no results
+    if (FilterSelected.getSelected().filters.length > 0) {
+      return (
+        <EmptyState
+          headingLevel="h5"
+          icon={SearchIcon}
+          titleText={t('No {{type}} found', { type: typeDisplay })}
+          variant={EmptyStateVariant.full}
+        >
+          <EmptyStateBody>{t('No results match the filter criteria. Clear all filters and try again.')}</EmptyStateBody>
+        </EmptyState>
+      );
+    }
+
+    // No data in selected namespaces
+    return (
+      <EmptyState
+        headingLevel="h5"
+        icon={CubesIcon}
+        titleText={t('No {{type}} found', { type: typeDisplay })}
+        variant={EmptyStateVariant.full}
+      >
+        <EmptyStateBody>
+          {t('No {{type}} were found in the selected namespaces.', { type: typeDisplay })}
+        </EmptyStateBody>
+      </EmptyState>
+    );
+  };
+}
+
+const mapStateToProps = (state: KialiAppState): ReduxProps => ({
+  activeNamespaces: activeNamespacesSelector(state),
+  language: languageSelector(state)
+});
+
+export const VirtualList = connect(mapStateToProps)(VirtualListComponent);

@@ -1,0 +1,201 @@
+import * as React from 'react';
+import { kialiStyle } from 'styles/StyleUtils';
+import { keyframes } from 'typestyle';
+import { Edge } from '@patternfly/react-topology';
+
+export abstract class TrafficPointRenderer {
+  abstract render(
+    edge: Edge,
+    moveAnimation: string,
+    animationDelay: string,
+    onAnimationEnd?: React.AnimationEventHandler
+  ): React.SVGProps<SVGElement>;
+}
+
+export function getMoveAnimation(edge: Edge, percentVisible: number): string {
+  const startPoint = edge.getStartPoint();
+  const endPoint = edge.getEndPoint();
+  const moveAnimation = {};
+
+  if (edge.getBendpoints().length === 0) {
+    const moveX = endPoint.x - startPoint.x;
+    const moveY = endPoint.y - startPoint.y;
+
+    moveAnimation['0%'] = { opacity: 1, translate: '0' };
+    moveAnimation[`${percentVisible}%`] = {
+      opacity: 1,
+      translate: `${moveX}px ${moveY}px`
+    };
+    if (percentVisible < 100) {
+      moveAnimation[`${percentVisible}.1%`] = { opacity: 0 };
+      moveAnimation['100%'] = { opacity: 0 };
+    }
+  } else {
+    // a kiali edge can have at most 1 bendpoint, in the middle. see extendedBaseEdge.ts
+    const bendPoint = edge.getBendpoints()[0];
+    const moveBendX = bendPoint.x - startPoint.x;
+    const moveBendY = bendPoint.y - startPoint.y;
+    const moveEndX = endPoint.x - startPoint.x;
+    const moveEndY = endPoint.y - startPoint.y;
+    const bend = Math.round(percentVisible / 2);
+
+    moveAnimation['0%'] = { opacity: 1, translate: '0' };
+    moveAnimation[`${bend}%`] = { opacity: 1, translate: `${moveBendX}px ${moveBendY}px` };
+    moveAnimation[`${percentVisible}%`] = {
+      opacity: 1,
+      translate: `${moveEndX}px ${moveEndY}px`
+    };
+    if (percentVisible < 100) {
+      moveAnimation[`${percentVisible}.1%`] = { opacity: 0 };
+      moveAnimation['100%'] = { opacity: 0 };
+    }
+  }
+  return keyframes(moveAnimation);
+}
+
+export class TrafficPointCircleRenderer extends TrafficPointRenderer {
+  readonly animationDuration: string;
+  readonly backgroundColor: string;
+  readonly borderColor: string;
+  readonly percentVisible: number;
+  readonly radius: number;
+  readonly withOffsets: boolean;
+  private cachedStyleClass: string | undefined;
+  private cachedMoveAnimation: string | undefined;
+
+  constructor(
+    animationDuration: string,
+    backgroundColor: string,
+    borderColor: string,
+    percentVisible: number,
+    radius: number,
+    withOffsets: boolean
+  ) {
+    super();
+    this.animationDuration = animationDuration;
+    this.backgroundColor = backgroundColor;
+    this.borderColor = borderColor;
+    this.percentVisible = percentVisible;
+    this.radius = radius;
+    this.withOffsets = withOffsets;
+  }
+
+  private getStyle(moveAnimation: string): string {
+    if (this.cachedMoveAnimation === moveAnimation && this.cachedStyleClass) {
+      return this.cachedStyleClass;
+    }
+    this.cachedMoveAnimation = moveAnimation;
+    this.cachedStyleClass = kialiStyle({
+      animationDuration: this.animationDuration,
+      animationFillMode: 'forwards',
+      animationIterationCount: 'infinite',
+      animationName: moveAnimation,
+      animationTimingFunction: 'linear',
+      fill: this.backgroundColor,
+      opacity: 0,
+      stroke: this.borderColor
+    });
+    return this.cachedStyleClass;
+  }
+
+  render(
+    edge: Edge,
+    moveAnimation: string,
+    animationDelay: string,
+    onAnimationEnd?: React.AnimationEventHandler
+  ): React.SVGProps<SVGCircleElement> {
+    const startPoint = edge.getStartPoint();
+    // If requested, calculate offsets. The offset must be small to avoid more serious
+    // calculation that would ensure perpendicular distance from the edge. Instead, we
+    // just apply a [-2.5, 2.5] offset to both 'x' and 'y'
+    const offsetX = this.withOffsets ? Math.random() * 5 - 2.5 : 0;
+    const offsetY = this.withOffsets ? Math.random() * 5 - 2.5 : 0;
+
+    // use random # to ensure the key is not repeat, or it can be ignored by the render
+    const key = `point-circle-${Math.random()}`;
+    return (
+      <circle
+        id={key}
+        key={key}
+        className={this.getStyle(moveAnimation)}
+        style={{ animationDelay: animationDelay }}
+        cx={startPoint.x + offsetX}
+        cy={startPoint.y + offsetY}
+        r={`${this.radius}`}
+        onAnimationEnd={onAnimationEnd}
+      />
+    );
+  }
+}
+
+export class TrafficPointDiamondRenderer extends TrafficPointRenderer {
+  readonly animationDuration: string;
+  readonly backgroundColor: string;
+  readonly borderColor: string;
+  readonly percentVisible: number;
+  readonly radius: number;
+  private cachedStyleClass: string | undefined;
+  private cachedMoveAnimation: string | undefined;
+
+  constructor(
+    animationDuration: string,
+    backgroundColor: string,
+    borderColor: string,
+    percentVisible: number,
+    radius: number
+  ) {
+    super();
+    this.animationDuration = animationDuration;
+    this.backgroundColor = backgroundColor;
+    this.borderColor = borderColor;
+    this.percentVisible = percentVisible;
+    this.radius = radius;
+  }
+
+  private getStyle(moveAnimation: string): string {
+    if (this.cachedMoveAnimation === moveAnimation && this.cachedStyleClass) {
+      return this.cachedStyleClass;
+    }
+    this.cachedMoveAnimation = moveAnimation;
+    this.cachedStyleClass = kialiStyle({
+      animationDuration: this.animationDuration,
+      animationFillMode: 'forwards',
+      animationIterationCount: 'infinite',
+      animationName: moveAnimation,
+      animationTimingFunction: 'linear',
+      fill: this.backgroundColor,
+      opacity: 0,
+      rotate: '45deg',
+      stroke: this.borderColor,
+      strokeWidth: this.radius - 1,
+      transformBox: 'fill-box',
+      transformOrigin: 'center'
+    });
+    return this.cachedStyleClass;
+  }
+
+  render(
+    edge: Edge,
+    moveAnimation: string,
+    animationDelay: string,
+    onAnimationEnd?: React.AnimationEventHandler
+  ): React.SVGProps<SVGRectElement> {
+    const startPoint = edge.getStartPoint();
+
+    // use random # to ensure the key is not repeated, or it can be ignored by the render
+    const key = `point-rect-${Math.random()}}`;
+    return (
+      <rect
+        id={key}
+        key={key}
+        className={this.getStyle(moveAnimation)}
+        style={{ animationDelay: animationDelay }}
+        x={startPoint.x - this.radius}
+        y={startPoint.y - this.radius}
+        width={this.radius * 2 - 1}
+        height={this.radius * 2 - 1}
+        onAnimationEnd={onAnimationEnd}
+      />
+    );
+  }
+}

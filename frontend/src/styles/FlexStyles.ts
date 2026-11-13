@@ -1,0 +1,160 @@
+import { kialiStyle } from './StyleUtils';
+import { PFSpacer } from './PfSpacer';
+
+// Flex column that fills its parent. Tab content areas and similar
+// containers use this to participate in the page flex chain.
+export const flexFillStyle = kialiStyle({
+  display: 'flex',
+  flex: 1,
+  flexDirection: 'column',
+  minHeight: 0
+});
+
+// Propagates the flex chain through a PF Card and its CardBody so child
+// content (tables, dashboards, editors) gets a constrained height.
+export const flexCardStyle = kialiStyle({
+  display: 'flex',
+  flex: 1,
+  flexDirection: 'column',
+  minHeight: 0,
+  $nest: {
+    '& > .pf-v6-c-card__body': {
+      display: 'flex',
+      flex: 1,
+      flexDirection: 'column',
+      minHeight: 0
+    }
+  }
+});
+
+// Left panel column in detail pages (App/Service/Workload/Namespace info).
+// Scrolls vertically for the whole column and ensures each card body
+// scrolls horizontally when its content overflows.
+export const detailLeftColumnStyle = kialiStyle({
+  minHeight: 0,
+  overflowY: 'auto',
+  paddingRight: '0.5rem',
+  $nest: {
+    '& .pf-v6-c-card__body': {
+      overflowX: 'auto'
+    },
+    '& .pf-v6-c-card__body td, & .pf-v6-c-card__body th': {
+      whiteSpace: 'nowrap'
+    }
+  }
+});
+
+// Overrides the default min-height:auto on flex items so the element
+// constrains its children instead of growing to fit.
+export const constrainedScrollStyle = kialiStyle({
+  minHeight: 0
+});
+
+// Prevents a flex item from shrinking when sibling content grows.
+// Useful for toolbars, alerts, and other fixed-height chrome.
+export const noShrinkStyle = kialiStyle({
+  flexShrink: 0
+});
+
+// Dashboards + Actions buttons on detail page tab bars.
+export const detailTabActionsStyle = kialiStyle({
+  alignItems: 'center',
+  display: 'flex',
+  gap: PFSpacer.sm
+});
+
+// Top margin for Cards rendered inside tab content areas.
+export const tabCardStyle = kialiStyle({
+  marginTop: '1rem'
+});
+
+// Title row used in detail pages (App/Service/Workload/Namespace).
+// Contains the badge + title in a flex row.
+export const detailTitleRowStyle = kialiStyle({
+  alignItems: 'center',
+  display: 'flex',
+  flexWrap: 'nowrap',
+  gap: PFSpacer.md,
+  marginTop: '0.5rem',
+  minWidth: 0,
+  width: '100%'
+});
+
+// Main title content area inside the detail title row.
+export const detailTitleMainStyle = kialiStyle({
+  alignItems: 'center',
+  display: 'flex',
+  flex: '1 1 auto',
+  flexWrap: 'nowrap',
+  gap: PFSpacer.sm,
+  minWidth: 0
+});
+
+// Grid layout for info panels on detail pages.
+export const detailGridStyle = kialiStyle({
+  alignItems: 'stretch',
+  flex: 1,
+  marginTop: '1rem',
+  minHeight: 0
+});
+
+// Page title inside detail pages — removes default margin and prevents
+// the title from shrinking when the actions area grows.
+export const detailPageTitleStyle = kialiStyle({
+  margin: 0,
+  flexShrink: 0
+});
+
+// Right panel column in detail pages when it stacks content above the mini-graph.
+export const detailRightColumnStyle = kialiStyle({
+  display: 'flex',
+  flexDirection: 'column',
+  height: '100%',
+  minHeight: 0
+});
+
+export const detailRightStackStyle = kialiStyle({
+  display: 'flex',
+  flex: 1,
+  flexDirection: 'column',
+  gap: '0.5rem',
+  height: '100%',
+  minHeight: 0
+});
+
+export const detailMiniGraphStackItemStyle = kialiStyle({
+  display: 'flex',
+  flex: 1,
+  flexDirection: 'column',
+  minHeight: 0
+});
+
+// Stack gap used between cards in detail page left columns.
+export const detailCardStackStyle = kialiStyle({
+  gap: '0.5rem'
+});
+
+// Inline-flex row for icon + text combinations (health status, badges, etc.).
+export const inlineIconRowStyle = kialiStyle({
+  display: 'inline-flex',
+  alignItems: 'center',
+  gap: '0.25rem'
+});
+
+// Clickable inline-flex trigger for popovers and expandable elements.
+export const clickableInlineStyle = kialiStyle({
+  cursor: 'pointer',
+  display: 'inline-flex',
+  alignItems: 'center'
+});
+
+// Scrollable flex child for use inside a CardBody or similar container.
+// Must be a flex container itself so children with flex:1 are constrained
+// to the available height rather than growing with their content.
+export const scrollableContentStyle = kialiStyle({
+  display: 'flex',
+  flex: 1,
+  flexDirection: 'column',
+  minHeight: 0,
+  overflowY: 'auto'
+});

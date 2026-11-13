@@ -1,0 +1,120 @@
+import { Then, When } from '@badeball/cypress-cucumber-preprocessor';
+import { clusterParameterExists } from './navigation';
+
+const openTab = (tab: string): void => {
+  // Use force:true because the tab button may be reported as covered by its parent
+  // scroll container (.pf-v6-c-tabs__list) due to flexbox layout, but is still clickable
+  cy.contains('.pf-v6-c-tabs__list button', tab).should('be.visible').click({ force: true });
+};
+
+Then('sd::user sees a list with content {string}', (tab: string) => {
+  cy.get('.pf-v6-c-tabs__list').contains(tab);
+});
+
+Then('sd::user sees the service actions', () => {
+  // In OSSMC, the service actions toggle does not exist. Service actions are integrated in the minigraph menu
+  if (Cypress.env('OSSMC')) {
+    cy.intercept(`**/api/**/services/**/graph*`).as('serviceMinigraph');
+    cy.wait('@serviceMinigraph');
+
+    cy.waitForReact();
+
+    cy.get('button#minigraph-toggle').should('be.visible').click();
+  } else {
+    cy.get('button[data-test="service-actions-toggle"]').should('be.visible').click();
+  }
+
+  cy.getBySel('request_routing').contains('Request Routing');
+});
+
+Then('sd::user sees {string} details information for service {string}', (name: string, version: string) => {
+  cy.getBySel('service-resources-card').within(() => {
+    cy.get('#pfbadge-A').closest('li').contains(name); // App
+    cy.get('#pfbadge-W').closest('li').contains(`${name}-${version}`); // Workload
+  });
+
+  cy.getBySel('service-resources-card').within(() => {
+    clusterParameterExists(false);
+  });
+});
+
+Then('sd::user sees Network card', () => {
+  cy.get('#ServiceNetworkCard')
+    .scrollIntoView()
+    .within(() => {
+      cy.get('.pf-v6-c-card__body').contains('Service IP');
+      cy.get('.pf-v6-c-card__body').contains('Hostnames');
+    });
+});
+
+Then('sd::user sees Istio Config', () => {
+  cy.get('#IstioConfigCard')
+    .scrollIntoView()
+    .within(() => {
+      cy.get('#pfbadge-G').should('be.visible');
+      cy.get('#pfbadge-VS').should('be.visible');
+    });
+});
+
+Then('sd::user sees Resources card', () => {
+  cy.getBySel('service-resources-card').should('be.visible');
+});
+
+Then('sd::user sees Labels card', () => {
+  cy.getBySel('service-labels-card').scrollIntoView().should('be.visible');
+});
+
+Then('sd::user sees Annotations card', () => {
+  cy.getBySel('service-annotations-card').scrollIntoView().should('be.visible');
+});
+
+Then('sd::user sees inbound and outbound traffic information', () => {
+  openTab('Traffic');
+
+  cy.get('.pf-v6-c-card__body').within(() => {
+    cy.contains('Inbound Traffic');
+    cy.contains('No Inbound Traffic').should('not.exist');
+
+    cy.contains('Outbound Traffic');
+    cy.contains('No Outbound Traffic').should('not.exist');
+
+    cy.get('table.pf-v6-c-table.pf-m-grid-md').should('exist');
+    cy.contains('istio-ingressgateway');
+  });
+});
+
+Then('sd::user sees {string} graph', (graph: string) => {
+  openTab('Inbound Metrics');
+
+  cy.get('.pf-v6-l-grid__item').children().children().children().contains(graph);
+});
+
+Then('sd::user does not see No data message in the {string} graph', (graph: string) => {
+  openTab('Inbound Metrics');
+
+  cy.get('.pf-v6-l-grid__item')
+    .children()
+    .children()
+    .children()
+    .contains(graph)
+    .should('not.contain', 'No data available');
+});
+
+When('user chooses the {string} option', (title: string) => {
+  cy.wait('@waitForCall');
+
+  cy.get('#minigraph-toggle').click();
+
+  cy.contains(title).should('be.visible');
+  cy.contains(title).click();
+});
+
+Then('the graph type is disabled', () => {
+  cy.get('button#graph_type_dropdown-toggle').should('be.disabled');
+});
+
+Then('user sees {string} badge for service', (badge: string) => {
+  cy.getBySel('service-details-card').within(() => {
+    cy.get('.pf-v6-c-label__content').contains(badge);
+  });
+});

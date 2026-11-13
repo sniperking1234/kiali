@@ -4,32 +4,42 @@ package istio
 // Istio.go is responsible for generating TrafficMaps using Istio telemetry.  It implements the
 // TelemetryVendor interface.
 //
-// The algorithm is two-pass:
-//   First Pass: Query Prometheus (istio-requests-total metric) to retrieve the source-destination
-//               dependencies. Build a traffic map to provide a full representation of nodes and edges.
+// The algorithm:
+//   Step 1) For each namespace:
+//     a) Query Prometheus (istio-requests-total metric) to retrieve the source-destination
+//        dependencies. Build a traffic map to provide a full representation of nodes and edges.
 //
-//   Second Pass: Apply any requested appenders to alter or append to the graph.
+//     b) Apply any requested appenders to alter or append-to the namespace traffic-map.
 //
-// Supports two vendor-specific query parameters:
+//     c) Merge the namespace traffic-map into the final traffic-map
+//
+//   Step 2) For the global traffic map
+//     a) Apply standard and requested finalizers to alter or append-to the final traffic-map
+//
+//     b) Convert the final traffic-map to the requested vendor configuration (i.e. Common) and return
+//
+// Supports three vendor-specific query parameters:
 //   aggregate: Must be a valid metric attribute (default: request_operation)
-//   responseTimeQuantile: Must be a valid quantile (default: 0.95)
+//   responseTime: Must be one of: avg | 50 | 95 | 99
+//   throughputType: request | response (default: response)
 //
 import (
 	"context"
-	"crypto/md5"
+	"crypto/sha256"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
-	prom_v1 "github.com/prometheus/client_golang/api/prometheus/v1"
 	"github.com/prometheus/common/model"
 
+	"github.com/kiali/kiali/config"
 	"github.com/kiali/kiali/graph"
 	"github.com/kiali/kiali/graph/telemetry"
 	"github.com/kiali/kiali/graph/telemetry/istio/appender"
 	"github.com/kiali/kiali/graph/telemetry/istio/util"
 	"github.com/kiali/kiali/log"
-	"github.com/kiali/kiali/prometheus"
+	"github.com/kiali/kiali/observability"
 	"github.com/kiali/kiali/prometheus/internalmetrics"
 )
 
@@ -38,34 +48,69 @@ const (
 	tsHashMap graph.MetadataKey = "tsHashMap"
 )
 
-// BuildNamespacesTrafficMap is required by the graph/TelemtryVendor interface
-func BuildNamespacesTrafficMap(o graph.TelemetryOptions, client *prometheus.Client, globalInfo *graph.AppenderGlobalInfo) graph.TrafficMap {
-	log.Tracef("Build [%s] graph for [%d] namespaces [%v]", o.GraphType, len(o.Namespaces), o.Namespaces)
+type waypointMap = map[graph.NodeKey]bool
 
-	appenders := appender.ParseAppenders(o)
+var grpcMetric = regexp.MustCompile(`istio_.*_messages`)
+
+// BuildNamespacesTrafficMap is required by the graph/TelemetryVendor interface
+func BuildNamespacesTrafficMap(ctx context.Context, o graph.TelemetryOptions, globalInfo *appender.GlobalInfo) graph.TrafficMap {
+	ctx, end := observability.StartSpan(
+		ctx,
+		"BuildNamespacesTrafficMap",
+		observability.Attribute("package", "istio"),
+	)
+	defer end()
+
+	zl := log.FromContext(ctx)
+	zl.Trace().Msgf("Build [%s] graph for [%d] namespaces [%v]", o.GraphType, len(o.Namespaces), o.Namespaces)
+
+	appenders, finalizers := appender.ParseAppenders(o)
 	trafficMap := graph.NewTrafficMap()
 
-	for _, namespace := range o.Namespaces {
-		log.Tracef("Build traffic map for namespace [%v]", namespace)
-		namespaceTrafficMap := buildNamespaceTrafficMap(namespace.Name, o, client)
-		namespaceInfo := graph.NewAppenderNamespaceInfo(namespace.Name)
-		for _, a := range appenders {
-			appenderTimer := internalmetrics.GetGraphAppenderTimePrometheusTimer(a.Name())
-			a.AppendGraph(namespaceTrafficMap, globalInfo, namespaceInfo)
-			appenderTimer.ObserveDuration()
-		}
-		telemetry.MergeTrafficMaps(trafficMap, namespace.Name, namespaceTrafficMap)
+	if o.Rates.Ambient != "none" {
+		globalInfo.Vendor.AmbientWaypoints = GetWaypointMap(ctx, globalInfo)
 	}
 
-	// The appenders can add/remove/alter nodes. After the manipulations are complete
-	// we can make some final adjustments:
-	// - mark the outsiders (i.e. nodes not in the requested namespaces)
-	// - mark the insider traffic generators (i.e. inside the namespace and only outgoing edges)
-	telemetry.MarkOutsideOrInaccessible(trafficMap, o)
-	telemetry.MarkTrafficGenerators(trafficMap)
+	for _, namespaceInfo := range o.Namespaces {
+		zl.Trace().Msgf("Build traffic map for namespace [%v]", namespaceInfo)
+		namespaceTrafficMap := buildNamespaceTrafficMap(ctx, namespaceInfo, o, globalInfo)
+
+		// The appenders can add/remove/alter nodes for the namespace
+		appenderNamespaceInfo := appender.NewAppenderNamespaceInfo(namespaceInfo.Name)
+		for _, a := range appenders {
+			var appenderEnd observability.EndFunc
+			ctx, appenderEnd = observability.StartSpan(
+				ctx,
+				"Appender "+a.Name(),
+				observability.Attribute("package", "istio"),
+				observability.Attribute("namespace", namespaceInfo.Name),
+			)
+			appenderCtx := buildAppenderContext(ctx, a.Name())
+			appenderTimer := internalmetrics.GetGraphAppenderTimePrometheusTimer(a.Name())
+			a.AppendGraph(appenderCtx, namespaceTrafficMap, globalInfo, appenderNamespaceInfo)
+			internalmetrics.ObserveDurationAndLogResults(
+				appenderCtx,
+				globalInfo.Conf,
+				appenderTimer,
+				"GraphAppenderTime",
+				map[string]string{
+					"namespace": namespaceInfo.Name,
+				},
+				"Namespace graph appender time")
+			appenderEnd()
+		}
+
+		// Merge this namespace into the final TrafficMap
+		telemetry.MergeTrafficMaps(trafficMap, namespaceInfo.Name, namespaceTrafficMap)
+	}
+
+	// The finalizers can perform final manipulations on the complete graph
+	for _, f := range finalizers {
+		f.AppendGraph(buildAppenderContext(ctx, f.Name()), trafficMap, globalInfo, nil)
+	}
 
 	if graph.GraphTypeService == o.GraphType {
-		trafficMap = telemetry.ReduceToServiceGraph(trafficMap)
+		trafficMap = telemetry.ReduceToServiceGraph(ctx, trafficMap)
 	}
 
 	return trafficMap
@@ -73,89 +118,223 @@ func BuildNamespacesTrafficMap(o graph.TelemetryOptions, client *prometheus.Clie
 
 // buildNamespaceTrafficMap returns a map of all namespace nodes (key=id).  All
 // nodes either directly send and/or receive requests from a node in the namespace.
-func buildNamespaceTrafficMap(namespace string, o graph.TelemetryOptions, client *prometheus.Client) graph.TrafficMap {
+func buildNamespaceTrafficMap(ctx context.Context, namespaceInfo graph.NamespaceInfo, o graph.TelemetryOptions, globalInfo *appender.GlobalInfo) graph.TrafficMap {
+	namespace := namespaceInfo.Name
+	var end observability.EndFunc
+	ctx, end = observability.StartSpan(ctx, "buildNamespaceTrafficMap",
+		observability.Attribute("package", "istio"),
+		observability.Attribute("namespace", namespace),
+	)
+	defer end()
+
 	// create map to aggregate traffic by protocol and response code
 	trafficMap := graph.NewTrafficMap()
 	duration := o.Namespaces[namespace].Duration
-
-	// HTTP/GRPC traffic
-	metric := "istio_requests_total"
-	groupBy := "source_cluster,source_workload_namespace,source_workload,source_canonical_service,source_canonical_revision,destination_cluster,destination_service_namespace,destination_service,destination_service_name,destination_workload_namespace,destination_workload,destination_canonical_service,destination_canonical_revision,request_protocol,response_code,grpc_response_status,response_flags"
 	idleCondition := "> 0"
 	if o.IncludeIdleEdges {
 		idleCondition = ""
 	}
+	promApi := globalInfo.PromClient.API()
+	var query string
+	var trafficVector model.Vector
 
-	// 0) Incoming: query source telemetry to capture unserviced namespace services' incoming traffic
-	query := fmt.Sprintf(`sum(rate(%s{reporter="source",source_workload_namespace!="%s",destination_workload_namespace="unknown",destination_workload="unknown",destination_service=~"^.+\\.%s\\..+$"} [%vs])) by (%s) %s`,
-		metric,
-		namespace,
-		namespace,
-		int(duration.Seconds()), // range duration for the query
-		groupBy,
-		idleCondition)
-	incomingVector := promQuery(query, time.Unix(o.QueryTime, 0), client.API())
-	populateTrafficMap(trafficMap, &incomingVector, false, o)
+	// HTTP/GRPC request traffic
+	if o.Rates.Http == graph.RateRequests || o.Rates.Grpc == graph.RateRequests {
+		metric := "istio_requests_total"
+		groupBy := "source_cluster,source_workload_namespace,source_workload,source_canonical_service,source_canonical_revision,destination_cluster,destination_service_namespace,destination_service,destination_service_name,destination_workload_namespace,destination_workload,destination_canonical_service,destination_canonical_revision,request_protocol,response_code,grpc_response_status,response_flags"
 
-	// 1) Incoming: query destination telemetry to capture namespace services' incoming traffic
-	query = fmt.Sprintf(`sum(rate(%s{reporter="destination",destination_workload_namespace="%s"} [%vs])) by (%s) %s`,
-		metric,
-		namespace,
-		int(duration.Seconds()), // range duration for the query
-		groupBy,
-		idleCondition)
-	incomingVector = promQuery(query, time.Unix(o.QueryTime, 0), client.API())
-	populateTrafficMap(trafficMap, &incomingVector, false, o)
+		// 0) Incoming: query source telemetry to capture unserviced namespace services' incoming traffic (failed requests that never reach a dest)
+		query = fmt.Sprintf(`sum(rate(%s{%s,source_workload_namespace!="%s",destination_workload_namespace="unknown",destination_workload="unknown",destination_service=~"^.+\\.%s\\..+$"} [%vs])) by (%s) %s`,
+			metric,
+			util.GetReporter("source", o.Rates),
+			namespace,
+			namespace,
+			int(duration.Seconds()), // range duration for the query
+			groupBy,
+			idleCondition)
+		trafficVector = graph.PromQuery(ctx, query, time.Unix(o.QueryTime, 0), promApi, globalInfo.Conf)
+		populateTrafficMap(ctx, trafficMap, &trafficVector, metric, o, globalInfo)
 
-	// 2) Outgoing: query source telemetry to capture namespace workloads' outgoing traffic
-	query = fmt.Sprintf(`sum(rate(%s{reporter="source",source_workload_namespace="%s"} [%vs])) by (%s) %s`,
-		metric,
-		namespace,
-		int(duration.Seconds()), // range duration for the query
-		groupBy,
-		idleCondition)
-	outgoingVector := promQuery(query, time.Unix(o.QueryTime, 0), client.API())
-	populateTrafficMap(trafficMap, &outgoingVector, false, o)
+		// 1) Incoming: Ambient only: query source telemetry, typically from a non-waypoint ingress gateway, that will likely not have overlapping dest or waypoint telem for the traffic (that traffic will be picked up in query #2)
+		if namespaceInfo.IsAmbient {
+			query = fmt.Sprintf(`sum(rate(%s{reporter="source",source_workload_namespace!="%s",destination_workload_namespace="%s"} [%vs])) by (%s) %s`,
+				metric,
+				namespace,
+				namespace,
+				int(duration.Seconds()), // range duration for the query
+				groupBy,
+				idleCondition)
+			trafficVector = graph.PromQuery(ctx, query, time.Unix(o.QueryTime, 0), promApi, globalInfo.Conf)
+			populateTrafficMap(ctx, trafficMap, &trafficVector, metric, o, globalInfo)
+		}
 
-	// TCP traffic
-	metric = "istio_tcp_sent_bytes_total"
-	groupBy = "source_cluster,source_workload_namespace,source_workload,source_canonical_service,source_canonical_revision,destination_cluster,destination_service_namespace,destination_service,destination_service_name,destination_workload_namespace,destination_workload,destination_canonical_service,destination_canonical_revision,response_flags"
+		// 2) Incoming: query destination telemetry to capture namespace services' incoming traffic
+		query = fmt.Sprintf(`sum(rate(%s{%s,destination_workload_namespace="%s"} [%vs])) by (%s) %s`,
+			metric,
+			util.GetReporter("destination", o.Rates),
+			namespace,
+			int(duration.Seconds()), // range duration for the query
+			groupBy,
+			idleCondition)
+		trafficVector = graph.PromQuery(ctx, query, time.Unix(o.QueryTime, 0), promApi, globalInfo.Conf)
+		populateTrafficMap(ctx, trafficMap, &trafficVector, metric, o, globalInfo)
 
-	// 0) Incoming: query source telemetry to capture unserviced namespace services' incoming traffic
-	query = fmt.Sprintf(`sum(rate(%s{reporter="source",source_workload_namespace!="%s",destination_workload_namespace="unknown",destination_workload="unknown",destination_service=~"^.+\\.%s\\..+$"} [%vs])) by (%s) %s`,
-		metric,
-		namespace,
-		namespace,
-		int(duration.Seconds()), // range duration for the query
-		groupBy,
-		idleCondition)
-	incomingVector = promQuery(query, time.Unix(o.QueryTime, 0), client.API())
-	populateTrafficMap(trafficMap, &incomingVector, true, o)
+		// 3) Outgoing: query source telemetry to capture namespace workloads' outgoing traffic
+		query = fmt.Sprintf(`sum(rate(%s{%s,source_workload_namespace="%s"} [%vs])) by (%s) %s`,
+			metric,
+			util.GetReporter("source", o.Rates),
+			namespace,
+			int(duration.Seconds()), // range duration for the query
+			groupBy,
+			idleCondition)
+		trafficVector = graph.PromQuery(ctx, query, time.Unix(o.QueryTime, 0), promApi, globalInfo.Conf)
+		populateTrafficMap(ctx, trafficMap, &trafficVector, metric, o, globalInfo)
+	}
 
-	// 1) Incoming: query destination telemetry to capture namespace services' incoming traffic	query = fmt.Sprintf(`sum(rate(%s{reporter="destination",destination_service_namespace="%s"} [%vs])) by (%s) %s`,
-	query = fmt.Sprintf(`sum(rate(%s{reporter="destination",destination_workload_namespace="%s"} [%vs])) by (%s) %s`,
-		metric,
-		namespace,
-		int(duration.Seconds()), // range duration for the query
-		groupBy,
-		idleCondition)
-	incomingVector = promQuery(query, time.Unix(o.QueryTime, 0), client.API())
-	populateTrafficMap(trafficMap, &incomingVector, true, o)
+	// GRPC Message traffic
+	if o.Rates.Grpc != graph.RateNone && o.Rates.Grpc != graph.RateRequests {
+		var metrics []string
+		groupBy := "source_cluster,source_workload_namespace,source_workload,source_canonical_service,source_canonical_revision,destination_cluster,destination_service_namespace,destination_service,destination_service_name,destination_workload_namespace,destination_workload,destination_canonical_service,destination_canonical_revision"
 
-	// 2) Outgoing: query source telemetry to capture namespace workloads' outgoing traffic
-	query = fmt.Sprintf(`sum(rate(%s{reporter="source",source_workload_namespace="%s"} [%vs])) by (%s) %s`,
-		metric,
-		namespace,
-		int(duration.Seconds()), // range duration for the query
-		groupBy,
-		idleCondition)
-	outgoingVector = promQuery(query, time.Unix(o.QueryTime, 0), client.API())
-	populateTrafficMap(trafficMap, &outgoingVector, true, o)
+		switch o.Rates.Grpc {
+		case graph.RateReceived:
+			metrics = []string{"istio_response_messages_total"}
+		case graph.RateSent:
+			metrics = []string{"istio_request_messages_total"}
+		case graph.RateTotal:
+			metrics = []string{"istio_request_messages_total", "istio_response_messages_total"}
+		default:
+			metrics = []string{}
+		}
+
+		for _, metric := range metrics {
+			// 0) Incoming: query source telemetry to capture unserviced namespace services' incoming traffic
+			query = fmt.Sprintf(`sum(rate(%s{%s,source_workload_namespace!="%s",destination_workload_namespace="unknown",destination_workload="unknown",destination_service=~"^.+\\.%s\\..+$"} [%vs])) by (%s) %s`,
+				metric,
+				util.GetReporter("source", o.Rates),
+				namespace,
+				namespace,
+				int(duration.Seconds()), // range duration for the query
+				groupBy,
+				idleCondition)
+			trafficVector = graph.PromQuery(ctx, query, time.Unix(o.QueryTime, 0), promApi, globalInfo.Conf)
+			populateTrafficMap(ctx, trafficMap, &trafficVector, metric, o, globalInfo)
+
+			// 1) Incoming: Ambient only: query source telemetry, typically from a non-waypoint ingress gateway, that will likely not have overlapping dest or waypoint telem for the traffic (that traffic will be picked up in query #2)
+			if namespaceInfo.IsAmbient {
+				query = fmt.Sprintf(`sum(rate(%s{reporter="source",source_workload_namespace!="%s",destination_workload_namespace="%s"} [%vs])) by (%s) %s`,
+					metric,
+					namespace,
+					namespace,
+					int(duration.Seconds()), // range duration for the query
+					groupBy,
+					idleCondition)
+				trafficVector = graph.PromQuery(ctx, query, time.Unix(o.QueryTime, 0), promApi, globalInfo.Conf)
+				populateTrafficMap(ctx, trafficMap, &trafficVector, metric, o, globalInfo)
+			}
+
+			// 2) Incoming: query destination telemetry to capture namespace services' incoming traffic	query = fmt.Sprintf(`sum(rate(%s{reporter="destination",destination_service_namespace="%s"} [%vs])) by (%s) %s`,
+			query = fmt.Sprintf(`sum(rate(%s{%s,destination_workload_namespace="%s"} [%vs])) by (%s) %s`,
+				metric,
+				util.GetReporter("destination", o.Rates),
+				namespace,
+				int(duration.Seconds()), // range duration for the query
+				groupBy,
+				idleCondition)
+			trafficVector = graph.PromQuery(ctx, query, time.Unix(o.QueryTime, 0), promApi, globalInfo.Conf)
+			populateTrafficMap(ctx, trafficMap, &trafficVector, metric, o, globalInfo)
+
+			// 3) Outgoing: query source telemetry to capture namespace workloads' outgoing traffic
+			query = fmt.Sprintf(`sum(rate(%s{%s,source_workload_namespace="%s"} [%vs])) by (%s) %s`,
+				metric,
+				util.GetReporter("source", o.Rates),
+				namespace,
+				int(duration.Seconds()), // range duration for the query
+				groupBy,
+				idleCondition)
+			trafficVector = graph.PromQuery(ctx, query, time.Unix(o.QueryTime, 0), promApi, globalInfo.Conf)
+			populateTrafficMap(ctx, trafficMap, &trafficVector, metric, o, globalInfo)
+		}
+	}
+
+	// TCP Byte traffic
+	if o.Rates.Tcp != graph.RateNone {
+		var metrics []string
+		groupBy := "app,source_cluster,source_workload_namespace,source_workload,source_canonical_service,source_canonical_revision,destination_cluster,destination_service_namespace,destination_service,destination_service_name,destination_workload_namespace,destination_workload,destination_canonical_service,destination_canonical_revision,response_flags"
+
+		// L4 telemetry is backwards, see https://github.com/istio/istio/issues/32399
+		switch o.Rates.Tcp {
+		case graph.RateReceived:
+			metrics = []string{"istio_tcp_sent_bytes_total"}
+		case graph.RateSent:
+			metrics = []string{"istio_tcp_received_bytes_total"}
+		case graph.RateTotal:
+			metrics = []string{"istio_tcp_received_bytes_total", "istio_tcp_sent_bytes_total"}
+		default:
+			metrics = []string{}
+		}
+
+		for _, metric := range metrics {
+			// 0) Incoming: query source telemetry to capture unserviced namespace services' incoming traffic
+			query = fmt.Sprintf(`sum(rate(%s{%s%s,source_workload_namespace!="%s",destination_workload_namespace="unknown",destination_workload="unknown",destination_service=~"^.+\\.%s\\..+$"} [%vs])) by (%s) %s`,
+				metric,
+				util.GetApp(o.Rates),
+				util.GetReporter("source", o.Rates),
+				namespace,
+				namespace,
+				int(duration.Seconds()), // range duration for the query
+				groupBy,
+				idleCondition)
+			trafficVector = graph.PromQuery(ctx, query, time.Unix(o.QueryTime, 0), promApi, globalInfo.Conf)
+			populateTrafficMap(ctx, trafficMap, &trafficVector, metric, o, globalInfo)
+
+			// 1) Incoming: query destination telemetry to capture namespace services' incoming traffic	query = fmt.Sprintf(`sum(rate(%s{reporter="destination",destination_service_namespace="%s"} [%vs])) by (%s) %s`,
+			query = fmt.Sprintf(`sum(rate(%s{%s%s,destination_workload_namespace="%s"} [%vs])) by (%s) %s`,
+				metric,
+				util.GetApp(o.Rates),
+				util.GetReporter("destination", o.Rates),
+				namespace,
+				int(duration.Seconds()), // range duration for the query
+				groupBy,
+				idleCondition)
+			trafficVector = graph.PromQuery(ctx, query, time.Unix(o.QueryTime, 0), promApi, globalInfo.Conf)
+			populateTrafficMap(ctx, trafficMap, &trafficVector, metric, o, globalInfo)
+
+			// 2) Outgoing: query source telemetry to capture namespace workloads' outgoing traffic
+			query = fmt.Sprintf(`sum(rate(%s{%s%s,source_workload_namespace="%s"} [%vs])) by (%s) %s`,
+				metric,
+				util.GetApp(o.Rates),
+				util.GetReporter("source", o.Rates),
+				namespace,
+				int(duration.Seconds()), // range duration for the query
+				groupBy,
+				idleCondition)
+			trafficVector = graph.PromQuery(ctx, query, time.Unix(o.QueryTime, 0), promApi, globalInfo.Conf)
+			populateTrafficMap(ctx, trafficMap, &trafficVector, metric, o, globalInfo)
+		}
+	}
 
 	return trafficMap
 }
 
-func populateTrafficMap(trafficMap graph.TrafficMap, vector *model.Vector, isTCP bool, o graph.TelemetryOptions) {
+func populateTrafficMap(ctx context.Context, trafficMap graph.TrafficMap, vector *model.Vector, metric string, o graph.TelemetryOptions, globalInfo *appender.GlobalInfo) {
+	isRequests := true
+	protocol := ""
+	switch {
+	case grpcMetric.MatchString(metric):
+		isRequests = false
+		protocol = graph.GRPC.Name
+	case strings.HasPrefix(metric, "istio_tcp"):
+		isRequests = false
+		protocol = graph.TCP.Name
+	}
+	skipRequestsGrpc := isRequests && o.Rates.Grpc != graph.RateRequests
+	skipRequestsHttp := isRequests && o.Rates.Http != graph.RateRequests
+	wpKeySource := &graph.NodeKey{}
+	wpKeyDest := &graph.NodeKey{}
+
+	zl := log.FromContext(ctx)
+
 	for _, s := range *vector {
 		val := float64(s.Value)
 
@@ -174,9 +353,8 @@ func populateTrafficMap(trafficMap graph.TrafficMap, vector *model.Vector, isTCP
 		lDestApp, destAppOk := m["destination_canonical_service"]
 		lDestVer, destVerOk := m["destination_canonical_revision"]
 
-		lFlags, flagsOk := m["response_flags"]
-		if !sourceWlNsOk || !sourceWlOk || !sourceAppOk || !sourceVerOk || !destSvcNsOk || !destSvcOk || !destSvcNameOk || !destWlNsOk || !destWlOk || !destAppOk || !destVerOk || !flagsOk {
-			log.Warningf("Skipping %s, missing expected TS labels", m.String())
+		if !sourceWlNsOk || !sourceWlOk || !sourceAppOk || !sourceVerOk || !destSvcNsOk || !destSvcOk || !destSvcNameOk || !destWlNsOk || !destWlOk || !destAppOk || !destVerOk {
+			zl.Warn().Msgf("Skipping %s, missing expected TS labels", m.String())
 			continue
 		}
 
@@ -185,7 +363,16 @@ func populateTrafficMap(trafficMap graph.TrafficMap, vector *model.Vector, isTCP
 		sourceApp := string(lSourceApp)
 		sourceVer := string(lSourceVer)
 		destSvc := string(lDestSvc)
-		flags := string(lFlags)
+
+		flags := ""
+		if isRequests || protocol == graph.TCP.Name {
+			lFlags, flagsOk := m["response_flags"]
+			if !flagsOk {
+				zl.Warn().Msgf("Skipping %s, missing expected TS label [flags]", m.String())
+				continue
+			}
+			flags = string(lFlags)
+		}
 
 		// handle clusters
 		sourceCluster, destCluster := util.HandleClusters(lSourceCluster, sourceClusterOk, lDestCluster, destClusterOk)
@@ -195,25 +382,27 @@ func populateTrafficMap(trafficMap graph.TrafficMap, vector *model.Vector, isTCP
 		}
 
 		// handle unusual destinations
-		destCluster, destSvcNs, destSvcName, destWlNs, destWl, destApp, destVer, _ := util.HandleDestination(sourceCluster, sourceWlNs, sourceWl, destCluster, string(lDestSvcNs), string(lDestSvc), string(lDestSvcName), string(lDestWlNs), string(lDestWl), string(lDestApp), string(lDestVer))
+		destCluster, destSvcNs, destSvcName, destWlNs, destWl, destApp, destVer, _ := util.HandleDestination(sourceCluster, sourceWlNs, sourceWl, destCluster, string(lDestSvcNs), string(lDestSvc), string(lDestSvcName), string(lDestWlNs), string(lDestWl), string(lDestApp), string(lDestVer), globalInfo.Conf)
 
 		if util.IsBadDestTelemetry(destCluster, destClusterOk, destSvcNs, destSvc, destSvcName, destWl) {
 			continue
 		}
 
 		var code string
-		protocol := "tcp"
-		if !isTCP {
+		if isRequests {
 			lProtocol, protocolOk := m["request_protocol"]
 			lCode, codeOk := m["response_code"]
 			lGrpc, grpcOk := m["grpc_response_status"]
 
 			if !protocolOk || !codeOk {
-				log.Warningf("Skipping %s, missing expected HTTP/GRPC TS labels", m.String())
+				zl.Warn().Msgf("Skipping %s, missing expected HTTP/GRPC TS labels", m.String())
 				continue
 			}
 
 			protocol = string(lProtocol)
+			if skipRequestsGrpc && protocol == graph.GRPC.Name || skipRequestsHttp && protocol == graph.HTTP.Name {
+				continue
+			}
 
 			// set response code in a backward compatible way
 			code = util.HandleResponseCode(protocol, string(lCode), grpcOk, string(lGrpc))
@@ -222,45 +411,89 @@ func populateTrafficMap(trafficMap graph.TrafficMap, vector *model.Vector, isTCP
 		// make code more readable by setting "host" because "destSvc" holds destination.service.host | request.host | "unknown"
 		host := destSvc
 
-		// don't inject a service node if destSvcName is not set or the dest node is already a service node.
-		inject := false
-		if o.InjectServiceNodes && graph.IsOK(destSvcName) {
-			_, destNodeType := graph.Id(destCluster, destSvcNs, destSvcName, destWlNs, destWl, destApp, destVer, o.GraphType)
-			inject = (graph.NodeTypeService != destNodeType)
+		// don't inject a service node if any of:
+		// - destSvcName is not set
+		// - destSvcName is PassthroughCluster (see https://github.com/kiali/kiali/issues/4488)
+		// - dest node is already a service node
+		// - source or dest workload is an ambient waypoint
+		var inject, sourceIsWaypoint, destIsWaypoint bool
+		if o.Rates.Ambient != "none" {
+			sourceIsWaypoint, destIsWaypoint = hasWaypoint(setWaypointKey(wpKeySource, sourceCluster, sourceWlNs, sourceWl), setWaypointKey(wpKeyDest, destCluster, destWlNs, destWl), globalInfo)
 		}
-		addTraffic(trafficMap, inject, val, protocol, code, flags, host, sourceCluster, sourceWlNs, "", sourceWl, sourceApp, sourceVer, destCluster, destSvcNs, destSvcName, destWlNs, destWl, destApp, destVer, o)
+
+		if o.InjectServiceNodes && graph.IsOK(destSvcName) && destSvcName != graph.PassthroughCluster {
+			_, destNodeType, err := graph.Id(destCluster, destSvcNs, destSvcName, destWlNs, destWl, destApp, destVer, o.GraphType)
+			if err != nil {
+				zl.Warn().Msgf("Skipping %s, %s", m.String(), err)
+				continue
+			}
+			inject = (graph.NodeTypeService != destNodeType) && !sourceIsWaypoint && !destIsWaypoint
+		}
+		addTraffic(ctx, trafficMap, metric, inject, val, protocol, code, flags, host, sourceCluster, sourceWlNs, "", sourceWl, sourceApp, sourceVer, destCluster, destSvcNs, destSvcName, destWlNs, destWl, destApp, destVer, sourceIsWaypoint, destIsWaypoint, o)
 	}
 }
 
-func addTraffic(trafficMap graph.TrafficMap, inject bool, val float64, protocol, code, flags, host, sourceCluster, sourceNs, sourceSvc, sourceWl, sourceApp, sourceVer, destCluster, destSvcNs, destSvcName, destWlNs, destWl, destApp, destVer string, o graph.TelemetryOptions) {
-	source, _ := addNode(trafficMap, sourceCluster, sourceNs, sourceSvc, sourceNs, sourceWl, sourceApp, sourceVer, o)
-	dest, _ := addNode(trafficMap, destCluster, destSvcNs, destSvcName, destWlNs, destWl, destApp, destVer, o)
+func addTraffic(ctx context.Context, trafficMap graph.TrafficMap, metric string, inject bool, val float64, protocol, code, flags, host, sourceCluster, sourceNs, sourceSvc, sourceWl, sourceApp, sourceVer, destCluster, destSvcNs, destSvcName, destWlNs, destWl, destApp, destVer string, sourceIsWaypoint, destIsWaypoint bool, o graph.TelemetryOptions) {
+	zl := log.FromContext(ctx)
+
+	// waypoints are not apps, force it to be a workload regardless of graph type
+	if sourceIsWaypoint {
+		sourceApp = ""
+	}
+	source, _, err := addNode(trafficMap, sourceCluster, sourceNs, sourceSvc, sourceNs, sourceWl, sourceApp, sourceVer, o)
+	if err != nil {
+		zl.Warn().Msgf("Skipping addTraffic (source), %s", err)
+		return
+	}
+	if destIsWaypoint {
+		destApp = ""
+	}
+	dest, _, err := addNode(trafficMap, destCluster, destSvcNs, destSvcName, destWlNs, destWl, destApp, destVer, o)
+	if err != nil {
+		zl.Warn().Msgf("Skipping addTraffic (dest), %s", err)
+		return
+	}
+
+	if sourceIsWaypoint {
+		source.Metadata[graph.IsWaypoint] = true
+	}
+	if destIsWaypoint {
+		dest.Metadata[graph.IsWaypoint] = true
+	}
 
 	// Istio can generate duplicate metrics by reporting from both the source and destination proxies. To avoid
 	// processing the same information twice we keep track of the time series applied to a particular edge. The
 	// edgeTSHash incorporates information about the time series' source, destination and metric information,
 	// and uses that unique TS has to protect against applying the same intomation twice.
-	edgeTSHash := fmt.Sprintf("%x", md5.Sum([]byte(fmt.Sprintf("%s:%s:%s:%s:%s", source.Metadata[tsHash], dest.Metadata[tsHash], code, flags, host))))
+	edgeTSHash := fmt.Sprintf("%x", sha256.Sum256([]byte(strings.Join([]string{metric, source.Metadata[tsHash].(string), dest.Metadata[tsHash].(string), code, flags, host}, ":"))))
 
 	if inject {
-		injectedService, _ := addNode(trafficMap, destCluster, destSvcNs, destSvcName, "", "", "", "", o)
-		if addEdgeTraffic(trafficMap, val, protocol, code, flags, host, source, injectedService, edgeTSHash, o) {
+		injectedService, _, err := addNode(trafficMap, destCluster, destSvcNs, destSvcName, "", "", "", "", o)
+		if err != nil {
+			zl.Warn().Msgf("Skipping addTraffic (inject), %s", err)
+			return
+		}
+		injectedService.Metadata[graph.IsInjected] = true
+		if addEdgeTraffic(val, protocol, code, flags, host, source, injectedService, edgeTSHash) {
 			addToDestServices(injectedService.Metadata, destCluster, destSvcNs, destSvcName)
 
-			addEdgeTraffic(trafficMap, val, protocol, code, flags, host, injectedService, dest, edgeTSHash, o)
-			addToDestServices(dest.Metadata, destCluster, destSvcNs, destSvcName)
+			addEdgeTraffic(val, protocol, code, flags, host, injectedService, dest, edgeTSHash)
+			if !destIsWaypoint {
+				addToDestServices(dest.Metadata, destCluster, destSvcNs, destSvcName)
+			}
 		}
 	} else {
-		if addEdgeTraffic(trafficMap, val, protocol, code, flags, host, source, dest, edgeTSHash, o) {
-			addToDestServices(dest.Metadata, destCluster, destSvcNs, destSvcName)
+		if addEdgeTraffic(val, protocol, code, flags, host, source, dest, edgeTSHash) {
+			if !destIsWaypoint {
+				addToDestServices(dest.Metadata, destCluster, destSvcNs, destSvcName)
+			}
 		}
 	}
 }
 
 // addEdgeTraffic uses edgeTSHash that the metric information has not been applied to the edge. Returns true
 // if the the metric information is applied, false if it determined to be a duplicate.
-func addEdgeTraffic(trafficMap graph.TrafficMap, val float64, protocol, code, flags, host string, source, dest *graph.Node, edgeTSHash string, o graph.TelemetryOptions) bool {
-
+func addEdgeTraffic(val float64, protocol, code, flags, host string, source, dest *graph.Node, edgeTSHash string) bool {
 	var edge *graph.Edge
 	for _, e := range source.Edges {
 		if dest.ID == e.Dest.ID && e.Metadata[graph.ProtocolKey] == protocol {
@@ -296,8 +529,11 @@ func addToDestServices(md graph.Metadata, cluster, namespace, service string) {
 	destServices.(graph.DestServicesMetadata)[destService.Key()] = destService
 }
 
-func addNode(trafficMap graph.TrafficMap, cluster, serviceNs, service, workloadNs, workload, app, version string, o graph.TelemetryOptions) (*graph.Node, bool) {
-	id, nodeType := graph.Id(cluster, serviceNs, service, workloadNs, workload, app, version, o.GraphType)
+func addNode(trafficMap graph.TrafficMap, cluster, serviceNs, service, workloadNs, workload, app, version string, o graph.TelemetryOptions) (*graph.Node, bool, error) {
+	id, nodeType, err := graph.Id(cluster, serviceNs, service, workloadNs, workload, app, version, o.GraphType)
+	if err != nil {
+		return nil, false, err
+	}
 	node, found := trafficMap[id]
 	if !found {
 		namespace := workloadNs
@@ -305,320 +541,531 @@ func addNode(trafficMap graph.TrafficMap, cluster, serviceNs, service, workloadN
 			namespace = serviceNs
 		}
 		newNode := graph.NewNodeExplicit(id, cluster, namespace, workload, app, version, service, nodeType, o.GraphType)
-		node = &newNode
+		node = newNode
 		trafficMap[id] = node
 	}
 	node.Metadata["tsHash"] = timeSeriesHash(cluster, serviceNs, service, workloadNs, workload, app, version)
-	return node, found
+	return node, found, nil
 }
 
 func timeSeriesHash(cluster, serviceNs, service, workloadNs, workload, app, version string) string {
-	return fmt.Sprintf("%x", md5.Sum([]byte(fmt.Sprintf("%s:%s:%s:%s:%s:%s:%s", cluster, serviceNs, service, workloadNs, workload, app, version))))
+	return fmt.Sprintf("%x", sha256.Sum256([]byte(strings.Join([]string{cluster, serviceNs, service, workloadNs, workload, app, version}, ":"))))
 }
 
 // BuildNodeTrafficMap is required by the graph/TelemtryVendor interface
-func BuildNodeTrafficMap(o graph.TelemetryOptions, client *prometheus.Client, globalInfo *graph.AppenderGlobalInfo) graph.TrafficMap {
-	if o.NodeOptions.Aggregate != "" {
-		return handleAggregateNodeTrafficMap(o, client, globalInfo)
+func BuildNodeTrafficMap(ctx context.Context, o graph.TelemetryOptions, globalInfo *appender.GlobalInfo) (graph.TrafficMap, error) {
+	// TODO: Node Map not supported yet.
+	if globalInfo.Conf.RunMode == config.RunModeOffline {
+		return graph.TrafficMap{}, nil
 	}
 
-	n := graph.NewNode(o.NodeOptions.Cluster, o.NodeOptions.Namespace, o.NodeOptions.Service, o.NodeOptions.Namespace, o.NodeOptions.Workload, o.NodeOptions.App, o.NodeOptions.Version, o.GraphType)
+	namespace := o.Namespace.Name
+	if o.Aggregate != "" {
+		return handleAggregateNodeTrafficMap(ctx, o, globalInfo), nil
+	}
 
-	log.Tracef("Build graph for node [%+v]", n)
+	zl := log.FromContext(ctx)
 
-	appenders := appender.ParseAppenders(o)
-	trafficMap := buildNodeTrafficMap(o.Cluster, o.NodeOptions.Namespace, n, o, client)
+	n, err := graph.NewNode(o.Cluster, namespace, o.Service, namespace, o.Workload, o.App, o.Version, o.GraphType)
+	if err != nil {
+		zl.Warn().Msgf("Skipping NodeTrafficMap (bad node), %s", err)
+		return nil, err
+	}
 
-	namespaceInfo := graph.NewAppenderNamespaceInfo(o.NodeOptions.Namespace)
+	zl.Trace().Msgf("Build graph for node [%+v]", n)
+
+	appenders, finalizers := appender.ParseAppenders(o)
+
+	if o.Rates.Ambient != "none" {
+		globalInfo.Vendor.AmbientWaypoints = GetWaypointMap(ctx, globalInfo)
+	}
+
+	trafficMap := buildNodeTrafficMap(ctx, o.Cluster, o.Namespace, n, o, globalInfo)
+
+	namespaceInfo := appender.NewAppenderNamespaceInfo(o.Namespace.Name)
 
 	for _, a := range appenders {
+		appenderCtx := buildAppenderContext(ctx, a.Name())
 		appenderTimer := internalmetrics.GetGraphAppenderTimePrometheusTimer(a.Name())
-		a.AppendGraph(trafficMap, globalInfo, namespaceInfo)
-		appenderTimer.ObserveDuration()
+		a.AppendGraph(appenderCtx, trafficMap, globalInfo, namespaceInfo)
+		internalmetrics.ObserveDurationAndLogResults(
+			appenderCtx,
+			globalInfo.Conf,
+			appenderTimer,
+			"GraphAppenderTime",
+			map[string]string{
+				"namespace": namespaceInfo.Namespace,
+			},
+			"Node graph appender time")
 	}
 
-	// The appenders can add/remove/alter nodes. After the manipulations are complete
-	// we can make some final adjustments:
-	// - mark the outsiders (i.e. nodes not in the requested namespaces)
-	// - mark the traffic generators
-	telemetry.MarkOutsideOrInaccessible(trafficMap, o)
-	telemetry.MarkTrafficGenerators(trafficMap)
+	// The finalizers can perform final manipulations on the complete graph
+	for _, f := range finalizers {
+		f.AppendGraph(buildAppenderContext(ctx, f.Name()), trafficMap, globalInfo, nil)
+	}
 
 	// Note that this is where we would call reduceToServiceGraph for graphTypeService but
 	// the current decision is to not reduce the node graph to provide more detail.  This may be
 	// confusing to users, we'll see...
 
-	return trafficMap
+	return trafficMap, nil
 }
 
 // buildNodeTrafficMap returns a map of all nodes requesting or requested by the target node (key=id). Node graphs
 // are from the perspective of the node, as such we use destination telemetry for incoming traffic and source telemetry
 // for outgoing traffic.
-func buildNodeTrafficMap(cluster, namespace string, n graph.Node, o graph.TelemetryOptions, client *prometheus.Client) graph.TrafficMap {
-	duration := o.Namespaces[namespace].Duration
-
-	// create map to aggregate traffic by response code
+func buildNodeTrafficMap(ctx context.Context, cluster string, namespaceInfo graph.NamespaceInfo, n *graph.Node, o graph.TelemetryOptions, globalInfo *appender.GlobalInfo) graph.TrafficMap {
+	// create map to aggregate traffic by protocol and response code
+	namespace := namespaceInfo.Name
 	trafficMap := graph.NewTrafficMap()
-
-	// only narrow by cluster if it is set on the target node
-	var sourceCluster, destCluster string
-	if cluster != graph.Unknown {
-		sourceCluster = fmt.Sprintf(",source_cluster=%s", cluster)
-		destCluster = fmt.Sprintf(",destination_cluster=%s", cluster)
-	}
-
-	// HTTP/GRPC Traffic
-	metric := "istio_requests_total"
-	groupBy := "source_cluster,source_workload_namespace,source_workload,source_canonical_service,source_canonical_revision,destination_cluster,destination_service_namespace,destination_service,destination_service_name,destination_workload_namespace,destination_workload,destination_canonical_service,destination_canonical_revision,request_protocol,response_code,grpc_response_status,response_flags"
+	duration := o.Namespaces[namespace].Duration
 	idleCondition := "> 0"
 	if o.IncludeIdleEdges {
 		idleCondition = ""
 	}
-
-	// query prometheus for request traffic in two queries:
-	// 1) query for incoming traffic
+	promApi := globalInfo.PromClient.API()
 	var query string
-	switch n.NodeType {
-	case graph.NodeTypeWorkload:
-		query = fmt.Sprintf(`sum(rate(%s{reporter="destination"%s,destination_workload_namespace="%s",destination_workload="%s"} [%vs])) by (%s) %s`,
-			metric,
-			destCluster,
-			namespace,
-			n.Workload,
-			int(duration.Seconds()), // range duration for the query
-			groupBy,
-			idleCondition)
-	case graph.NodeTypeApp:
-		if graph.IsOK(n.Version) {
-			query = fmt.Sprintf(`sum(rate(%s{reporter="destination"%s,destination_service_namespace="%s",destination_canonical_service="%s",destination_canonical_revision="%s"} [%vs])) by (%s) %s`,
+	var trafficVector model.Vector
+
+	// only narrow by cluster if it is set on the target node
+	var sourceCluster, destCluster string
+	if cluster != graph.Unknown {
+		sourceCluster = fmt.Sprintf(`,source_cluster="%s"`, cluster)
+		destCluster = fmt.Sprintf(`,destination_cluster="%s"`, cluster)
+	}
+
+	// HTTP/GRPC Traffic
+	if o.Rates.Http == graph.RateRequests || o.Rates.Grpc == graph.RateRequests {
+		metric := "istio_requests_total"
+		groupBy := "source_cluster,source_workload_namespace,source_workload,source_canonical_service,source_canonical_revision,destination_cluster,destination_service_namespace,destination_service,destination_service_name,destination_workload_namespace,destination_workload,destination_canonical_service,destination_canonical_revision,request_protocol,response_code,grpc_response_status,response_flags"
+
+		// query prometheus for request traffic in two parts:
+		// 1) query for incoming traffic
+		//    for ambient namespaces query source and dest, incoming gateway traffic is source-reported, and no destination proxy is reporting
+		var reporter string
+		if namespaceInfo.IsAmbient {
+			reporter = util.GetReporter("source|destination", o.Rates)
+		} else {
+			reporter = util.GetReporter("destination", o.Rates)
+		}
+		switch n.NodeType {
+		case graph.NodeTypeWorkload:
+			query = fmt.Sprintf(`sum(rate(%s{%s%s,destination_workload_namespace="%s",destination_workload="%s"} [%vs])) by (%s) %s`,
 				metric,
+				reporter,
 				destCluster,
 				namespace,
-				n.App,
-				n.Version,
+				n.Workload,
 				int(duration.Seconds()), // range duration for the query
 				groupBy,
 				idleCondition)
-		} else {
-			query = fmt.Sprintf(`sum(rate(%s{reporter="destination"%s,destination_service_namespace="%s",destination_canonical_service="%s"} [%vs])) by (%s) %s`,
+		case graph.NodeTypeApp:
+			if graph.IsOK(n.Version) {
+				query = fmt.Sprintf(`sum(rate(%s{%s%s,destination_service_namespace="%s",destination_canonical_service="%s",destination_canonical_revision="%s"} [%vs])) by (%s) %s`,
+					metric,
+					reporter,
+					destCluster,
+					namespace,
+					n.App,
+					n.Version,
+					int(duration.Seconds()), // range duration for the query
+					groupBy,
+					idleCondition)
+			} else {
+				query = fmt.Sprintf(`sum(rate(%s{%s%s,destination_service_namespace="%s",destination_canonical_service="%s"} [%vs])) by (%s) %s`,
+					metric,
+					reporter,
+					destCluster,
+					namespace,
+					n.App,
+					int(duration.Seconds()), // range duration for the query
+					groupBy,
+					idleCondition)
+			}
+		case graph.NodeTypeService:
+			// Service nodes require two queries for incoming
+			// 1.a) query source telemetry for requests to the service that could not be serviced
+			query = fmt.Sprintf(`sum(rate(%s{%s%s,destination_workload="unknown",destination_service=~"^%s\\.%s\\..*$"} [%vs])) by (%s) %s`,
 				metric,
+				util.GetReporter("source", o.Rates),
+				destCluster,
+				n.Service,
+				namespace,
+				int(duration.Seconds()), // range duration for the query
+				groupBy,
+				idleCondition)
+			trafficVector = graph.PromQuery(ctx, query, time.Unix(o.QueryTime, 0), promApi, globalInfo.Conf)
+			populateTrafficMap(ctx, trafficMap, &trafficVector, metric, o, globalInfo)
+
+			// 1.b) query dest telemetry for requests to the service, serviced by service workloads
+			query = fmt.Sprintf(`sum(rate(%s{%s%s,destination_service_namespace="%s",destination_service=~"^%s\\.%s\\..*$"} [%vs])) by (%s) %s`,
+				metric,
+				util.GetReporter("destination", o.Rates),
 				destCluster,
 				namespace,
-				n.App,
+				n.Service,
+				namespace,
 				int(duration.Seconds()), // range duration for the query
 				groupBy,
 				idleCondition)
+		default:
+			graph.Error(fmt.Sprintf("NodeType [%s] not supported", n.NodeType))
 		}
-	case graph.NodeTypeService:
-		// Service nodes require two queries for incoming
-		// 1.a) query source telemetry for requests to the service that could not be serviced
-		query = fmt.Sprintf(`sum(rate(%s{reporter="source"%s,destination_workload="unknown",destination_service=~"^%s\\.%s\\..*$"} [%vs])) by (%s) %s`,
-			metric,
-			destCluster,
-			n.Service,
-			namespace,
-			int(duration.Seconds()), // range duration for the query
-			groupBy,
-			idleCondition)
-		vector := promQuery(query, time.Unix(o.QueryTime, 0), client.API())
-		populateTrafficMap(trafficMap, &vector, false, o)
+		trafficVector = graph.PromQuery(ctx, query, time.Unix(o.QueryTime, 0), promApi, globalInfo.Conf)
+		populateTrafficMap(ctx, trafficMap, &trafficVector, metric, o, globalInfo)
 
-		// 1.b) query dest telemetry for requests to the service, serviced by service workloads
-		query = fmt.Sprintf(`sum(rate(%s{reporter="destination"%s,destination_service_namespace="%s",destination_service=~"^%s\\.%s\\..*$"} [%vs])) by (%s) %s`,
-			metric,
-			destCluster,
-			namespace,
-			n.Service,
-			namespace,
-			int(duration.Seconds()), // range duration for the query
-			groupBy,
-			idleCondition)
-	default:
-		graph.Error(fmt.Sprintf("NodeType [%s] not supported", n.NodeType))
-	}
-	inVector := promQuery(query, time.Unix(o.QueryTime, 0), client.API())
-	populateTrafficMap(trafficMap, &inVector, false, o)
-
-	// 2) query for outbound traffic
-	switch n.NodeType {
-	case graph.NodeTypeWorkload:
-		query = fmt.Sprintf(`sum(rate(%s{reporter="source"%s,source_workload_namespace="%s",source_workload="%s"} [%vs])) by (%s) %s`,
-			metric,
-			sourceCluster,
-			namespace,
-			n.Workload,
-			int(duration.Seconds()), // range duration for the query
-			groupBy,
-			idleCondition)
-	case graph.NodeTypeApp:
-		if graph.IsOK(n.Version) {
-			query = fmt.Sprintf(`sum(rate(%s{reporter="source"%s,source_workload_namespace="%s",source_canonical_service="%s",source_canonical_revision="%s"} [%vs])) by (%s) %s`,
+		// 2) query for outbound traffic
+		switch n.NodeType {
+		case graph.NodeTypeWorkload:
+			query = fmt.Sprintf(`sum(rate(%s{%s%s,source_workload_namespace="%s",source_workload="%s"} [%vs])) by (%s) %s`,
 				metric,
+				util.GetReporter("source", o.Rates),
 				sourceCluster,
 				namespace,
-				n.App,
-				n.Version,
+				n.Workload,
 				int(duration.Seconds()), // range duration for the query
 				groupBy,
 				idleCondition)
-		} else {
-			query = fmt.Sprintf(`sum(rate(%s{reporter="source"%s,source_workload_namespace="%s",source_canonical_service="%s"} [%vs])) by (%s) %s`,
-				metric,
-				sourceCluster,
-				namespace,
-				n.App,
-				int(duration.Seconds()), // range duration for the query
-				groupBy,
-				idleCondition)
+		case graph.NodeTypeApp:
+			if graph.IsOK(n.Version) {
+				query = fmt.Sprintf(`sum(rate(%s{%s%s,source_workload_namespace="%s",source_canonical_service="%s",source_canonical_revision="%s"} [%vs])) by (%s) %s`,
+					metric,
+					util.GetReporter("source", o.Rates),
+					sourceCluster,
+					namespace,
+					n.App,
+					n.Version,
+					int(duration.Seconds()), // range duration for the query
+					groupBy,
+					idleCondition)
+			} else {
+				query = fmt.Sprintf(`sum(rate(%s{%s%s,source_workload_namespace="%s",source_canonical_service="%s"} [%vs])) by (%s) %s`,
+					metric,
+					util.GetReporter("source", o.Rates),
+					sourceCluster,
+					namespace,
+					n.App,
+					int(duration.Seconds()), // range duration for the query
+					groupBy,
+					idleCondition)
+			}
+		case graph.NodeTypeService:
+			query = ""
+		default:
+			graph.Error(fmt.Sprintf("NodeType [%s] not supported", n.NodeType))
 		}
-	case graph.NodeTypeService:
-		query = ""
-	default:
-		graph.Error(fmt.Sprintf("NodeType [%s] not supported", n.NodeType))
+		trafficVector = graph.PromQuery(ctx, query, time.Unix(o.QueryTime, 0), promApi, globalInfo.Conf)
+		populateTrafficMap(ctx, trafficMap, &trafficVector, metric, o, globalInfo)
 	}
-	outVector := promQuery(query, time.Unix(o.QueryTime, 0), client.API())
-	populateTrafficMap(trafficMap, &outVector, false, o)
 
-	// TCP traffic
-	metric = "istio_tcp_sent_bytes_total"
-	groupBy = "source_cluster,source_workload_namespace,source_workload,source_canonical_service,source_canonical_revision,destination_cluster,destination_service_namespace,destination_service,destination_service_name,destination_workload_namespace,destination_workload,destination_canonical_service,destination_canonical_revision,response_flags"
+	// gRPC message traffic
+	if o.Rates.Grpc != graph.RateNone && o.Rates.Grpc != graph.RateRequests {
+		var metrics []string
+		groupBy := "source_cluster,source_workload_namespace,source_workload,source_canonical_service,source_canonical_revision,destination_cluster,destination_service_namespace,destination_service,destination_service_name,destination_workload_namespace,destination_workload,destination_canonical_service,destination_canonical_revision"
 
-	switch n.NodeType {
-	case graph.NodeTypeWorkload:
-		query = fmt.Sprintf(`sum(rate(%s{reporter="source"%s,destination_workload_namespace="%s",destination_workload="%s"} [%vs])) by (%s) %s`,
-			metric,
-			destCluster,
-			namespace,
-			n.Workload,
-			int(duration.Seconds()), // range duration for the query
-			groupBy,
-			idleCondition)
-	case graph.NodeTypeApp:
-		if graph.IsOK(n.Version) {
-			query = fmt.Sprintf(`sum(rate(%s{reporter="source"%s,destination_service_namespace="%s",destination_canonical_service="%s",destination_canonical_revision="%s"} [%vs])) by (%s) %s`,
-				metric,
-				destCluster,
-				namespace,
-				n.App,
-				n.Version,
-				int(duration.Seconds()), // range duration for the query
-				groupBy,
-				idleCondition)
-		} else {
-			query = fmt.Sprintf(`sum(rate(%s{reporter="source"%s,destination_service_namespace="%s",destination_canonical_service="%s"} [%vs])) by (%s) %s`,
-				metric,
-				destCluster,
-				namespace,
-				n.App,
-				int(duration.Seconds()), // range duration for the query
-				groupBy,
-				idleCondition)
+		switch o.Rates.Grpc {
+		case graph.RateReceived:
+			metrics = []string{"istio_response_messages_total"}
+		case graph.RateSent:
+			metrics = []string{"istio_request_messages_total"}
+		case graph.RateTotal:
+			metrics = []string{"istio_request_messages_total", "istio_response_messages_total"}
+		default:
+			metrics = []string{}
 		}
-	case graph.NodeTypeService:
-		// TODO: Do we need to handle requests from unknown in a special way (like in HTTP above)? Not sure how tcp is reported from unknown.
-		query = fmt.Sprintf(`sum(rate(%s{reporter="source"%s,destination_service_namespace="%s",destination_service=~"^%s\\.%s\\..*$"} [%vs])) by (%s) %s`,
-			metric,
-			destCluster,
-			namespace,
-			n.Service,
-			namespace,
-			int(duration.Seconds()), // range duration for the query
-			groupBy,
-			idleCondition)
-	default:
-		graph.Error(fmt.Sprintf("NodeType [%s] not supported", n.NodeType))
-	}
-	tcpInVector := promQuery(query, time.Unix(o.QueryTime, 0), client.API())
-	populateTrafficMap(trafficMap, &tcpInVector, true, o)
 
-	// 2) query for outbound traffic
-	switch n.NodeType {
-	case graph.NodeTypeWorkload:
-		query = fmt.Sprintf(`sum(rate(%s{reporter="source"%s,source_workload_namespace="%s",source_workload="%s"} [%vs])) by (%s) %s`,
-			metric,
-			sourceCluster,
-			namespace,
-			n.Workload,
-			int(duration.Seconds()), // range duration for the query
-			groupBy,
-			idleCondition)
-	case graph.NodeTypeApp:
-		if graph.IsOK(n.Version) {
-			query = fmt.Sprintf(`sum(rate(%s{reporter="source"%s,source_workload_namespace="%s",source_canonical_service="%s",source_canonical_revision="%s"} [%vs])) by (%s) %s`,
-				metric,
-				sourceCluster,
-				namespace,
-				n.App,
-				n.Version,
-				int(duration.Seconds()), // range duration for the query
-				groupBy,
-				idleCondition)
-		} else {
-			query = fmt.Sprintf(`sum(rate(%s{reporter="source"%s,source_workload_namespace="%s",source_canonical_service="%s"} [%vs])) by (%s) %s`,
-				metric,
-				sourceCluster,
-				namespace,
-				n.App,
-				int(duration.Seconds()), // range duration for the query
-				groupBy,
-				idleCondition)
+		for _, metric := range metrics {
+			switch n.NodeType {
+			case graph.NodeTypeWorkload:
+				query = fmt.Sprintf(`sum(rate(%s{%s%s,destination_workload_namespace="%s",destination_workload="%s"} [%vs])) by (%s) %s`,
+					metric,
+					util.GetReporter("destination", o.Rates),
+					destCluster,
+					namespace,
+					n.Workload,
+					int(duration.Seconds()), // range duration for the query
+					groupBy,
+					idleCondition)
+			case graph.NodeTypeApp:
+				if graph.IsOK(n.Version) {
+					query = fmt.Sprintf(`sum(rate(%s{%s%s,destination_service_namespace="%s",destination_canonical_service="%s",destination_canonical_revision="%s"} [%vs])) by (%s) %s`,
+						metric,
+						util.GetReporter("destination", o.Rates),
+						destCluster,
+						namespace,
+						n.App,
+						n.Version,
+						int(duration.Seconds()), // range duration for the query
+						groupBy,
+						idleCondition)
+				} else {
+					query = fmt.Sprintf(`sum(rate(%s{%s%s,destination_service_namespace="%s",destination_canonical_service="%s"} [%vs])) by (%s) %s`,
+						metric,
+						util.GetReporter("destination", o.Rates),
+						destCluster,
+						namespace,
+						n.App,
+						int(duration.Seconds()), // range duration for the query
+						groupBy,
+						idleCondition)
+				}
+			case graph.NodeTypeService:
+				// TODO: Do we need to handle requests from unknown in a special way (like in HTTP above)? Not sure how gRPC-messages is reported from unknown.
+				query = fmt.Sprintf(`sum(rate(%s{%s%s,destination_service_namespace="%s",destination_service=~"^%s\\.%s\\..*$"} [%vs])) by (%s) %s`,
+					metric,
+					util.GetReporter("destination", o.Rates),
+					destCluster,
+					namespace,
+					n.Service,
+					namespace,
+					int(duration.Seconds()), // range duration for the query
+					groupBy,
+					idleCondition)
+			default:
+				graph.Error(fmt.Sprintf("NodeType [%s] not supported", n.NodeType))
+			}
+			trafficVector = graph.PromQuery(ctx, query, time.Unix(o.QueryTime, 0), promApi, globalInfo.Conf)
+			populateTrafficMap(ctx, trafficMap, &trafficVector, metric, o, globalInfo)
+
+			// 2) query for outbound traffic
+			switch n.NodeType {
+			case graph.NodeTypeWorkload:
+				query = fmt.Sprintf(`sum(rate(%s{%s%s,source_workload_namespace="%s",source_workload="%s"} [%vs])) by (%s) %s`,
+					metric,
+					util.GetReporter("source", o.Rates),
+					sourceCluster,
+					namespace,
+					n.Workload,
+					int(duration.Seconds()), // range duration for the query
+					groupBy,
+					idleCondition)
+			case graph.NodeTypeApp:
+				if graph.IsOK(n.Version) {
+					query = fmt.Sprintf(`sum(rate(%s{%s%s,source_workload_namespace="%s",source_canonical_service="%s",source_canonical_revision="%s"} [%vs])) by (%s) %s`,
+						metric,
+						util.GetReporter("source", o.Rates),
+						sourceCluster,
+						namespace,
+						n.App,
+						n.Version,
+						int(duration.Seconds()), // range duration for the query
+						groupBy,
+						idleCondition)
+				} else {
+					query = fmt.Sprintf(`sum(rate(%s{%s%s,source_workload_namespace="%s",source_canonical_service="%s"} [%vs])) by (%s) %s`,
+						metric,
+						util.GetReporter("source", o.Rates),
+						sourceCluster,
+						namespace,
+						n.App,
+						int(duration.Seconds()), // range duration for the query
+						groupBy,
+						idleCondition)
+				}
+			case graph.NodeTypeService:
+				query = ""
+			default:
+				graph.Error(fmt.Sprintf("NodeType [%s] not supported", n.NodeType))
+			}
+			trafficVector = graph.PromQuery(ctx, query, time.Unix(o.QueryTime, 0), promApi, globalInfo.Conf)
+			populateTrafficMap(ctx, trafficMap, &trafficVector, metric, o, globalInfo)
 		}
-	case graph.NodeTypeService:
-		query = ""
-	default:
-		graph.Error(fmt.Sprintf("NodeType [%s] not supported", n.NodeType))
 	}
-	tcpOutVector := promQuery(query, time.Unix(o.QueryTime, 0), client.API())
-	populateTrafficMap(trafficMap, &tcpOutVector, true, o)
+
+	// TCP byte traffic
+	if o.Rates.Tcp != graph.RateNone {
+		var metrics []string
+		groupBy := "app,source_cluster,source_workload_namespace,source_workload,source_canonical_service,source_canonical_revision,destination_cluster,destination_service_namespace,destination_service,destination_service_name,destination_workload_namespace,destination_workload,destination_canonical_service,destination_canonical_revision,response_flags"
+
+		inboundReporter := `reporter="destination"`
+		outboutReporter := `reporter="source"`
+		if wpMap := globalInfo.Vendor.AmbientWaypoints; wpMap != nil {
+			if isWaypoint(wpMap.(waypointMap), setWaypointKey(nil, n.Cluster, n.Namespace, n.Workload)) {
+				inboundReporter = util.GetReporter("source", o.Rates)
+				outboutReporter = util.GetReporter("destination", o.Rates)
+			}
+		}
+		// L4 telemetry is backwards, see https://github.com/istio/istio/issues/32399
+		switch o.Rates.Tcp {
+		case graph.RateReceived:
+			metrics = []string{"istio_tcp_sent_bytes_total"}
+		case graph.RateSent:
+			metrics = []string{"istio_tcp_received_bytes_total"}
+		case graph.RateTotal:
+			metrics = []string{"istio_tcp_received_bytes_total", "istio_tcp_sent_bytes_total"}
+		default:
+			metrics = []string{}
+		}
+
+		for _, metric := range metrics {
+			switch n.NodeType {
+			case graph.NodeTypeWorkload:
+				query = fmt.Sprintf(`sum(rate(%s{%s%s%s,destination_workload_namespace="%s",destination_workload="%s"} [%vs])) by (%s) %s`,
+					metric,
+					util.GetApp(o.Rates),
+					inboundReporter,
+					destCluster,
+					namespace,
+					n.Workload,
+					int(duration.Seconds()), // range duration for the query
+					groupBy,
+					idleCondition)
+			case graph.NodeTypeApp:
+				if graph.IsOK(n.Version) {
+					query = fmt.Sprintf(`sum(rate(%s{%s%s%s,destination_service_namespace="%s",destination_canonical_service="%s",destination_canonical_revision="%s"} [%vs])) by (%s) %s`,
+						metric,
+						util.GetApp(o.Rates),
+						inboundReporter,
+						destCluster,
+						namespace,
+						n.App,
+						n.Version,
+						int(duration.Seconds()), // range duration for the query
+						groupBy,
+						idleCondition)
+				} else {
+					query = fmt.Sprintf(`sum(rate(%s{%s%s%s,destination_service_namespace="%s",destination_canonical_service="%s"} [%vs])) by (%s) %s`,
+						metric,
+						util.GetApp(o.Rates),
+						inboundReporter,
+						destCluster,
+						namespace,
+						n.App,
+						int(duration.Seconds()), // range duration for the query
+						groupBy,
+						idleCondition)
+				}
+			case graph.NodeTypeService:
+				// TODO: Do we need to handle requests from unknown in a special way (like in HTTP above)? Not sure how tcp is reported from unknown.
+				query = fmt.Sprintf(`sum(rate(%s{%s%s%s,destination_service_namespace="%s",destination_service=~"^%s\\.%s\\..*$"} [%vs])) by (%s) %s`,
+					metric,
+					util.GetApp(o.Rates),
+					inboundReporter,
+					destCluster,
+					namespace,
+					n.Service,
+					namespace,
+					int(duration.Seconds()), // range duration for the query
+					groupBy,
+					idleCondition)
+			default:
+				graph.Error(fmt.Sprintf("NodeType [%s] not supported", n.NodeType))
+			}
+			trafficVector = graph.PromQuery(ctx, query, time.Unix(o.QueryTime, 0), promApi, globalInfo.Conf)
+			populateTrafficMap(ctx, trafficMap, &trafficVector, metric, o, globalInfo)
+
+			// 2) query for outbound traffic
+			switch n.NodeType {
+			case graph.NodeTypeWorkload:
+				query = fmt.Sprintf(`sum(rate(%s{%s%s%s,source_workload_namespace="%s",source_workload="%s"} [%vs])) by (%s) %s`,
+					metric,
+					util.GetApp(o.Rates),
+					outboutReporter,
+					sourceCluster,
+					namespace,
+					n.Workload,
+					int(duration.Seconds()), // range duration for the query
+					groupBy,
+					idleCondition)
+			case graph.NodeTypeApp:
+				if graph.IsOK(n.Version) {
+					query = fmt.Sprintf(`sum(rate(%s{%s%s%s,source_workload_namespace="%s",source_canonical_service="%s",source_canonical_revision="%s"} [%vs])) by (%s) %s`,
+						metric,
+						util.GetApp(o.Rates),
+						outboutReporter,
+						sourceCluster,
+						namespace,
+						n.App,
+						n.Version,
+						int(duration.Seconds()), // range duration for the query
+						groupBy,
+						idleCondition)
+				} else {
+					query = fmt.Sprintf(`sum(rate(%s{%s%s%s,source_workload_namespace="%s",source_canonical_service="%s"} [%vs])) by (%s) %s`,
+						metric,
+						util.GetApp(o.Rates),
+						outboutReporter,
+						sourceCluster,
+						namespace,
+						n.App,
+						int(duration.Seconds()), // range duration for the query
+						groupBy,
+						idleCondition)
+				}
+			case graph.NodeTypeService:
+				query = ""
+			default:
+				graph.Error(fmt.Sprintf("NodeType [%s] not supported", n.NodeType))
+			}
+			trafficVector = graph.PromQuery(ctx, query, time.Unix(o.QueryTime, 0), promApi, globalInfo.Conf)
+			populateTrafficMap(ctx, trafficMap, &trafficVector, metric, o, globalInfo)
+		}
+	}
 
 	return trafficMap
 }
 
-func handleAggregateNodeTrafficMap(o graph.TelemetryOptions, client *prometheus.Client, globalInfo *graph.AppenderGlobalInfo) graph.TrafficMap {
-	n := graph.NewAggregateNode(o.NodeOptions.Cluster, o.NodeOptions.Namespace, o.NodeOptions.Aggregate, o.NodeOptions.AggregateValue, o.NodeOptions.Service, o.NodeOptions.App)
+func handleAggregateNodeTrafficMap(ctx context.Context, o graph.TelemetryOptions, globalInfo *appender.GlobalInfo) graph.TrafficMap {
+	n := graph.NewAggregateNode(o.Cluster, o.Namespace.Name, o.Aggregate, o.AggregateValue, o.Service, o.App)
 
-	log.Tracef("Build graph for aggregate node [%+v]", n)
+	zl := log.FromContext(ctx)
+
+	zl.Trace().Msgf("Build graph for aggregate node [%+v]", n)
 
 	if !o.Appenders.All {
 		o.Appenders.AppenderNames = append(o.Appenders.AppenderNames, appender.AggregateNodeAppenderName)
 	}
-	appenders := appender.ParseAppenders(o)
-	trafficMap := buildAggregateNodeTrafficMap(o.NodeOptions.Namespace, n, o, client)
+	appenders, finalizers := appender.ParseAppenders(o)
+	trafficMap := buildAggregateNodeTrafficMap(ctx, o.Namespace.Name, n, o, globalInfo)
 
-	namespaceInfo := graph.NewAppenderNamespaceInfo(o.NodeOptions.Namespace)
+	namespaceInfo := appender.NewAppenderNamespaceInfo(o.Namespace.Name)
 
 	for _, a := range appenders {
+		appenderCtx := buildAppenderContext(ctx, a.Name())
 		appenderTimer := internalmetrics.GetGraphAppenderTimePrometheusTimer(a.Name())
-		a.AppendGraph(trafficMap, globalInfo, namespaceInfo)
-		appenderTimer.ObserveDuration()
+		a.AppendGraph(appenderCtx, trafficMap, globalInfo, namespaceInfo)
+		internalmetrics.ObserveDurationAndLogResults(
+			appenderCtx,
+			globalInfo.Conf,
+			appenderTimer,
+			"GraphAppenderTime",
+			map[string]string{
+				"namespace": namespaceInfo.Namespace,
+			},
+			"Aggregate node graph appender time")
 	}
 
-	// The appenders can add/remove/alter nodes. After the manipulations are complete
-	// we can make some final adjustments:
-	// - mark the outsiders (i.e. nodes not in the requested namespaces)
-	// - mark the traffic generators
-	telemetry.MarkOutsideOrInaccessible(trafficMap, o)
-	telemetry.MarkTrafficGenerators(trafficMap)
+	// The finalizers can perform final manipulations on the complete graph
+	for _, f := range finalizers {
+		f.AppendGraph(buildAppenderContext(ctx, f.Name()), trafficMap, globalInfo, nil)
+	}
 
 	return trafficMap
 }
 
 // buildAggregateNodeTrafficMap returns a map of all incoming and outgoing traffic from the perspective of the aggregate. Aggregates
 // are always generated for serviced requests and therefore via destination telemetry.
-func buildAggregateNodeTrafficMap(namespace string, n graph.Node, o graph.TelemetryOptions, client *prometheus.Client) graph.TrafficMap {
+//
+// TODO: This *may* require an additional query to pick up incoming gateway traffic (source reported) for ambient namespaces (no dest
+// proxy reporting) but because it's unclear whether this is a used feature, or whether we really need to handle that use case, I'm
+// deferring. If necessary, see the incoming traffic handling in buildNamespacesTrafficMap.
+func buildAggregateNodeTrafficMap(ctx context.Context, namespace string, n graph.Node, o graph.TelemetryOptions, globalInfo *appender.GlobalInfo) graph.TrafficMap {
 	interval := o.Namespaces[namespace].Duration
 
 	// create map to aggregate traffic by response code
 	trafficMap := graph.NewTrafficMap()
+	promApi := globalInfo.PromClient.API()
 
 	// It takes only one prometheus query to get everything involving the target operation
 	serviceFragment := ""
 	if n.Service != "" {
 		serviceFragment = fmt.Sprintf(`,destination_service_name="%s"`, n.Service)
 	}
+	metric := "istio_requests_total"
 	groupBy := "source_cluster,source_workload_namespace,source_workload,source_canonical_service,source_canonical_revision,destination_cluster,destination_service_namespace,destination_service,destination_service_name,destination_workload_namespace,destination_workload,destination_canonical_service,destination_canonical_revision,request_protocol,response_code,grpc_response_status,response_flags"
-	httpQuery := fmt.Sprintf(`sum(rate(%s{reporter="destination",destination_service_namespace="%s",%s="%s"%s}[%vs])) by (%s) > 0`,
-		"istio_requests_total",
+	httpQuery := fmt.Sprintf(`sum(rate(%s{%s,destination_service_namespace="%s",%s="%s"%s}[%vs])) by (%s) > 0`,
+		metric,
+		util.GetReporter("destination", o.Rates),
 		namespace,
 		n.Metadata[graph.Aggregate],
 		n.Metadata[graph.AggregateValue],
@@ -626,7 +1073,7 @@ func buildAggregateNodeTrafficMap(namespace string, n graph.Node, o graph.Teleme
 		int(interval.Seconds()), // range duration for the query
 		groupBy)
 	/* It's not clear that request classification makes sense for TCP metrics. Because it costs us queries I'm
-	   removing the support for now, we can add it back if someone presents a valid use case.
+	   removing the support for now, we can add it back if someone presents a valid use case. (same for gRCP message metrics)
 	tcpQuery := fmt.Sprintf(`sum(rate(%s{reporter="destination",destination_service_namespace="%s",%s="%s"}[%vs])) by (%s) > 0`,
 		"istio_tcp_sent_bytes_total",
 		namespace,
@@ -637,38 +1084,105 @@ func buildAggregateNodeTrafficMap(namespace string, n graph.Node, o graph.Teleme
 	query := fmt.Sprintf(`(%s) OR (%s)`, httpQuery, tcpQuery)
 	*/
 	query := httpQuery
-	vector := promQuery(query, time.Unix(o.QueryTime, 0), client.API())
-	populateTrafficMap(trafficMap, &vector, false, o)
+	vector := graph.PromQuery(ctx, query, time.Unix(o.QueryTime, 0), promApi, globalInfo.Conf)
+	populateTrafficMap(ctx, trafficMap, &vector, metric, o, globalInfo)
 
 	return trafficMap
 }
 
-func promQuery(query string, queryTime time.Time, api prom_v1.API) model.Vector {
-	if query == "" {
-		return model.Vector{}
+// GetWaypointMap returns a waypointMap based on the current workloads. To handle ambient telemetry we
+// need to know about the configured waypoints. We typically avoid mixing config with telemetry because
+// config is current and telemetry can be dated.  But for the moment it's unavoidable, as we need to do
+// our best to identify source or dest waypoint workloads.  If in the future we can make that determination
+// via the telem, we should change to that approach (see https://github.com/istio/ztunnel/issues/1128).
+// Here we build a waypointMap to help quickly identify waypoints in telemetry.
+func GetWaypointMap(ctx context.Context, gi *appender.GlobalInfo) waypointMap {
+	waypoints := gi.Business.Workload.GetWaypoints(ctx)
+	wpMap := make(waypointMap, len(waypoints))
+	wpKey := graph.NodeKey{} // a re-usable key struct. This works because map keys are always copies
+
+	for _, wp := range waypoints {
+		wpKey.Cluster = wp.Cluster
+		wpKey.Namespace = wp.Namespace
+		wpKey.Name = wp.Name
+		wpMap[wpKey] = true
+		if wp.Cluster != graph.Unknown {
+			wpKey.Cluster = graph.Unknown
+		}
+		wpMap[wpKey] = true
+	}
+	return wpMap
+}
+
+func setWaypointKey(wpKey *graph.NodeKey, cluster, namespace, name string) *graph.NodeKey {
+	if wpKey == nil {
+		wpKey = &graph.NodeKey{}
+	}
+	wpKey.Cluster = cluster
+	wpKey.Namespace = namespace
+	wpKey.Name = name
+	return wpKey
+}
+
+// hasWaypoint returns true if the source or dest workload is determined to be a waypoint workload.
+func hasWaypoint(wpKeySource, wpKeyDest *graph.NodeKey, globalInfo *appender.GlobalInfo) (sourceIsWaypoint bool, destIsWaypoint bool) {
+	wpMap := globalInfo.Vendor.AmbientWaypoints.(waypointMap)
+	sourceIsWaypoint = wpMap[*wpKeySource]
+	destIsWaypoint = wpMap[*wpKeyDest]
+
+	return sourceIsWaypoint, destIsWaypoint
+}
+
+// isWaypoint returns true if the ns, name and cluster of a workload matches with one of the known waypoints
+func isWaypoint(wpMap waypointMap, wpKey *graph.NodeKey) bool {
+	return wpMap[*wpKey]
+}
+
+// buildAppenderContext builds the logger to be used for the appender and puts it in the given context.
+func buildAppenderContext(ctx context.Context, appenderName string) context.Context {
+	zl := log.FromContext(ctx)
+	zlWithAppender := zl.With().Str(log.GraphAppenderLogName, appenderName).Logger()
+	ctx = log.ToContext(ctx, &zlWithAppender)
+	return ctx
+}
+
+// GraphOptionsMatch is required by the graph/TelemetryVendor interface
+func GraphOptionsMatch(a, b graph.TelemetryOptions) bool {
+	// check for changes in relevant param values
+
+	// Helper function to check if a parameter is present and matches
+	checkParam := func(paramName string) bool {
+		valA := a.Params.Get(paramName)
+		valB := b.Params.Get(paramName)
+
+		// If at least one has the param set, compare values
+		if valA != "" || valB != "" {
+			return valA == valB
+		}
+
+		// Neither has the param, so they match
+		return true
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	// wrap with a round() to be in line with metrics api
-	query = fmt.Sprintf("round(%s,0.001)", query)
-	log.Tracef("Graph query:\n%s@time=%v (now=%v, %v)\n", query, queryTime.Format(graph.TF), time.Now().Format(graph.TF), queryTime.Unix())
-
-	promtimer := internalmetrics.GetPrometheusProcessingTimePrometheusTimer("Graph-Generation")
-	value, warnings, err := api.Query(ctx, query, queryTime)
-	if warnings != nil && len(warnings) > 0 {
-		log.Warningf("promQuery. Prometheus Warnings: [%s]", strings.Join(warnings, ","))
-	}
-	graph.CheckError(err)
-	promtimer.ObserveDuration() // notice we only collect metrics for successful prom queries
-
-	switch t := value.Type(); t {
-	case model.ValVector: // Instant Vector
-		return value.(model.Vector)
-	default:
-		graph.Error(fmt.Sprintf("No handling for type %v!\n", t))
+	// Check responseTime parameter
+	if !checkParam("responseTime") {
+		return false
 	}
 
-	return nil
+	// Check throughputType parameter
+	if !checkParam("throughputType") {
+		return false
+	}
+
+	// Check aggregate parameter
+	if !checkParam("aggregate") {
+		return false
+	}
+
+	// Check waypoints parameter
+	if !checkParam("waypoints") {
+		return false
+	}
+
+	return true
 }

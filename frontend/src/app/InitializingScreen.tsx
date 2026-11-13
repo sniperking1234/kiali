@@ -1,0 +1,115 @@
+import * as React from 'react';
+import { Alert, Button, ButtonVariant } from '@patternfly/react-core';
+import { kialiStyle } from 'styles/StyleUtils';
+import { isKioskMode } from '../utils/SearchParamUtils';
+
+import { ColorScheme } from 'types/Common';
+import {
+  applyDocumentAppearance,
+  getKialiColorScheme,
+  getKialiContrastMode,
+  getKialiTheme,
+  resolveColorScheme,
+  isParentOwnedAppearance,
+  readDocumentColorScheme
+} from 'utils/AppearanceUtils';
+import { kialiLogoDark, kialiLogoLight } from 'config';
+
+type initializingScreenProps = {
+  errorDetails?: string;
+  errorMsg?: string;
+};
+
+const defaultErrorStyle = kialiStyle({
+  $nest: {
+    '& > textarea': {
+      display: 'none'
+    },
+    '& > p:last-of-type': {
+      marginTop: '3em'
+    }
+  }
+});
+
+const expandedErrorStyle = kialiStyle({
+  $nest: {
+    '& > p:last-of-type': {
+      display: 'none'
+    },
+    '& > textarea': {
+      width: '100%',
+      whiteSpace: 'pre',
+      marginTop: '3em'
+    }
+  }
+});
+
+const centerVerticalHorizontalStyle = kialiStyle({
+  position: 'relative',
+  top: '10em',
+  textAlign: 'center',
+  $nest: {
+    '& > img': {
+      marginBottom: '3em'
+    },
+    '& > div': {
+      width: '40em',
+      marginLeft: 'auto',
+      marginRight: 'auto',
+      textAlign: 'left'
+    }
+  }
+});
+
+export const InitializingScreen: React.FC<initializingScreenProps> = (props: initializingScreenProps) => {
+  const errorDiv = React.createRef<HTMLDivElement>();
+  const [colorScheme, setColorScheme] = React.useState(() =>
+    isParentOwnedAppearance() ? readDocumentColorScheme() : resolveColorScheme(getKialiColorScheme())
+  );
+
+  React.useEffect(() => {
+    if (isKioskMode()) {
+      document.body.classList.add('kiosk');
+    }
+
+    // OSSMC: Console owns <html> classes — logo color scheme comes from useState above.
+    // Standalone: apply stored appearance (color scheme, contrast mode, and theme) to <html>.
+    if (!isParentOwnedAppearance()) {
+      applyDocumentAppearance(getKialiColorScheme(), getKialiContrastMode(), getKialiTheme());
+      setColorScheme(resolveColorScheme(getKialiColorScheme()));
+    }
+  }, []);
+
+  return (
+    <div data-test="loading-screen" className={centerVerticalHorizontalStyle}>
+      <img alt="Kiali Logo" src={colorScheme === ColorScheme.DARK ? kialiLogoDark : kialiLogoLight} width="200" />
+      {props.errorMsg ? (
+        <div ref={errorDiv} className={defaultErrorStyle}>
+          <Alert variant="danger" isInline={true} title={props.errorMsg} />
+          {props.errorDetails ? (
+            <>
+              <p>
+                <Button
+                  variant={ButtonVariant.link}
+                  onClick={e => {
+                    e.preventDefault();
+                    if (errorDiv.current) {
+                      errorDiv.current.setAttribute('class', expandedErrorStyle);
+                    }
+                  }}
+                >
+                  Show details
+                </Button>
+              </p>
+              <textarea readOnly={true} rows={10}>
+                {props.errorDetails}
+              </textarea>
+            </>
+          ) : null}
+        </div>
+      ) : (
+        <h1>Loading...</h1>
+      )}
+    </div>
+  );
+};

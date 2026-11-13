@@ -1,0 +1,55 @@
+# Refreshes Codecov's default-branch baseline on every push to master.
+# Kiali CI only uploads merged coverage after long integration jobs; this workflow
+# ensures master always has a recent report even when the main workflow is skipped
+# (paths-ignore) or before the full codecov_merge_upload job was added.
+name: Codecov master baseline
+
+on:
+  push:
+    branches:
+    - master
+    paths-ignore:
+    - "design/**"
+    - "**/*.md"
+    - "**/*.adoc"
+  workflow_dispatch:
+
+concurrency:
+  group: codecov-master-baseline-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  upload_unit_coverage:
+    name: Upload unit coverage to Codecov (master)
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        fetch-depth: 1
+
+    - name: Set up Go
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      with:
+        cache: true
+        cache-dependency-path: go.sum
+        go-version-file: go.mod
+
+    - name: Run unit tests with coverage
+      run: make -e GO_TEST_FLAGS="-race -coverpkg=github.com/kiali/kiali/... -coverprofile=coverage-unit.out" test
+
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+      with:
+        disable_search: true
+        fail_ci_if_error: true
+        files: coverage-unit.out
+        flags: integration
+        override_branch: ${{ github.ref_name }}
+        override_commit: ${{ github.sha }}
+        slug: kiali/kiali
+        token: ${{ secrets.CODECOV_TOKEN }}
+        use_pypi: true

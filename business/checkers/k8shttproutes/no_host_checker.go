@@ -1,0 +1,75 @@
+package k8shttproutes
+
+import (
+	"fmt"
+	"strings"
+
+	core_v1 "k8s.io/api/core/v1"
+	k8s_networking_v1 "sigs.k8s.io/gateway-api/apis/v1"
+	k8s_networking_v1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
+
+	"github.com/kiali/kiali/config"
+	"github.com/kiali/kiali/kubernetes"
+	"github.com/kiali/kiali/models"
+)
+
+type NoHostChecker struct {
+	Conf               *config.Config
+	K8sHTTPRoute       *k8s_networking_v1.HTTPRoute
+	K8sReferenceGrants []*k8s_networking_v1beta1.ReferenceGrant
+	Namespaces         []string
+	Services           []core_v1.Service
+}
+
+func (n NoHostChecker) Check() ([]*models.IstioCheck, bool) {
+	validations := make([]*models.IstioCheck, 0)
+	valid := true
+
+	for i, ref := range n.K8sHTTPRoute.Spec.ParentRefs {
+		if ref.Kind == nil || string(*ref.Kind) != kubernetes.ServiceType {
+			continue
+		}
+		valid = n.checkReference(ref.Namespace, ref.Name, &validations, fmt.Sprintf("spec/parentRefs[%d]/name", i)) && valid
+	}
+
+	for k, httpRoute := range n.K8sHTTPRoute.Spec.Rules {
+		for i, ref := range httpRoute.BackendRefs {
+			if ref.Kind == nil || string(*ref.Kind) != kubernetes.ServiceType {
+				continue
+			}
+			valid = n.checkReference(ref.Namespace, ref.Name, &validations, fmt.Sprintf("spec/rules[%d]/backendRefs[%d]/name", k, i)) && valid
+		}
+	}
+
+	return validations, valid
+}
+
+func (n NoHostChecker) checkReference(refNamespace *k8s_networking_v1.Namespace, refName k8s_networking_v1.ObjectName, validations *[]*models.IstioCheck, location string) bool {
+	namespace := n.K8sHTTPRoute.Namespace
+	if refNamespace != nil && string(*refNamespace) != "" {
+		namespace = string(*refNamespace)
+	}
+	// BackendRefs use simple names; dotted names are invalid for kind: Service
+	if strings.Contains(string(refName), ".") ||
+		(namespace == n.K8sHTTPRoute.Namespace && !n.checkDestination(string(refName), namespace)) ||
+		(namespace != n.K8sHTTPRoute.Namespace && (!n.checkReferenceGrant(n.K8sHTTPRoute.Namespace, namespace) || !n.checkDestination(string(refName), namespace))) {
+		validation := models.Build("k8sroutes.nohost.namenotfound", location)
+		*validations = append(*validations, &validation)
+		return false
+	}
+	return true
+}
+
+func (n NoHostChecker) checkDestination(svcName string, namespace string) bool {
+	for _, svc := range n.Services {
+		if svc.Name == svcName && svc.Namespace == namespace {
+			return true
+		}
+	}
+	return false
+}
+
+func (n NoHostChecker) checkReferenceGrant(fromNamespace string, toNamespace string) bool {
+	// Use ReferenceGrant objects to check if cross namespace reference exists
+	return kubernetes.HasMatchingReferenceGrant(fromNamespace, toNamespace, kubernetes.K8sHTTPRouteType, kubernetes.ServiceType, n.K8sReferenceGrants)
+}

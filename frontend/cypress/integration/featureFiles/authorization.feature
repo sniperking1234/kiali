@@ -1,0 +1,45 @@
+@authorization
+# don't change first line of this file - the tag is used for the test scripts to identify the test suite
+@skip-ossmc
+
+Feature: Kiali Authorization
+
+  User opens the Namespaces page.
+
+  Background:
+    Given user is at limited user perspective
+    And user is at the "namespaces" list page
+
+  @multi-cluster
+  @multi-primary
+  @authorization
+  Scenario: There should be one bookinfo namespace entry
+    When user selects filter "Namespace"
+    And user filters for name "bookinfo"
+    Then user sees the "bookinfo" namespace in cluster "east" in the namespaces page
+    And user does not see the "bookinfo" namespace in cluster "west" in the namespaces page
+    And user does not see the "istio-system" namespace in cluster "east" in the namespaces page
+    And user does not see the "istio-system" namespace in cluster "west" in the namespaces page
+    And user doesn't see the "mesh" menu
+
+  @multi-cluster
+  @multi-primary
+  @authorization
+  Scenario: No Mesh Link in the Kiali about page
+    And user clicks on Help Button
+    And user clicks on About Button
+    Then user does not see the "mesh" link
+
+  @multi-cluster
+  @multi-primary
+  @authorization
+  Scenario: See just the "east" Istio Config objects in the bookinfo namespace.
+    When user is at the "istio" page for the "bookinfo" namespace
+    Then user sees the "east" Istio Config objects and not the "west" Istio Config Objects
+
+  @multi-cluster
+  @multi-primary
+  @authorization
+  Scenario: Don't see a restricted Istio config
+    When user is at the details page for the "istio" "bookinfo/networking.istio.io/v1/Gateway/bookinfo-gateway" located in the "west" cluster
+    Then user sees the forbidden error message

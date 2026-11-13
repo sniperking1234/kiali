@@ -7,10 +7,6 @@
 
 The following are brief summaries for each hack script. Most of these hack scripts accept a `--help` option to provide information on the different options available.
 
-* `link:aws-openshift-istio.sh[]`
-
-Utilizes the `aws-openshift.sh` script to start an OpenShift cluster on AWS, and then utilizes some of the link:./istio[hack scripts in ./istio] to install either Service Mesh or upstream Istio as well as the bookinfo demo. You must have an AWS account as well as an OpenShift pull secret to use this.
-
 * `link:aws-openshift.sh[]`
 
 Starts and stops an OpenShift cluster on AWS as well as provides information about the running OpenShift cluster. You must have an AWS account as well as an OpenShift pull secret to use this.
@@ -19,17 +15,41 @@ Starts and stops an OpenShift cluster on AWS as well as provides information abo
 
 Used by the Kiali server build targets in order to confirm the version of Go is compatible with Kiali.
 
+* `link:ci-kind-molecule-tests.sh[]`
+
+Runs the Kiali molecule tests on a Kind Kubernetes cluster. This utilizes `kind` to start and stop a k8s cluster and the `run-molecule-tests.sh` script to run the molecule tests. Use this in a cron job to periodically run the molecule tests on `kind`.
+
 * `link:ci-minikube-molecule-tests.sh[]`
 
-Runs the Kiali molecule tests with the latest version of the Kiali quay.io images on a minikube Kubernetes cluster. This utilizes the `k8s-minikube.sh` script to start and stop a minikube VM and the `run-molecule-tests.sh` script to run the molecule tests. Use this in a cron job to periodically run the molecule tests on minikube.
+Runs the Kiali molecule tests on a `minikube` Kubernetes cluster. This utilizes the `k8s-minikube.sh` script to start and stop a `minikube` VM and the `run-molecule-tests.sh` script to run the molecule tests. Use this in a cron job to periodically run the molecule tests on `minikube`.
 
 * `link:ci-openshift-molecule-tests.sh[]`
 
-Runs the Kiali molecule tests with the latest version of the Kiali quay.io images on an existing OpenShift cluster. Utilizes the `run-molecule-tests.sh` script to run the molecule tests. Use this in a cron job to periodically run the molecule tests.
+Runs the Kiali molecule tests on an existing OpenShift cluster. Utilizes the `run-molecule-tests.sh` script to run the molecule tests. Use this in a cron job to periodically run the molecule tests.
+
+* `link:configure-operator.sh[]`
+
+Configures an installed operator so you can enable and disable operator features (see https://kiali.io/docs/faq/installation/#operator-configuration)
 
 * `link:crc-openshift.sh[]`
 
-Similar to `aws-openshift.sh` except it runs OpenShift on the local machine using link:https://github.com/code-ready/crc[CRC].
+Runs OpenShift on the local machine using link:https://github.com/code-ready/crc[CRC].
+
+* `link:docker-io-auth.sh[]`
+
+Creates the necessary resources allowing your cluster to authenticate itself with Docker Hub when pulling Docker Hub images. This helps avoid the annoying Docker Hub rate limiting errors.
+
+* `link:fix_imports.sh[]`
+
+Makes Go imports pretty in the Go source files.
+
+* `link:ibmcloud-openshift.sh[]`
+
+Deploys an OpenShift cluster in IBM Cloud.
+
+* `link:install-kiali-ossmc-openshift.sh[]`
+
+Installs the current community release of Kiali Operator, Kiali Server, and OSSMC via an OLM Subscription and CRs (Kiali CR and OSSMConsole CR). This will optionally install an OpenShift cluster via link:crc-openshift.sh[CRC] and also optionally install link:istio/install-istio-via-istioctl.sh[Istio].
 
 * `link:jwt-decode.sh[]`
 
@@ -41,15 +61,61 @@ A testing utility that can be used to encode JWT tokens. Developers use this to 
 
 * `link:k8s-minikube.sh[]`
 
-Starts and stops a Kubernetes cluster via minikube as well as provides information about the running Kubernetes cluster. This can optionally install Dex OpenID Connect provider which is useful for testing Kiali's OpenID authentication integration.
+Starts and stops a Kubernetes cluster via `minikube` as well as provides information about the running Kubernetes cluster. This can optionally install Dex OpenID Connect provider which is useful for testing Kiali's OpenID authentication integration.
+
+* `link:kiali-port-forward.sh[]`
+
+Use this to access the Kiali UI that is installed locally in `minikube` or `kind`.
+
+* `link:perf-ibmcloud-openshift.sh[]`
+
+Sets up the Kiali performance testing environment in IBM Cloud.
+
+* `link:purge-kiali-from-cluster.sh[]`
+
+Removes all remnants of Kiali and Kiali Operator from a cluster.
+
+* `link:run-integration-tests.sh[]`
+
+Sets up the environment for the integration tests and runs them. This is the same setup that is used by the CI system.
+
+NOTE: When running the multi-cluster tests locally, it might be necessary to
+edit some kernel settings to allow for the kind clusters to be created.
+
+These commands will set the kernel settings temporarily. After a reboot, your system will revert back to its original settings:
+```bash
+sudo sysctl fs.inotify.max_user_watches=524288
+sudo sysctl fs.inotify.max_user_instances=512
+```
+If you wish to make these settings permanent, the following lines added to your sysctl configuration file should work (depending on your operating system, this configuration file can be something like `/etc/sysctl.d/local.conf`, `/etc/sysctl.conf`, or something else. Refer to the `man sysctl` docs for details):
+```bash
+fs.inotify.max_user_watches=524288
+fs.inotify.max_user_instances=512
+```
+
+* `link:run-kiali.sh[]`
+
+Runs Kiali on the local machine while having it connect to a remote k8s cluster. This is useful for development and debugging.
 
 * `link:run-molecule-tests.sh[]`
 
-Runs the suite of molecule tests on a running OpenShift or minikube cluster.
+Runs the suite of molecule tests on a running OpenShift or `minikube` cluster.
 
 * `link:run-prometheus.sh[]`
 
 Runs a local Prometheus in docker and scrapes the Kiali server and operator that is running in an OpenShift cluster.
+
+* `link:setup-kind-in-ci.sh[]`
+
+Creates a KinD cluster for use within GitHub Actions so CI tests can run. Installs Istio and can also set up multiple clusters for multiclster testing.
+
+* `link:start-kind.sh[]`
+
+Starts a kind cluster with metallb as a load balancer implementation.
+
+* `link:use-openshift-prometheus.sh[]`
+
+Creates the necessary resources that enable Istio and Kiali to store and query telemetry data using OpenShift's built-in Prometheus server.
 
 == Running Molecule Tests Periodically
 

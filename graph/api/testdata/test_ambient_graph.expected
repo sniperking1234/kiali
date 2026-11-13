@@ -1,0 +1,284 @@
+{
+  "timestamp": 1523364075,
+  "duration": 600,
+  "graphType": "workload",
+  "elements": {
+    "nodes": [
+      {
+        "data": {
+          "id": "da7f601fed0a2c78f1741449e71b1ac4e15412f253001a87397b2ce5a0521fa8",
+          "nodeType": "workload",
+          "cluster": "Kubernetes",
+          "namespace": "bookinfo",
+          "workload": "waypoint",
+          "version": "latest",
+          "traffic": [
+            {
+              "protocol": "tcp",
+              "rates": {
+                "tcpIn": "100.00",
+                "tcpOut": "250.00"
+              }
+            }
+          ],
+          "healthData": null,
+          "isWaypoint": true
+        }
+      },
+      {
+        "data": {
+          "id": "6af9524cff591d364361fdca83edc6a4d00d64718ea7920e1edb4998d8970704",
+          "nodeType": "workload",
+          "cluster": "Kubernetes",
+          "namespace": "bookinfo",
+          "workload": "details-v1",
+          "app": "details",
+          "version": "v1",
+          "destServices": [
+            {
+              "cluster": "Kubernetes",
+              "namespace": "bookinfo",
+              "name": "details"
+            }
+          ],
+          "traffic": [
+            {
+              "protocol": "http",
+              "rates": {
+                "httpIn": "10.00"
+              }
+            },
+            {
+              "protocol": "tcp",
+              "rates": {
+                "tcpIn": "50.00"
+              }
+            }
+          ],
+          "healthData": null
+        }
+      },
+      {
+        "data": {
+          "id": "d53e0d1d33c7e8e49550455e8b0aba282d977167c0c9be049cb351da06a95f11",
+          "nodeType": "workload",
+          "cluster": "Kubernetes",
+          "namespace": "bookinfo",
+          "workload": "productpage-v1",
+          "app": "productpage",
+          "version": "v1",
+          "destServices": [
+            {
+              "cluster": "Kubernetes",
+              "namespace": "bookinfo",
+              "name": "productpage"
+            }
+          ],
+          "traffic": [
+            {
+              "protocol": "http",
+              "rates": {
+                "httpOut": "20.00"
+              }
+            },
+            {
+              "protocol": "tcp",
+              "rates": {
+                "tcpIn": "150.00",
+                "tcpOut": "100.00"
+              }
+            }
+          ],
+          "healthData": null,
+          "isRoot": true
+        }
+      },
+      {
+        "data": {
+          "id": "dcf792ef4a06df4510c80c7b828599c7b153fd2f2ec7b4e5600a2b437d8d4111",
+          "nodeType": "workload",
+          "cluster": "Kubernetes",
+          "namespace": "bookinfo",
+          "workload": "reviews-v1",
+          "app": "reviews",
+          "version": "v1",
+          "destServices": [
+            {
+              "cluster": "Kubernetes",
+              "namespace": "bookinfo",
+              "name": "reviews"
+            }
+          ],
+          "traffic": [
+            {
+              "protocol": "http",
+              "rates": {
+                "httpIn": "10.00"
+              }
+            },
+            {
+              "protocol": "tcp",
+              "rates": {
+                "tcpIn": "50.00"
+              }
+            }
+          ],
+          "healthData": null
+        }
+      }
+    ],
+    "edges": [
+      {
+        "data": {
+          "id": "fc7e327b415978dbdc0c7b21848571cfe1fdbe6d361a40b52389631a45fa9158",
+          "source": "d53e0d1d33c7e8e49550455e8b0aba282d977167c0c9be049cb351da06a95f11",
+          "target": "6af9524cff591d364361fdca83edc6a4d00d64718ea7920e1edb4998d8970704",
+          "traffic": {
+            "protocol": "http",
+            "rates": {
+              "http": "10.00",
+              "httpPercentReq": "50.0"
+            },
+            "responses": {
+              "200": {
+                "flags": {
+                  "-": "100.0"
+                },
+                "hosts": {
+                  "details:9080": "100.0"
+                }
+              }
+            }
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "784d7813dd7a786b647fa4c78226f5493906686b74aeafcf4e8ee1e33d606f2d",
+          "source": "d53e0d1d33c7e8e49550455e8b0aba282d977167c0c9be049cb351da06a95f11",
+          "target": "da7f601fed0a2c78f1741449e71b1ac4e15412f253001a87397b2ce5a0521fa8",
+          "traffic": {
+            "protocol": "tcp",
+            "rates": {
+              "tcp": "100.00"
+            },
+            "responses": {
+              "-": {
+                "flags": {
+                  "-": "100.0"
+                },
+                "hosts": {
+                  "details.bookinfo.svc.cluster.local": "50.0",
+                  "reviews.bookinfo.svc.cluster.local": "50.0"
+                }
+              }
+            }
+          },
+          "waypoint": {
+            "direction": "to",
+            "fromEdge": {
+              "id": "a46a8f633b2770bf4fd3638b987b1bc58661c21c05ce18eba4e60d5e64e37594",
+              "source": "d53e0d1d33c7e8e49550455e8b0aba282d977167c0c9be049cb351da06a95f11",
+              "target": "d53e0d1d33c7e8e49550455e8b0aba282d977167c0c9be049cb351da06a95f11",
+              "traffic": {
+                "protocol": "tcp",
+                "rates": {
+                  "tcp": "150.00"
+                },
+                "responses": {
+                  "-": {
+                    "flags": {
+                      "-": "100.0"
+                    },
+                    "hosts": {
+                      "productpage.bookinfo.svc.cluster.local": "100.0"
+                    }
+                  }
+                }
+              },
+              "waypoint": {
+                "direction": "from"
+              }
+            }
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "0d9362799842fbc075db9e0633ba756b97877f0ce6606d0c2245939d2c49fc5a",
+          "source": "d53e0d1d33c7e8e49550455e8b0aba282d977167c0c9be049cb351da06a95f11",
+          "target": "dcf792ef4a06df4510c80c7b828599c7b153fd2f2ec7b4e5600a2b437d8d4111",
+          "traffic": {
+            "protocol": "http",
+            "rates": {
+              "http": "10.00",
+              "httpPercentReq": "50.0"
+            },
+            "responses": {
+              "200": {
+                "flags": {
+                  "-": "100.0"
+                },
+                "hosts": {
+                  "reviews:9080": "100.0"
+                }
+              }
+            }
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "d5ca8e75971eceeee45eae039f2cffbae88fd97cb12a758b63be49041e1fee6f",
+          "source": "da7f601fed0a2c78f1741449e71b1ac4e15412f253001a87397b2ce5a0521fa8",
+          "target": "6af9524cff591d364361fdca83edc6a4d00d64718ea7920e1edb4998d8970704",
+          "traffic": {
+            "protocol": "tcp",
+            "rates": {
+              "tcp": "50.00"
+            },
+            "responses": {
+              "-": {
+                "flags": {
+                  "-": "100.0"
+                },
+                "hosts": {
+                  "details.bookinfo.svc.cluster.local": "100.0"
+                }
+              }
+            }
+          },
+          "waypoint": {
+            "direction": "from"
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "5f73ad9675d0b8896c9309977d683408244eff14ceaacdc95661bf6739723520",
+          "source": "da7f601fed0a2c78f1741449e71b1ac4e15412f253001a87397b2ce5a0521fa8",
+          "target": "dcf792ef4a06df4510c80c7b828599c7b153fd2f2ec7b4e5600a2b437d8d4111",
+          "traffic": {
+            "protocol": "tcp",
+            "rates": {
+              "tcp": "50.00"
+            },
+            "responses": {
+              "-": {
+                "flags": {
+                  "-": "100.0"
+                },
+                "hosts": {
+                  "reviews.bookinfo.svc.cluster.local": "100.0"
+                }
+              }
+            }
+          },
+          "waypoint": {
+            "direction": "from"
+          }
+        }
+      }
+    ]
+  }
+}

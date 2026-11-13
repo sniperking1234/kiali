@@ -1,0 +1,33 @@
+# We are building what was the old (now deprecated) ubi9/openssl, which is essentially ubi-micro image with openssl/root certs
+ARG UBI_MAJOR_VERSION="9"
+FROM registry.access.redhat.com/ubi${UBI_MAJOR_VERSION}/ubi AS ubi-build
+ARG UBI_MAJOR_VERSION
+RUN mkdir -p /mnt/rootfs/keys
+RUN chmod 0777 /mnt/rootfs/keys
+RUN yum install --installroot /mnt/rootfs --releasever ${UBI_MAJOR_VERSION} --setopt install_weak_deps=false --nodocs -y bash coreutils-single glibc-minimal-langpack openssl && \
+    yum --installroot /mnt/rootfs clean all
+RUN rm -rf /mnt/rootfs/var/cache/* /mnt/rootfs/var/log/dnf* /mnt/rootfs/var/log/yum.*
+
+FROM scratch
+COPY --from=ubi-build /mnt/rootfs/ /
+VOLUME  /keys
+
+# Start Kiali specific build
+
+LABEL maintainer="kiali-dev@googlegroups.com"
+
+# Add kiali user and group
+RUN echo kiali:x:1000: >> /etc/group
+RUN echo kiali:x:1000:1000:/home/kiali:/sbin/nologin >> /etc/passwd
+
+ENV KIALI_HOME=/opt/kiali
+ENV PATH=$KIALI_HOME:$PATH
+
+WORKDIR $KIALI_HOME
+
+ARG TARGETARCH
+COPY --chown=1000:1000 kiali-${TARGETARCH} $KIALI_HOME/kiali
+
+USER 1000
+
+ENTRYPOINT ["/opt/kiali/kiali"]

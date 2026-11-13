@@ -1,0 +1,557 @@
+import * as React from 'react';
+import { classes } from 'typestyle';
+import { connect } from 'react-redux';
+import type { KialiAppState } from 'store/Store';
+import { languageSelector, namespaceItemsSelector } from 'store/Selectors';
+import type { ISortBy, SortByDirection } from '@patternfly/react-table';
+import type { Workload } from 'types/Workload';
+import type { EnvoyProxyDump, Pod } from 'types/IstioObjects';
+import * as API from '../../services/Api';
+import { addError } from '../../utils/AlertUtils';
+import {
+  Button,
+  ButtonVariant,
+  Card,
+  CardBody,
+  EmptyState,
+  EmptyStateBody,
+  EmptyStateVariant,
+  Tab,
+  Tabs,
+  Tooltip,
+  TooltipPosition
+} from '@patternfly/react-core';
+import { SummaryTableBuilder } from './tables/BaseTable';
+import type { Namespace } from 'types/Namespace';
+import { kialiStyle } from 'styles/StyleUtils';
+import Editor from '@monaco-editor/react';
+import type { editor } from 'monaco-editor';
+import { PFBadge, PFBadges } from 'components/Pf/PfBadges';
+import { ToolbarDropdown } from 'components/Dropdown/ToolbarDropdown';
+import { activeTab } from '../../components/Tab/Tabs';
+import { KialiIcon } from 'config/KialiIcon';
+import { CopyToClipboard } from 'react-copy-to-clipboard';
+import type { DashboardRef } from 'types/Runtimes';
+import { CustomMetrics } from 'components/Metrics/CustomMetrics';
+import { EnvoyMemory } from 'components/Envoy/EnvoyMemory';
+import type { TimeRange } from 'types/Common';
+import { FilterSelected } from 'components/Filters/StatefulFilters';
+import { location, router } from '../../app/History';
+import {
+  tabName as workloadTabName,
+  defaultTab as workloadDefaultTab
+} from '../../pages/WorkloadDetails/WorkloadDetailsPage';
+import { editorStyle } from 'styles/EditorStyle';
+import {
+  tabCardStyle,
+  constrainedScrollStyle,
+  flexCardStyle,
+  flexFillStyle,
+  noShrinkStyle,
+  scrollableContentStyle
+} from 'styles/FlexStyles';
+import { ResizeHeightObserver } from 'utils/ResizeHeightObserver';
+import type { TimeInMilliseconds } from '../../types/Common';
+import { ColorScheme } from '../../types/Common';
+import { mapAppearanceFromState, resolveColorScheme } from '../../utils/AppearanceUtils';
+import { subTabStyle } from 'styles/TabStyles';
+import { getAppLabelName, getVersionLabelName } from 'config/ServerConfig';
+import { t } from 'utils/I18nUtils';
+
+const iconStyle = kialiStyle({
+  display: 'inline-block',
+  alignSelf: 'center'
+});
+
+const copyButtonStyle = kialiStyle({
+  float: 'right',
+  marginRight: '0.5rem',
+  marginTop: '1rem',
+  $nest: {
+    '& span.pf-v6-c-icon': {
+      marginRight: '0.25rem'
+    }
+  }
+});
+
+const envoyTabs = ['memory', 'clusters', 'listeners', 'routes', 'bootstrap', 'config', 'metrics'];
+const tabName = 'envoyTab';
+const defaultTab = 'memory';
+
+const envoyTabTitles: Record<string, string> = {
+  bootstrap: 'Bootstrap',
+  clusters: 'Clusters',
+  config: 'Config',
+  listeners: 'Listeners',
+  memory: 'Overview',
+  metrics: 'Metrics',
+  routes: 'Routes'
+};
+
+export type ResourceSorts = { [resource: string]: ISortBy };
+
+type ReduxProps = {
+  colorScheme: string;
+  language: string;
+  namespaces: Namespace[];
+  systemAppearanceRevision: number;
+};
+
+type EnvoyDetailsProps = ReduxProps & {
+  lastRefreshAt: TimeInMilliseconds;
+  namespace: string;
+  rangeDuration: TimeRange;
+  workload: Workload;
+};
+
+type EnvoyDetailsState = {
+  activeKey: number;
+  config: EnvoyProxyDump;
+  editorHeight: number;
+  fetch: boolean;
+  pod?: Pod;
+  resource: string;
+  tableSortBy: ResourceSorts;
+};
+
+const editorColumnStyle = kialiStyle({
+  display: 'flex',
+  flex: 1,
+  flexDirection: 'column',
+  minHeight: 0
+});
+
+const editorWrapperStyle = kialiStyle({
+  flex: 1,
+  minHeight: 0,
+  position: 'relative'
+});
+
+class EnvoyDetailsComponent extends React.Component<EnvoyDetailsProps, EnvoyDetailsState> {
+  monacoEditorRef: React.RefObject<editor.IStandaloneCodeEditor | null>;
+  editorWrapperRef: React.RefObject<HTMLDivElement>;
+  private heightObserver = new ResizeHeightObserver(h => this.setState({ editorHeight: h }), 2, 1);
+
+  constructor(props: EnvoyDetailsProps) {
+    super(props);
+
+    this.monacoEditorRef = React.createRef();
+    this.editorWrapperRef = React.createRef();
+
+    const initialResource = activeTab(tabName, defaultTab);
+
+    this.state = {
+      pod: this.sortedPods()[0],
+      config: {},
+      editorHeight: 300,
+      fetch: true,
+      activeKey: this.tabIndexForResource(initialResource),
+      resource: initialResource,
+      tableSortBy: {
+        clusters: {
+          index: 0,
+          direction: 'asc'
+        },
+        listeners: {
+          index: 0,
+          direction: 'asc'
+        },
+        routes: {
+          index: 0,
+          direction: 'asc'
+        }
+      }
+    };
+  }
+
+  componentDidMount(): void {
+    this.fetchContent();
+    if (this.editorWrapperRef.current) {
+      this.heightObserver.observe(this.editorWrapperRef.current);
+    }
+  }
+
+  componentWillUnmount(): void {
+    this.heightObserver.disconnect();
+  }
+
+  componentDidUpdate(prevProps: EnvoyDetailsProps, prevState: EnvoyDetailsState): void {
+    const currentTabIndex = this.tabIndexForResource(activeTab(tabName, defaultTab));
+
+    const prevFirstPod = prevProps.workload.pods[0]?.name;
+    const nextFirstPod = this.props.workload.pods[0]?.name;
+    if (prevFirstPod !== nextFirstPod) {
+      this.setState({
+        config: {},
+        fetch: true,
+        pod: this.sortedPods()[0]
+      });
+    }
+
+    if (this.state.pod?.name !== prevState.pod?.name || this.state.resource !== prevState.resource) {
+      this.fetchContent();
+
+      if (currentTabIndex !== this.state.activeKey) {
+        this.setState({ activeKey: currentTabIndex });
+      }
+    }
+
+    if (this.state.activeKey !== prevState.activeKey) {
+      if (this.showEditor() && this.editorWrapperRef.current) {
+        this.heightObserver.observe(this.editorWrapperRef.current);
+      } else if (!this.showEditor()) {
+        this.heightObserver.unobserve();
+      }
+    }
+  }
+
+  envoyHandleTabClick = (_event: React.MouseEvent, tabIndex: string | number): void => {
+    const resourceIdx: number = +tabIndex;
+    const targetResource = this.getFilteredEnvoyTabs()[resourceIdx];
+
+    if (!targetResource || targetResource === this.state.resource) {
+      return;
+    }
+
+    this.selectEnvoyTab(targetResource, resourceIdx);
+  };
+
+  selectEnvoyTab = (targetResource: string, resourceIdx?: number): void => {
+    const activeKey = resourceIdx ?? this.tabIndexForResource(targetResource);
+
+    if (targetResource === this.state.resource && activeKey === this.state.activeKey) {
+      return;
+    }
+
+    this.setState({
+      config: {},
+      fetch: true,
+      resource: targetResource,
+      activeKey
+    });
+
+    const mainTab = new URLSearchParams(location.getSearch()).get(workloadTabName) ?? workloadDefaultTab;
+    const urlParams = new URLSearchParams(location.getSearch());
+    urlParams.set(tabName, targetResource);
+    urlParams.set(workloadTabName, mainTab);
+    router.navigate(`${location.getPathname()}?${urlParams.toString()}`);
+  };
+
+  fetchEnvoyProxyResourceEntries = (resource: string): void => {
+    const pod = this.state.pod;
+    if (!pod) {
+      return;
+    }
+
+    API.getPodEnvoyProxyResourceEntries(this.props.namespace, pod.name, resource, this.props.workload.cluster)
+      .then(resultEnvoyProxy => {
+        this.setState({
+          config: resultEnvoyProxy.data,
+          fetch: false
+        });
+      })
+      .catch(error => {
+        addError(`Could not fetch envoy config ${resource} entries for ${pod.name}.`, error);
+      });
+  };
+
+  fetchEnvoyProxy = (): void => {
+    const pod = this.state.pod;
+    if (!pod) {
+      return;
+    }
+
+    API.getPodEnvoyProxy(this.props.namespace, pod.name, this.props.workload.cluster)
+      .then(resultEnvoyProxy => {
+        this.setState({
+          config: resultEnvoyProxy.data,
+          fetch: false
+        });
+      })
+      .catch(error => {
+        addError(`Could not fetch envoy config for ${pod.name}.`, error);
+      });
+  };
+
+  fetchContent = (): void => {
+    if (this.state.fetch !== true) {
+      return;
+    }
+
+    const needsPod = this.state.resource !== 'memory' && this.state.resource !== 'metrics';
+    if (needsPod && !this.state.pod) {
+      this.setState({ fetch: false });
+      return;
+    }
+
+    if (this.state.resource === 'config') {
+      this.fetchEnvoyProxy();
+      return;
+    }
+
+    if (this.state.resource === 'memory' || this.state.resource === 'metrics') {
+      this.setState({ fetch: false });
+      return;
+    }
+
+    this.fetchEnvoyProxyResourceEntries(this.state.resource);
+  };
+
+  setPod = (podName: string): void => {
+    const podIdx: number = +podName;
+    const targetPod: Pod = this.sortedPods()[podIdx];
+
+    if (!targetPod || targetPod.name === this.state.pod?.name) {
+      return;
+    }
+
+    this.setState({
+      config: {},
+      pod: targetPod,
+      fetch: true
+    });
+  };
+
+  sortedPods = (): Pod[] => {
+    return [...this.props.workload.pods].sort((p1: Pod, p2: Pod) => (p1.name >= p2.name ? 1 : -1));
+  };
+
+  hasPods = (): boolean => {
+    return this.props.workload.pods.length > 0;
+  };
+
+  renderNoPodsEmptyState = (): React.ReactNode => {
+    return (
+      <EmptyState headingLevel="h5" titleText={t('No pods')} variant={EmptyStateVariant.full}>
+        <EmptyStateBody>
+          {t('Envoy pod configuration is unavailable until this workload has running pods.')}
+        </EmptyStateBody>
+      </EmptyState>
+    );
+  };
+
+  onSort = (tab: string, index: number, direction: SortByDirection): void => {
+    if (this.state.tableSortBy[tab].index !== index || this.state.tableSortBy[tab].direction !== direction) {
+      const tableSortBy = this.state.tableSortBy;
+      tableSortBy[tab].index = index;
+      tableSortBy[tab].direction = direction;
+      this.setState({
+        tableSortBy: tableSortBy
+      });
+    }
+  };
+
+  editorContent = (): string => JSON.stringify(this.state.config, null, '  ');
+
+  onCopyToClipboard = (_text: string, _result: boolean): void => {
+    const ed = this.monacoEditorRef.current;
+
+    if (ed) {
+      const model = ed.getModel();
+      if (model) {
+        ed.setSelection(model.getFullModelRange());
+      }
+    }
+  };
+
+  showEditor = (): boolean => {
+    return this.state.resource === 'config' || this.state.resource === 'bootstrap';
+  };
+
+  showMemory = (): boolean => {
+    return this.state.resource === 'memory';
+  };
+
+  showMetrics = (): boolean => {
+    return this.state.resource === 'metrics';
+  };
+
+  getEnvoyMetricsDashboardRef = (): DashboardRef | undefined => {
+    let envoyDashboardRef: DashboardRef | undefined = undefined;
+    this.props.workload.runtimes.forEach(runtime => {
+      runtime.dashboardRefs.forEach(dashboardRef => {
+        if (dashboardRef.template === 'envoy') {
+          envoyDashboardRef = dashboardRef;
+        }
+      });
+    });
+    return envoyDashboardRef;
+  };
+
+  getFilteredEnvoyTabs = (): string[] => {
+    if (this.getEnvoyMetricsDashboardRef()) {
+      return envoyTabs;
+    }
+
+    return envoyTabs.filter(tab => tab !== 'metrics');
+  };
+
+  tabIndexForResource = (resource: string): number => {
+    const filteredTabs = this.getFilteredEnvoyTabs();
+    const index = filteredTabs.indexOf(resource);
+
+    if (index >= 0) {
+      return index;
+    }
+
+    const defaultIndex = filteredTabs.indexOf(defaultTab);
+    return defaultIndex >= 0 ? defaultIndex : 0;
+  };
+
+  onRouteLinkClick = (): void => {
+    this.setState({
+      config: {},
+      fetch: true,
+      resource: 'routes',
+      activeKey: this.tabIndexForResource('routes')
+    });
+
+    // Forcing to regenerate the active filters
+    FilterSelected.resetFilters();
+  };
+
+  render(): React.ReactNode {
+    const builder = SummaryTableBuilder(
+      this.state.resource,
+      this.state.config,
+      this.state.tableSortBy,
+      this.props.namespaces,
+      this.props.namespace,
+      this.onRouteLinkClick,
+      this.props.workload.name
+    );
+
+    const SummaryWriterComp = builder[0];
+    const summaryWriter = builder[1];
+    const appLabelName = getAppLabelName(this.props.workload.labels);
+    const verLabelName = getVersionLabelName(this.props.workload.labels);
+    const app = appLabelName ? this.props.workload.labels[appLabelName] : '';
+    const version = verLabelName ? this.props.workload.labels[verLabelName] : '';
+    const envoyMetricsDashboardRef = this.getEnvoyMetricsDashboardRef();
+    const filteredEnvoyTabs = this.getFilteredEnvoyTabs();
+
+    const tabs = filteredEnvoyTabs.map((value, index) => {
+      const title = t(envoyTabTitles[value] ?? value);
+      const tabNeedsPod = value !== 'memory' && value !== 'metrics';
+
+      return (
+        <Tab key={`tab_${value}`} eventKey={index} title={title}>
+          {tabNeedsPod && !this.hasPods() ? (
+            this.renderNoPodsEmptyState()
+          ) : this.showEditor() ? (
+            <Card className={classes(flexCardStyle, tabCardStyle)}>
+              <CardBody>
+                <div className={editorColumnStyle}>
+                  <div className={noShrinkStyle} style={{ marginBottom: '1.25rem' }}>
+                    <div key="service-icon" className={iconStyle}>
+                      <PFBadge badge={PFBadges.Pod} position={TooltipPosition.top} />
+                    </div>
+
+                    <ToolbarDropdown
+                      id="envoy_pods_list"
+                      tooltip={t('Display envoy config for the selected pod')}
+                      handleSelect={key => this.setPod(key)}
+                      value={this.state.pod?.name ?? ''}
+                      label={this.state.pod?.name ?? ''}
+                      options={this.props.workload.pods.map((pod: Pod) => pod.name).sort()}
+                    />
+
+                    <Tooltip key="copy_config" position="top" content={t('Copy config dump to clipboard')}>
+                      <CopyToClipboard onCopy={this.onCopyToClipboard} text={this.editorContent()}>
+                        <Button variant={ButtonVariant.link} className={copyButtonStyle} isInline>
+                          <KialiIcon.Copy />
+                          <span>{t('Copy')}</span>
+                        </Button>
+                      </CopyToClipboard>
+                    </Tooltip>
+                  </div>
+
+                  <div ref={this.editorWrapperRef} className={editorWrapperStyle}>
+                    <div className={editorStyle} data-test="envoy-editor" style={{ height: '100%' }}>
+                      <Editor
+                        value={this.editorContent()}
+                        language="yaml"
+                        theme={resolveColorScheme(this.props.colorScheme) === ColorScheme.DARK ? 'vs-dark' : 'light'}
+                        height="100%"
+                        onMount={ed => {
+                          (this.monacoEditorRef as any).current = ed;
+                        }}
+                        options={{ readOnly: true, wordWrap: 'on', scrollBeyondLastLine: false, folding: true }}
+                      />
+                    </div>
+                  </div>
+                </div>
+              </CardBody>
+            </Card>
+          ) : this.showMemory() ? (
+            <EnvoyMemory
+              lastRefreshAt={this.props.lastRefreshAt}
+              namespace={this.props.namespace}
+              onSelectEnvoyTab={resource => this.selectEnvoyTab(resource)}
+              podName={this.state.pod?.name}
+              timeRange={this.props.rangeDuration}
+              workload={this.props.workload}
+            />
+          ) : this.showMetrics() && envoyMetricsDashboardRef ? (
+            <Card className={classes(flexCardStyle, tabCardStyle)}>
+              <CardBody>
+                <div className={scrollableContentStyle}>
+                  <CustomMetrics
+                    app={app}
+                    appLabelName={appLabelName}
+                    data-test="envoy-metrics-component"
+                    embedded={true}
+                    lastRefreshAt={this.props.lastRefreshAt}
+                    namespace={this.props.namespace}
+                    template={envoyMetricsDashboardRef.template}
+                    version={version}
+                    versionLabelName={verLabelName}
+                    workload={this.props.workload!.name}
+                  />
+                </div>
+              </CardBody>
+            </Card>
+          ) : SummaryWriterComp ? (
+            <Card className={classes(flexCardStyle, tabCardStyle)}>
+              <CardBody>
+                <SummaryWriterComp
+                  writer={summaryWriter}
+                  sortBy={this.state.tableSortBy}
+                  onSort={this.onSort}
+                  pod={this.state.pod?.name ?? ''}
+                  pods={this.props.workload.pods.map(pod => pod.name)}
+                  setPod={this.setPod}
+                />
+              </CardBody>
+            </Card>
+          ) : null}
+        </Tab>
+      );
+    });
+
+    return (
+      <div className={classes(flexFillStyle, constrainedScrollStyle)}>
+        <div className={subTabStyle}>
+          <Tabs
+            id="envoy-details"
+            activeKey={this.state.activeKey}
+            onSelect={this.envoyHandleTabClick}
+            mountOnEnter={true}
+            unmountOnExit={true}
+            isSubtab={true}
+          >
+            {tabs}
+          </Tabs>
+        </div>
+      </div>
+    );
+  }
+}
+
+const mapStateToProps = (state: KialiAppState): ReduxProps => ({
+  language: languageSelector(state),
+  namespaces: namespaceItemsSelector(state)!,
+  ...mapAppearanceFromState(state)
+});
+
+export const EnvoyDetails = connect(mapStateToProps)(EnvoyDetailsComponent);

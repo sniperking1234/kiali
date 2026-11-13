@@ -1,58 +1,49 @@
 package data
 
 import (
-	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	api_networking_v1 "istio.io/api/networking/v1"
+	networking_v1 "istio.io/client-go/pkg/apis/networking/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	"github.com/kiali/kiali/config"
 	"github.com/kiali/kiali/kubernetes"
 )
 
-func CreateEmptyGateway(name, namespace string, selector map[string]string) kubernetes.IstioObject {
-	iSelector := make(map[string]interface{}, len(selector))
-	for k, v := range selector {
-		iSelector[k] = v
-	}
-	gateway := kubernetes.GenericIstioObject{
-		ObjectMeta: meta_v1.ObjectMeta{
-			Name:        name,
-			Namespace:   namespace,
-			ClusterName: config.Get().ExternalServices.Istio.IstioIdentityDomain,
-		},
-		Spec: map[string]interface{}{
-			"selector": iSelector,
+func CreateEmptyGateway(name, namespace string, selector map[string]string) *networking_v1.Gateway {
+	gw := networking_v1.Gateway{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       kubernetes.Gateways.Kind,
+			APIVersion: kubernetes.Gateways.GroupVersion().String(),
 		},
 	}
-	return &gateway
+	gw.Name = name
+	gw.Namespace = namespace
+	gw.Spec.Selector = selector
+	return &gw
 }
 
-func AddServerToGateway(server map[string]interface{}, gw kubernetes.IstioObject) kubernetes.IstioObject {
-	if serversTypeExists, found := gw.GetSpec()["servers"]; found {
-		if serversTypeCasted, ok := serversTypeExists.([]interface{}); ok {
-			serversTypeCasted = append(serversTypeCasted, server)
-			gw.GetSpec()["servers"] = serversTypeCasted
-		}
-	} else {
-		gw.GetSpec()["servers"] = []interface{}{server}
-	}
+func AddServerToGateway(server *api_networking_v1.Server, gw *networking_v1.Gateway) *networking_v1.Gateway {
+	gw.Spec.Servers = append(gw.Spec.Servers, server)
 	return gw
 }
 
-func CreateServer(hosts []string, port uint32, portName, protocolName string) map[string]interface{} {
-	hostSlice := make([]interface{}, 0, len(hosts))
-	for _, h := range hosts {
-		hostSlice = append(hostSlice, h)
+func CreateServer(hosts []string, port uint32, portName, protocolName string) *api_networking_v1.Server {
+	server := api_networking_v1.Server{
+		Hosts: hosts,
+		Port:  CreateEmptyPortDefinition(port, portName, protocolName),
 	}
-	return map[string]interface{}{
-		"port":  CreateEmptyPortDefinition(port, portName, protocolName),
-		"hosts": hostSlice,
-	}
+	return &server
 }
 
-func AddGatewaysToVirtualService(gateways []string, vs kubernetes.IstioObject) kubernetes.IstioObject {
-	gates := make([]interface{}, 0, len(gateways))
-	for _, v := range gateways {
-		gates = append(gates, v)
-	}
-	vs.GetSpec()["gateways"] = gates
+func AddGatewaysToVirtualService(gateways []string, vs *networking_v1.VirtualService) *networking_v1.VirtualService {
+	vs.Spec.Gateways = gateways
 	return vs
+}
+
+func CreateEmptyPortDefinition(port uint32, portName, protocolName string) *api_networking_v1.Port {
+	p := api_networking_v1.Port{
+		Number:   port,
+		Name:     portName,
+		Protocol: protocolName,
+	}
+	return &p
 }

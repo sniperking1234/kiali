@@ -7,35 +7,24 @@ assignees: ''
 
 ---
 
-**General remarks**
 
-> Please delete this section including header before submitting
->
-> This form is to report bugs. For general usage questions refer to 
->       https://github.com/kiali/kiali/discussions
->
-> For general Kiali-development questions refer to 
->       [Kiali-dev](https://groups.google.com/forum/#!forum/kiali-dev) mailing list.
->
-> If you want to propose an enhancement or feature request, please use the feature request template.
+### Describe the bug
 
+A clear and concise description of the bug. (provide screenshots if applicable)
 
-**Describe the bug**
-A clear and concise description of what the bug is.
+### Expected Behavior
 
-For UI issues please also add a screenshot that shows the issue.
+### What are the steps to reproduce this bug?
 
-**Versions used**
-Kiali:
-Istio:
-Kubernetes flavour and version: (e.g. OpenShift Origin 3.9)
+1. …
+2. …
+3. …
 
-**To Reproduce**
-Steps to reproduce the behavior:
-1. Go to '...'
-2. Click on '....'
-3. Scroll down to '....'
-4. See error
+### Environment
+*Learn about how to determine versions [here](https://kiali.io/docs/faq/general/#how-do-i-determine-what-version-i-am-running).*
 
-**Expected behavior**
-A clear and concise description of what you expected to happen.
+- **Kiali version:**
+- **Istio version:**
+- **Kubernetes impl:** 
+- **Kubernetes version:** 
+- **Other notable environmental factors:**

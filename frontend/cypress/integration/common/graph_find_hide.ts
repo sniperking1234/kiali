@@ -1,0 +1,127 @@
+import { Then, When } from '@badeball/cypress-cucumber-preprocessor';
+import { assertGraphFindHideReady } from './graph';
+
+const clearFindAndHide = (): void => {
+  cy.get('#graph_hide').clear();
+  cy.get('#graph_find').clear();
+};
+
+When('user finds unhealthy workloads', () => {
+  clearFindAndHide();
+
+  cy.get('#graph_find').type('!healthy{enter}');
+  cy.get('#graph_find').should('have.value', '!healthy');
+});
+
+Then('user sees unhealthy workloads highlighted on the graph', () => {
+  const expectedUnhealthyNodes = [
+    {
+      app: 'w-server',
+      version: 'v1', // red workload
+      namespace: 'alpha'
+    },
+    {
+      app: 'w-server',
+      version: undefined, // red service
+      namespace: 'alpha'
+    },
+    {
+      app: 'y-server',
+      version: 'v1', // yellow workload
+      namespace: 'alpha'
+    },
+    {
+      app: 'y-server',
+      version: undefined, // yellow service
+      namespace: 'alpha'
+    }
+  ];
+
+  assertGraphFindHideReady({ readFindValueFromInput: true }, ({ nodes }) => {
+    const unhealthyNodes = nodes
+      .filter(n => n.getData().isFind)
+      .map(n => ({
+        app: n.getData().app,
+        version: n.getData().version,
+        namespace: n.getData().namespace
+      }));
+
+    assert.includeDeepMembers(unhealthyNodes, expectedUnhealthyNodes, 'Unexpected unhealthy nodes');
+  });
+});
+
+Then('user sees nothing highlighted on the graph', () => {
+  assertGraphFindHideReady({ findValue: '' }, ({ nodes }) => {
+    const filteredNodes = nodes.filter(n => n.getData().isFind);
+    assert.equal(filteredNodes.length, 0, 'Unexpected number of highlighted nodes');
+  });
+});
+
+When('user hides unhealthy workloads', () => {
+  clearFindAndHide();
+
+  cy.get('#graph_hide').type('!healthy{enter}');
+  cy.get('#graph_hide').should('have.value', '!healthy');
+});
+
+Then('user sees no unhealthy workloads on the graph', () => {
+  assertGraphFindHideReady({ hideValue: '!healthy' }, ({ nodes }) => {
+    const visibleNodes = nodes.filter(n => n.isVisible());
+    const noUnhealthyNodes = visibleNodes.every(
+      node => node.getData().healthStatus !== 'Failure' || node.getData().nodeType === 'box'
+    );
+
+    assert.equal(noUnhealthyNodes, true, 'Unhealthy nodes are still visible');
+  });
+});
+
+Then('user sees preset find options', () => {
+  cy.getBySel('find-options-dropdown').click();
+  cy.contains('Find: unhealthy nodes');
+});
+
+When('user selects the preset the find option {string}', (option: string) => {
+  cy.get('#graph-find-presets').contains(option).click();
+  cy.get('#graph_find').should('not.have.value', '');
+});
+
+Then('user sees preset hide options', () => {
+  cy.getBySel('hide-options-dropdown').click();
+  cy.contains('Hide: healthy nodes');
+});
+
+When('user selects the preset hide option {string}', (option: string) => {
+  cy.get('#graph-hide-presets').contains(option).click();
+  cy.get('#graph_hide').should('not.have.value', '');
+});
+
+Then('user sees no healthy workloads on the graph', () => {
+  assertGraphFindHideReady({ readHideValueFromInput: true }, ({ nodes }) => {
+    const visibleNodes = nodes.filter(n => n.isVisible());
+    const noHealthyNodes = visibleNodes.every(
+      node => node.getData().healthStatus !== 'Healthy' || node.getData().nodeType === 'box'
+    );
+
+    assert.equal(noHealthyNodes, true, 'Healthy nodes are still visible');
+  });
+});
+
+When('user seeks help for find and hide', () => {
+  cy.getBySel('graph-find-hide-help-button').should('be.visible').click();
+});
+
+Then('user sees the help menu', () => {
+  cy.getBySel('graph-find-hide-help').should('be.visible');
+});
+
+Then('the help menu has info on {string}', (helpMenuItem: string) => {
+  cy.get('#graph_find_help_tabs').contains(helpMenuItem).should('be.visible');
+});
+
+When('user fills {string} in find and submits', (input: string) => {
+  cy.get('#graph_find').type(`${input}{enter}`);
+});
+
+Then('user sees the {string} message', (error: string) => {
+  cy.get('[aria-label="graph settings"]').should('contain.text', error);
+});

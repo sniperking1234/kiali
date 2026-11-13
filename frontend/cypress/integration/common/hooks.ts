@@ -1,0 +1,419 @@
+import { Before, After } from '@badeball/cypress-cucumber-preprocessor';
+import { discoverKialiRuntimeInfo, enableKialiCaching } from './kiali-config';
+import { waitForResourceDeletion } from './transition';
+
+const CLUSTER1_CONTEXT = Cypress.env('CLUSTER1_CONTEXT');
+const CLUSTER2_CONTEXT = Cypress.env('CLUSTER2_CONTEXT');
+const IN_OFFLINE_MODE = Cypress.env('RUN_MODE') === 'offline';
+
+const install_demoapp = (demoapp: string): void => {
+  if (IN_OFFLINE_MODE) {
+    cy.log(`In offline mode. Skipping installing demo ${demoapp}.`);
+    return;
+  }
+
+  let namespaces = 'bookinfo';
+  let deletion = `--delete-${demoapp}`;
+  let tg = '-tg';
+  let istio = '-in istio-system';
+
+  if (demoapp === 'error-rates') {
+    namespaces = 'alpha beta';
+    deletion = '--delete';
+    tg = '';
+  } else if (demoapp === 'sleep') {
+    namespaces = 'sleep';
+    tg = '';
+    istio = '';
+  } else if (demoapp === 'loggers') {
+    namespaces = 'loggers';
+    tg = '';
+    istio = '';
+    deletion = '--delete';
+  }
+
+  cy.exec(`../hack/istio/cypress/${demoapp}-status.sh`, { failOnNonZeroExit: false, timeout: 120000 }).then(result => {
+    cy.log(result.stdout);
+
+    if (result.exitCode === 0) {
+      cy.log(`${demoapp} demo app is up and running`);
+    } else {
+      cy.log(`${demoapp} demo app is either broken or not present. Installing now.`);
+      cy.log(`Detecting pod architecture.`);
+
+      cy.exec('../hack/istio/cypress/get-node-architecture.sh', { failOnNonZeroExit: false }).then(result => {
+        if (result.exitCode === 0) {
+          const arch: string = result.stdout;
+          cy.log(`Installing apps on ${arch} architecture.`);
+
+          // is the suite running on openshift?
+          cy.exec('kubectl api-versions | grep --quiet "route.openshift.io";', { failOnNonZeroExit: false }).then(
+            result => {
+              if (result.exitCode === 0) {
+                cy.log('Openshift detected.').log(`Removing old ${demoapp} installations.`);
+
+                cy.exec(`../hack/istio/install-${demoapp}-demo.sh ${deletion} true`).then(() => {
+                  cy.log('Installing new demo app.');
+                  cy.exec(`../hack/istio/install-${demoapp}-demo.sh ${tg} ${istio} -a ${arch}`, {
+                    timeout: 300000
+                  }).then(() => {
+                    cy.log('Waiting for demoapp to be ready.');
+
+                    cy.exec(`../hack/istio/wait-for-namespace.sh -n ${namespaces}`, { timeout: 400000 });
+                  });
+                });
+              } else {
+                cy.log(`Removing old ${demoapp} installations.`)
+                  .exec(`../hack/istio/install-${demoapp}-demo.sh ${deletion} true -c kubectl`)
+                  .then(() => {
+                    cy.log('Installing new demo app.');
+
+                    cy.exec(`../hack/istio/install-${demoapp}-demo.sh -c kubectl ${tg} ${istio} -a ${arch}`, {
+                      timeout: 300000
+                    });
+                  });
+              }
+            }
+          );
+        } else {
+          cy.log(
+            'Different architectures on various nodes detected. Failed to install the demoapp using the Cypress hook.'
+          );
+        }
+      });
+    }
+  });
+};
+
+Before(() => {
+  cy.on('uncaught:exception', (err, runnable, promise) => {
+    if (promise) {
+      Cypress.log({
+        name: 'uncaught:promise',
+        message: `Swallowed unhandled promise rejection: ${err.message}`,
+        consoleProps: () => ({ error: err, runnable })
+      });
+      return false;
+    }
+
+    if (err.message?.includes('ResizeObserver loop')) {
+      return false;
+    }
+  });
+});
+
+Before({ tags: '@gateway-api' }, () => {
+  cy.exec('kubectl get crd gateways.gateway.networking.k8s.io', { failOnNonZeroExit: false }).then(result => {
+    if (result.exitCode !== 0) {
+      cy.log('Gateway API not found. Enabling it now.');
+
+      cy.exec('kubectl kustomize "github.com/kubernetes-sigs/gateway-api/config/crd?ref=v1.6.0" | kubectl apply -f -;')
+        .its('exitCode')
+        .should('eq', 0)
+        .then(() => {
+          cy.exec(
+            'kubectl rollout restart deployment/kiali -n istio-system && kubectl rollout status deployment/kiali -n istio-system'
+          );
+        });
+    }
+  });
+});
+
+Before({ tags: '@gateway-api-ie' }, () => {
+  cy.exec('kubectl get crd inference.networking.k8s.io', { failOnNonZeroExit: false }).then(result => {
+    if (result.exitCode !== 0) {
+      cy.log('Gateway API Inference Extension not found. Enabling it now.');
+
+      cy.exec(
+        'kubectl kustomize "github.com/kubernetes-sigs/gateway-api-inference-extension/config/crd?ref=v1.5.0" | kubectl apply -f -;'
+      )
+        .its('exitCode')
+        .should('eq', 0)
+        .then(() => {
+          cy.exec(
+            'kubectl rollout restart deployment/kiali -n istio-system && kubectl rollout status deployment/kiali -n istio-system'
+          );
+        });
+    }
+  });
+});
+
+Before({ tags: '@bookinfo-app' }, () => {
+  install_demoapp('bookinfo');
+});
+
+Before({ tags: '@error-rates-app' }, () => {
+  install_demoapp('error-rates');
+});
+
+Before({ tags: '@sleep-app' }, () => {
+  install_demoapp('sleep');
+});
+
+Before({ tags: '@loggers-app' }, () => {
+  install_demoapp('loggers');
+});
+
+// OpenShift user-workload Prometheus scrapes Istio proxies via a namespaced
+// PodMonitor. Cypress bookinfo reinstall deletes the namespace and drops it.
+Before({ tags: '@core-caching' }, () => {
+  if (IN_OFFLINE_MODE || Cypress.env('OPENSHIFT_BOOKINFO_MONITORING_ENSURED')) {
+    return;
+  }
+
+  const tagFilter = (Cypress.env('TAGS') ?? '') as string;
+  if (!tagFilter.includes('@core-caching')) {
+    return;
+  }
+
+  cy.exec('kubectl api-versions | grep --quiet "route.openshift.io";', { failOnNonZeroExit: false }).then(result => {
+    if (result.exitCode === 0) {
+      cy.exec('../hack/istio/ensure-openshift-istio-proxies-podmonitor.sh -c oc -n bookinfo', {
+        failOnNonZeroExit: false,
+        timeout: 120000
+      });
+    }
+    Cypress.env('OPENSHIFT_BOOKINFO_MONITORING_ENSURED', true);
+  });
+});
+
+// This hook enables Kiali caching when it isn't already on. Because the
+// enable path leaves caching turned on (no teardown), @core-caching must
+// be the LAST tag group in composite cypress:run / cypress:run:junit
+// scripts in package.json to avoid affecting other suites.
+Before({ tags: '@core-caching' }, () => {
+  cy.task('log', '[CACHING_HOOK] Before @core-caching hook ENTERED');
+
+  if (Cypress.env('CACHING_ENABLED')) {
+    cy.task('log', '[CACHING_HOOK] CACHING_ENABLED already set — returning early');
+    return;
+  }
+
+  // Only attempt caching setup when @core-caching is explicitly part of the
+  // requested tag filter. Otherwise this scenario was matched by another tag
+  // (e.g. @smoke) and caching infrastructure isn't relevant.
+  const tags = (Cypress.env('TAGS') ?? '') as string;
+  cy.task('log', `[CACHING_HOOK] TAGS env = "${tags}"`);
+  if (!tags.includes('@core-caching')) {
+    cy.task('log', '[CACHING_HOOK] TAGS does not include @core-caching — skipping setup, setting CACHING_ENABLED');
+    Cypress.env('CACHING_ENABLED', true);
+    return;
+  }
+
+  // Detect both caches and health status metric enabled. Operator path returns JSON, Helm returns YAML.
+  // The regex must match "enabled: true" only within the immediate cache block,
+  // not an unrelated "enabled: true" elsewhere in the config.
+  const bothCachesEnabled = (text: string, json: boolean): boolean => {
+    if (json) {
+      // JSON: "graph_cache": { ... "enabled": true ... } — match within the same braces
+      return (
+        /"graph_cache"\s*:\s*\{[^}]*"enabled"\s*:\s*true/.test(text) &&
+        /"health_cache"\s*:\s*\{[^}]*"enabled"\s*:\s*true/.test(text) &&
+        /"health_status"\s*:\s*\{[^}]*"enabled"\s*:\s*true/.test(text)
+      );
+    }
+    // YAML: "enabled: true" must appear on the next indented line after the cache key
+    return (
+      /graph_cache:\s*\n\s+enabled:\s*true/.test(text) &&
+      /health_cache:\s*\n\s+enabled:\s*true/.test(text) &&
+      /health_status:\s*\n\s+enabled:\s*true/.test(text)
+    );
+  };
+
+  cy.task('log', '[CACHING_HOOK] Calling discoverKialiRuntimeInfo()...');
+  discoverKialiRuntimeInfo().then(info => {
+    cy.task(
+      'log',
+      `[CACHING_HOOK] Discovered Kiali: deployment=${info.deploymentName}, namespace=${info.namespace}, configMap=${info.configMapName}`
+    );
+    cy.exec(
+      `kubectl get deployment/${info.deploymentName} -n ${info.namespace} -o jsonpath="{.metadata.annotations.operator-sdk\\/primary-resource}"`,
+      { failOnNonZeroExit: false }
+    ).then(result => {
+      const primaryResource = result.stdout.trim();
+      cy.task(
+        'log',
+        `[CACHING_HOOK] operator-sdk/primary-resource annotation = "${primaryResource}" (code=${result.code})`
+      );
+
+      const checkDone = (configText: string, isJson: boolean): void => {
+        const alreadyEnabled = bothCachesEnabled(configText, isJson);
+        cy.task(
+          'log',
+          `[CACHING_HOOK] bothCachesEnabled(json=${isJson}) = ${alreadyEnabled}, configText length = ${configText.length}`
+        );
+        if (configText.length < 500) {
+          cy.task('log', `[CACHING_HOOK] configText = ${configText}`);
+        } else {
+          cy.task('log', `[CACHING_HOOK] configText (first 500 chars) = ${configText.substring(0, 500)}`);
+        }
+
+        if (alreadyEnabled) {
+          cy.task('log', '[CACHING_HOOK] Caching already enabled — no restart needed');
+          Cypress.env('CACHING_ENABLED', true);
+          return;
+        }
+
+        cy.task('log', '[CACHING_HOOK] Caching NOT enabled — calling enableKialiCaching()...');
+        enableKialiCaching(info);
+        cy.then(() => {
+          cy.task('log', '[CACHING_HOOK] enableKialiCaching() complete — setting CACHING_ENABLED');
+          Cypress.env('CACHING_ENABLED', true);
+        });
+      };
+
+      if (primaryResource) {
+        const parts = primaryResource.split('/');
+        cy.task('log', `[CACHING_HOOK] Operator path: kubectl get kiali ${parts[1]} -n ${parts[0]}`);
+        cy.exec(`kubectl get kiali ${parts[1]} -n ${parts[0]} -o jsonpath="{.spec}"`, {
+          failOnNonZeroExit: false
+        }).then(crResult => {
+          cy.task('log', `[CACHING_HOOK] Kiali CR spec fetch: code=${crResult.code}, stderr="${crResult.stderr}"`);
+          checkDone(crResult.stdout, true);
+        });
+      } else {
+        cy.task('log', `[CACHING_HOOK] Helm path: kubectl get configmap ${info.configMapName} -n ${info.namespace}`);
+        cy.exec(
+          `kubectl get configmap ${info.configMapName} -n ${info.namespace} -o jsonpath="{.data.config\\\\.yaml}"`,
+          { failOnNonZeroExit: false }
+        ).then(cmResult => {
+          cy.task('log', `[CACHING_HOOK] ConfigMap fetch: code=${cmResult.code}, stderr="${cmResult.stderr}"`);
+          checkDone(cmResult.stdout, false);
+        });
+      }
+    });
+  });
+});
+
+Before({ tags: '@remote-istio-crds' }, () => {
+  cy.exec(
+    `kubectl get crd --context ${CLUSTER2_CONTEXT} -o=custom-columns=NAME:.metadata.name |  grep -E -i '.(istio|k8s).io$'`,
+    { failOnNonZeroExit: false }
+  ).then(result => {
+    if (result.exitCode !== 0) {
+      cy.log('Istio CRDs not found on the remote cluster. Enabling it now.');
+
+      cy.exec(
+        `kubectl apply -f https://raw.githubusercontent.com/istio/istio/master/manifests/charts/base/crds/crd-all.gen.yaml --context ${CLUSTER2_CONTEXT}`
+      )
+        .its('exitCode')
+        .should('eq', 0)
+        .then(() => {
+          cy.exec(
+            `kubectl rollout restart deployment/kiali -n istio-system --context ${CLUSTER1_CONTEXT} && kubectl rollout status deployment/kiali -n istio-system --context ${CLUSTER1_CONTEXT}`
+          );
+        });
+    }
+  });
+});
+
+After({ tags: '@sleep-app-scaleup-after' }, () => {
+  // Restore sleep so later tests have the deployment. Run even if scale fails (e.g. namespace missing).
+  cy.exec('kubectl scale -n sleep --replicas=1 deployment/sleep', { failOnNonZeroExit: false });
+});
+
+// remove resources created in the istio-system namespace to not influence istio instance after the test
+After({ tags: '@clean-istio-namespace-resources-after' }, () => {
+  cy.exec('kubectl -n istio-system delete PeerAuthentication default', { failOnNonZeroExit: false });
+  cy.exec('kubectl -n istio-system delete Sidecar default', { failOnNonZeroExit: false });
+  waitForResourceDeletion('istio-system', 'PeerAuthentication', 'default');
+  waitForResourceDeletion('istio-system', 'Sidecar', 'default');
+  // Restart alpha and beta deployments to force Envoy config reload
+  cy.exec('kubectl rollout restart deployment -n alpha', { failOnNonZeroExit: false });
+  cy.exec('kubectl rollout restart deployment -n beta', { failOnNonZeroExit: false });
+  cy.exec('kubectl rollout status deployment -n alpha --timeout=60s', { failOnNonZeroExit: false });
+  cy.exec('kubectl rollout status deployment -n beta --timeout=60s', { failOnNonZeroExit: false });
+});
+
+const istioSharedMeshConfigMap = `
+apiVersion: v1
+data:
+  mesh: |-
+    outboundTrafficPolicy:
+      mode: REGISTRY_ONLY
+kind: ConfigMap
+metadata:
+  name: istio-user
+  namespace: istio-system
+`;
+
+function restoreMeshConfigAfterSharedMeshConfig(): void {
+  cy.exec(`echo "${istioSharedMeshConfigMap}" | kubectl delete -f -`, { failOnNonZeroExit: false });
+  const patch = '{"spec": {"values": {"pilot": {"env": {"SHARED_MESH_CONFIG": null}}}}}';
+  cy.exec(`kubectl patch istio default --type='merge' -p '${patch}'`, { failOnNonZeroExit: false });
+}
+
+Before({ tags: '@shared-mesh-config' }, () => {
+  // Before runs before Background, so no cy.visit() has run yet and the session is not restored.
+  // cy.request() then has no auth cookies → 401 on OpenShift. Ensure we're logged in first.
+  const authStrategy = Cypress.env('AUTH_STRATEGY');
+  if (authStrategy !== undefined && authStrategy !== 'anonymous') {
+    cy.login(Cypress.env('USERNAME') ?? 'jenkins', Cypress.env('PASSWD'));
+  }
+  cy.exec(`kubectl get pods -l app=istiod -n istio-system -o jsonpath="{.items[0].metadata.name}"`).then(result => {
+    const podName = result.stdout;
+
+    cy.exec(`echo "${istioSharedMeshConfigMap}" | kubectl apply -f -`);
+    const patch = '{"spec": {"values": {"pilot": {"env": {"SHARED_MESH_CONFIG": "istio-user"}}}}}';
+    cy.exec(`kubectl patch istio default --type='merge' -p '${patch}'`).then(() => {
+      const maxTries = 15;
+      let tries = 0;
+      const doRequest = (): void => {
+        if (tries > maxTries) {
+          restoreMeshConfigAfterSharedMeshConfig();
+          throw new Error('Timed out waiting for Kiali to see the Shared Mesh Config');
+        }
+
+        tries++;
+        cy.request({ method: 'GET', url: '/api/mesh/graph', failOnStatusCode: false }).then(response => {
+          if (response.status !== 200) {
+            // e.g. 401: restore mesh so we don't leave REGISTRY_ONLY for later scenarios
+            restoreMeshConfigAfterSharedMeshConfig();
+            cy.then(() =>
+              expect(response.status, `Expected 200 from /api/mesh/graph, got ${response.status}`).to.equal(200)
+            );
+            return;
+          }
+          console.log(response.body.elements.nodes.find(node => node.data.infraType === 'istiod'));
+          if (
+            response.body.elements.nodes.find(node => node.data.infraType === 'istiod')?.data?.infraData?.config
+              ?.sharedConfig === undefined
+          ) {
+            cy.log(`Kiali has not seen the Shared Mesh Config yet. Tries: ${tries}. Waiting 3s...`);
+            cy.wait(3000);
+            doRequest();
+          } else {
+            cy.exec(`kubectl wait --for=delete pod/${podName} -n istio-system --timeout=60s`);
+          }
+        });
+      };
+      doRequest();
+    });
+  });
+});
+
+After({ tags: '@shared-mesh-config' }, () => {
+  // Restore mesh so PolicyAllowAny is back to default (e.g. ALLOW_ANY).
+  restoreMeshConfigAfterSharedMeshConfig();
+});
+
+Before(() => {
+  if (Cypress.env('STERN') === true) {
+    const specName = Cypress.spec && Cypress.spec.name ? Cypress.spec.name : 'unknown-spec';
+    cy.exec(`../hack/stern/run-stern.sh --logfile ${specName}.json`, { failOnNonZeroExit: false }).then(result => {
+      if (result.exitCode !== 0) {
+        cy.log('Failed to start stern. Check if the stern binary is downloaded.');
+      }
+    });
+  }
+});
+
+After(() => {
+  if (Cypress.env('STERN') === true) {
+    cy.exec(`../hack/stern/run-stern.sh --stop true`, { failOnNonZeroExit: false }).then(result => {
+      if (result.exitCode !== 0) {
+        cy.log('Failed to stop stern. Check if the stern binary is downloaded.');
+      }
+    });
+  }
+});

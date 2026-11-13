@@ -1,0 +1,590 @@
+import * as React from 'react';
+import { connect } from 'react-redux';
+import type { KialiDispatch } from 'types/Redux';
+import { Button, ButtonVariant, EmptyState, EmptyStateBody, EmptyStateVariant } from '@patternfly/react-core';
+import type { IRow, IRowData, IAction, ISortBy, OnSort } from '@patternfly/react-table';
+import { SortByDirection, TableVariant } from '@patternfly/react-table';
+import { compareNullable } from 'components/FilterList/FilterHelper';
+import type { MetricsStats } from 'types/Metrics';
+import type { KialiAppState } from 'store/Store';
+import type { MetricsStatsQuery } from 'types/MetricsOptions';
+import { MetricsStatsThunkActions } from 'actions/MetricsStatsThunkActions';
+import type { EnvoySpanInfo, OpenTracingHTTPInfo, OpenTracingTCPInfo, RichSpanData } from 'types/TracingInfo';
+import { isWaypointProxySpan, sameSpans } from 'utils/tracing/TracingHelper';
+import { buildQueriesFromSpans } from 'utils/tracing/TraceStats';
+import { getParamsSeparator, getSpanId } from '../../../utils/SearchParamUtils';
+import { kialiStyle } from 'styles/StyleUtils';
+import { formatDuration, isErrorTag } from 'utils/tracing/TracingHelper';
+import { KialiLink } from '../../Link/KialiLink';
+import { responseFlags } from 'utils/ResponseFlags';
+import { renderMetricsComparison } from './StatsComparison';
+import { router } from 'app/History';
+import { isParentKiosk, kioskNavigateAction, kioskTracingAction } from '../../Kiosk/KioskActions';
+import type { TracingUrlProvider } from 'types/Tracing';
+import { KialiIcon } from 'config/KialiIcon';
+import type { SortableTh } from 'components/Table/SimpleTable';
+import { SimpleTable } from 'components/Table/SimpleTable';
+import { ColorScheme } from '../../../types/Common';
+import { mapAppearanceFromState, resolveColorScheme } from '../../../utils/AppearanceUtils';
+import { languageSelector } from 'store/Selectors';
+import { t } from 'utils/I18nUtils';
+
+type ReduxProps = {
+  loadMetricsStats: (queries: MetricsStatsQuery[], isCompact: boolean) => void;
+};
+
+type StateProps = {
+  colorScheme: string;
+  kiosk: string;
+  language: string;
+  metricsStats: Map<string, MetricsStats>;
+  provider?: string;
+  systemAppearanceRevision: number;
+};
+
+type Props = ReduxProps &
+  StateProps & {
+    cluster?: string;
+    externalURLProvider?: TracingUrlProvider;
+    fromWaypoint: boolean; // If the traces come from a waypoint proxy
+    includeWaypoint?: boolean;
+    items: RichSpanData[];
+    namespace: string;
+    target: string;
+    traceID: string;
+  };
+
+interface State {
+  expandedSpans: Map<string, boolean>;
+  openKebab?: string;
+  sortDirection: SortByDirection;
+  sortIndex: number;
+}
+
+interface SortableCompareTh<T> extends SortableTh {
+  compare?: (a: T, b: T) => number;
+}
+
+const dangerErrorStyle = kialiStyle({
+  borderLeft: 'var(--pf-t--global--dark--color--status--danger--100)'
+});
+
+const selectedErrorStyle = kialiStyle({
+  borderRight: 'var(--pf-t--global--dark--color--status--info--100)',
+  borderLeft: 'var(--pf-t--global--dark--color--status--danger--100)'
+});
+
+const selectedStyle = kialiStyle({
+  borderRight: 'var(--pf-t--global--dark--color--status--info--100)'
+});
+
+const tableStyle = kialiStyle({
+  $nest: {
+    '&& tbody > tr > td': {
+      paddingTop: '0.25rem',
+      paddingBottom: '0.75rem',
+      $nest: {
+        '& .pf-v6-c-menu-toggle': {
+          verticalAlign: '-0.25rem'
+        }
+      }
+    }
+  }
+});
+
+const expandButtonStyle = kialiStyle({
+  padding: '0.25rem',
+  paddingLeft: 0
+});
+
+const linkIconStyle = kialiStyle({
+  marginLeft: '0.25rem'
+});
+
+const errorIconStyle = kialiStyle({
+  marginRight: '0.25rem'
+});
+
+const getClassName = (
+  isError: boolean,
+  isSpan,
+  operationName,
+  item: string,
+  darkTheme: boolean
+): string | undefined => {
+  const highlight = operationName.toLowerCase().includes(item);
+
+  const blueColor = darkTheme
+    ? 'var(--pf-t--global--dark--color--nonstatus--blue--300)'
+    : 'var(--pf-t--global--dark--color--nonstatus--blue--100)';
+  const highlightStyle = kialiStyle({
+    background: blueColor
+  });
+
+  const highlightErrorStyle = kialiStyle({
+    background: blueColor,
+    borderLeft: 'var(--pf-t--global--dark--color--status--danger--100)'
+  });
+  return isSpan
+    ? isError
+      ? selectedErrorStyle
+      : selectedStyle
+    : isError
+      ? highlight
+        ? highlightErrorStyle
+        : dangerErrorStyle
+      : highlight
+        ? highlightStyle
+        : undefined;
+};
+
+class SpanTableComponent extends React.Component<Props, State> {
+  constructor(props: Props) {
+    super(props);
+    const isSpan = getSpanId();
+    const mapExpandedSpans = new Map();
+    isSpan && mapExpandedSpans.set(isSpan, true);
+    this.state = {
+      expandedSpans: mapExpandedSpans,
+      sortIndex: 0,
+      sortDirection: SortByDirection.asc
+    };
+  }
+
+  componentDidMount(): void {
+    this.fetchComparisonMetrics(this.props.items);
+  }
+
+  componentDidUpdate(prevProps: Readonly<Props>): void {
+    if (!sameSpans(prevProps.items, this.props.items)) {
+      this.fetchComparisonMetrics(this.props.items);
+    }
+  }
+
+  render(): JSX.Element {
+    const sortBy: ISortBy = { index: this.state.sortIndex, direction: this.state.sortDirection };
+    const onSort: OnSort = (_event: React.MouseEvent, index: number, sortDirection: SortByDirection) =>
+      this.setState({ sortIndex: index, sortDirection: sortDirection });
+
+    const noSpans: React.ReactNode = (
+      <EmptyState headingLevel="h5" titleText={t('No spans found')} variant={EmptyStateVariant.full}>
+        <EmptyStateBody>{t('No spans match the current filters')}</EmptyStateBody>
+      </EmptyState>
+    );
+
+    return (
+      <SimpleTable
+        label={t('Span List')}
+        className={tableStyle}
+        columns={this.getColumns()}
+        rows={this.rows()}
+        emptyState={noSpans}
+        onSort={onSort}
+        sortBy={sortBy}
+        actionResolver={this.actionResolver}
+        variant={TableVariant.compact}
+      />
+    );
+  }
+
+  private getColumns = (): SortableCompareTh<RichSpanData>[] => [
+    {
+      title: t('Timeline'),
+      sortable: true,
+      compare: (a, b) => a.startTime - b.startTime
+    },
+    {
+      title: t('App / Workload'),
+      sortable: true,
+      compare: (a, b) => compareNullable(a.workload, b.workload, (a2, b2) => a2.localeCompare(b2))
+    },
+    {
+      title: t('Summary'),
+      sortable: false
+    },
+    {
+      title: t('Statistics'),
+      sortable: true,
+      compare: (a, b) => a.duration - b.duration
+    }
+  ];
+
+  private fetchComparisonMetrics(items: RichSpanData[]): void {
+    const queries = buildQueriesFromSpans(items, false, this.shouldIncludeWaypoint());
+    this.props.loadMetricsStats(queries, false);
+  }
+
+  private shouldIncludeWaypoint = (): boolean =>
+    !!this.props.includeWaypoint || this.props.items.some(item => isWaypointProxySpan(item));
+
+  private rows = (): IRow[] => {
+    const compare = this.getColumns()[this.state.sortIndex].compare;
+    const sorted = compare
+      ? this.props.items.sort(this.state.sortDirection === SortByDirection.asc ? compare : (a, b) => compare(b, a))
+      : this.props.items;
+
+    return sorted.map(item => this.buildRow(item));
+  };
+
+  private buildRow = (item: RichSpanData): IRow => {
+    const isExpanded = this.isExpanded(item.spanID);
+    const isSpan = item.spanID === getSpanId();
+    const darkTheme = resolveColorScheme(this.props.colorScheme) === ColorScheme.DARK;
+    return {
+      cells: [
+        <>
+          <Button
+            key={`${item.spanID}-duration`}
+            className={expandButtonStyle}
+            variant={ButtonVariant.link}
+            onClick={() => this.toggleExpanded(item.spanID)}
+          >
+            {isExpanded ? <KialiIcon.AngleDown /> : <KialiIcon.AngleRight />}
+          </Button>
+          {formatDuration(item.relativeStartTime)}
+        </>,
+        this.originCell(item),
+        this.summaryCell(item),
+        this.statsCell(item)
+      ],
+      className: getClassName(item.tags.some(isErrorTag), isSpan, item.operationName, this.props.target, darkTheme),
+      item: item
+    };
+  };
+
+  private actionResolver = (rowData: IRowData): IAction[] => {
+    const item = rowData.item;
+    const parentKiosk = isParentKiosk(this.props.kiosk);
+    const appActions: IAction[] = [
+      {
+        isDisabled: true,
+        title: <h1 aria-hidden="true">{`Application (${item.app})`}</h1>
+      },
+      {
+        title: t('Inbound Metrics'),
+        onClick: () => {
+          const href = `${item.linkToApp}${getParamsSeparator(rowData.item.linkToApp)}tab=in_metrics`;
+          if (parentKiosk) {
+            kioskNavigateAction(href);
+          } else {
+            router.navigate(href);
+          }
+        }
+      },
+      {
+        title: t('Outbound Metrics'),
+        onClick: () => {
+          const href = `${item.linkToApp}${getParamsSeparator(rowData.item.linkToApp)}tab=out_metrics`;
+          if (parentKiosk) {
+            kioskNavigateAction(href);
+          } else {
+            router.navigate(href);
+          }
+        }
+      }
+    ];
+
+    let workloadActions: IAction[] = [];
+
+    if (item.linkToWorkload) {
+      workloadActions = [
+        {
+          isDisabled: true,
+          title: <h1 aria-hidden="true">{`Workload (${item.workload})`}</h1>
+        },
+        {
+          title: t('Logs'),
+          onClick: () => {
+            const href = `${item.linkToWorkload}?tab=logs`;
+            if (parentKiosk) {
+              kioskNavigateAction(href);
+            } else {
+              router.navigate(href);
+            }
+          }
+        },
+        {
+          title: t('Inbound Metrics'),
+          onClick: () => {
+            const href = `${item.linkToWorkload}${getParamsSeparator(rowData.item.linkToWorkload)}tab=in_metrics`;
+            if (parentKiosk) {
+              kioskNavigateAction(href);
+            } else {
+              router.navigate(href);
+            }
+          }
+        },
+        {
+          title: t('Outbound Metrics'),
+          onClick: () => {
+            const href = `${item.linkToWorkload}${getParamsSeparator(rowData.item.linkToWorkload)}tab=out_metrics`;
+            if (parentKiosk) {
+              kioskNavigateAction(href);
+            } else {
+              router.navigate(href);
+            }
+          }
+        }
+      ];
+    }
+
+    let tracingActions: IAction[] = [];
+
+    if (this.props.externalURLProvider || parentKiosk) {
+      const spanLink = this.props.externalURLProvider?.SpanUrl(item);
+      tracingActions = [
+        {
+          isDisabled: true,
+          title: <h1 aria-hidden="true">{`Tracing`}</h1>
+        },
+        {
+          title: (
+            <span>
+              More span details <KialiIcon.ExternalLink className={linkIconStyle} />
+            </span>
+          ),
+          onClick: e => {
+            if (parentKiosk) {
+              e.preventDefault();
+              kioskTracingAction(spanLink, this.props.traceID);
+            } else {
+              window.open(spanLink, '_blank', 'noopener,noreferrer');
+            }
+          }
+        }
+      ];
+    }
+
+    // Parent Kiosk won't have links to the app details
+    // as most of the kubernetes consoles don't have an unified "app" entity
+    return parentKiosk
+      ? [...workloadActions, ...tracingActions]
+      : [...appActions, ...workloadActions, ...tracingActions];
+  };
+
+  private isExpanded = (spanID: string): boolean => {
+    return this.state.expandedSpans.get(spanID) || false;
+  };
+
+  private toggleExpanded = (spanID: string): void => {
+    const isExpanded = this.isExpanded(spanID);
+    this.state.expandedSpans.set(spanID, !isExpanded);
+    this.setState({ expandedSpans: this.state.expandedSpans });
+  };
+
+  private originCell = (item: RichSpanData): React.ReactNode => {
+    const key = `${item.spanID}-origin`;
+    return (
+      <>
+        {!this.props.fromWaypoint && (
+          <>
+            <strong key={`${key}-app`}>{`${t('Application')}:`} </strong>
+            {(item.linkToApp && (
+              <KialiLink key={`${key}-link-app`} to={item.linkToApp}>
+                {item.app}
+              </KialiLink>
+            )) ||
+              item.app}
+
+            <br key={`${key}-br`} />
+          </>
+        )}
+        <strong key={`${key}-wl`}>{`${t('Workload')}:`} </strong>
+        {(item.linkToWorkload && (
+          <KialiLink key={`${key}-link-wl`} to={item.linkToWorkload}>
+            {item.workload}
+          </KialiLink>
+        )) ||
+          'unknown'}
+
+        {this.isExpanded(item.spanID) && (
+          <div key={`${key}-expanded-br-1`}>
+            <strong key={`${key}-expanded-pod`}>{`${t('Pod')}:`} </strong>
+            {item.pod || 'unknown'}
+          </div>
+        )}
+      </>
+    );
+  };
+
+  private summaryCell = (item: RichSpanData): React.ReactNode => {
+    const flag = (item.info as EnvoySpanInfo).responseFlags;
+    const key = `${item.spanID}-summary`;
+
+    return (
+      <>
+        {item.info.hasError && (
+          <div key={`${key}-err`}>
+            <KialiIcon.ExclamationCircle key={`${key}-err-ic`} className={errorIconStyle} />
+            <strong key={`${key}-err-msg`}>{t('This span reported an error')}</strong>
+          </div>
+        )}
+
+        <div key={`${key}-op`}>
+          <strong key={`${key}-op-title`}>{`${t('Operation')}:`} </strong>
+          {flag ? (
+            <span key={`${key}-op-name`}>
+              {item.operationName} ({flag} <KialiIcon.ExclamationCircle key={`${key}-dan-ic`} />)
+            </span>
+          ) : (
+            <span key={`${key}-op-name`}>{item.operationName}</span>
+          )}
+        </div>
+
+        <div key={`${key}-comp`}>
+          <strong key={`${key}-comp=-title`}>{`${t('Component')}:`} </strong>
+          {item.component}
+        </div>
+
+        {this.isExpanded(item.spanID) &&
+          ((item.type === 'envoy' && this.renderEnvoySummary(item)) ||
+            (item.type === 'http' && this.renderHTTPSummary(item)) ||
+            (item.type === 'tcp' && this.renderTCPSummary(item)))}
+      </>
+    );
+  };
+
+  private renderEnvoySummary = (item: RichSpanData): React.ReactNode => {
+    const info = item.info as EnvoySpanInfo;
+    let rqLabel = 'Request';
+    let peerLink: JSX.Element | undefined = undefined;
+    const key = `${item.spanID}-summary-envoy`;
+
+    if (info.direction === 'inbound') {
+      rqLabel = 'Received request';
+
+      if (info.peer) {
+        peerLink = (
+          <>
+            {' from '}
+            <KialiLink to={`/namespaces/${info.peer.namespace}/workloads/${info.peer.name}`}>
+              {info.peer.name}
+            </KialiLink>
+          </>
+        );
+      }
+    } else if (info.direction === 'outbound') {
+      rqLabel = 'Sent request';
+
+      if (info.peer) {
+        peerLink = (
+          <React.Fragment key={`${key}-out`}>
+            <span key={`${key}-out-to`}>{' to '}</span>
+            <KialiLink key={`${key}-out-link`} to={`/namespaces/${info.peer.namespace}/services/${info.peer.name}`}>
+              {info.peer.name}
+            </KialiLink>
+          </React.Fragment>
+        );
+      }
+    }
+
+    const rsDetails: string[] = [];
+    if (info.statusCode) {
+      rsDetails.push(String(info.statusCode));
+    }
+
+    let flagInfo: string | undefined = undefined;
+    if (info.responseFlags) {
+      rsDetails.push(info.responseFlags);
+      flagInfo = responseFlags[info.responseFlags]?.help || 'Unknown flag';
+    }
+
+    return (
+      <React.Fragment key={`${key}`}>
+        <div key={`${key}-req`}>
+          <strong key={`${key}-req-title`}>
+            {rqLabel}
+            {peerLink}:{' '}
+          </strong>
+          <span key={`${key}-req-val`}>
+            {info.method} {info.url}
+          </span>
+        </div>
+
+        <div key={`${key}-status`}>
+          <strong key={`${key}-status-title`}>Response status: </strong>
+          <span key={`${key}-status-val`}>{rsDetails.join(', ')}</span>
+        </div>
+        <span key={`${key}-flag`}>{flagInfo}</span>
+      </React.Fragment>
+    );
+  };
+
+  private renderHTTPSummary = (item: RichSpanData): React.ReactNode => {
+    const info = item.info as OpenTracingHTTPInfo;
+    const rqLabel =
+      info.direction === 'inbound' ? 'Received request' : info.direction === 'outbound' ? 'Sent request' : 'Request';
+    const key = `${item.spanID}-summary-http`;
+
+    return (
+      <React.Fragment key={key}>
+        <div key={`${key}-req`}>
+          <strong key={`${key}-req-title`}>{rqLabel}: </strong>
+          <span key={`${key}-req-val`}>
+            {info.method} {info.url}
+          </span>
+        </div>
+
+        {info.statusCode && (
+          <div key={`${key}-code`}>
+            <strong key={`${key}-code-title`}>Response status: </strong>
+            <span key={`${key}-code-val`}>{info.statusCode}</span>
+          </div>
+        )}
+      </React.Fragment>
+    );
+  };
+
+  private renderTCPSummary = (item: RichSpanData): React.ReactNode => {
+    const info = item.info as OpenTracingTCPInfo;
+    const key = `${item.spanID}-summary-tcp`;
+
+    return (
+      <React.Fragment key={key}>
+        {info.topic && (
+          <div key={`${key}-topic`}>
+            <strong key={`${key}-topic-title`}>Topic: </strong>
+            <span key={`${key}-topic-val`}>{info.topic}</span>
+          </div>
+        )}
+      </React.Fragment>
+    );
+  };
+
+  private statsCell = (item: RichSpanData): React.ReactNode => {
+    const key = `${item.spanID}-stats`;
+
+    return (
+      <div key={key}>
+        <div key={`${key}-dur-div`}>
+          <strong key={`${key}-dur-title`}>{`${t('Duration')}:`} </strong>
+          {formatDuration(item.duration)}
+        </div>
+
+        {item.type === 'envoy' &&
+          renderMetricsComparison(
+            item,
+            !this.isExpanded(item.spanID),
+            this.props.metricsStats,
+            this.shouldIncludeWaypoint(),
+            () => this.fetchComparisonMetrics([item])
+          )}
+      </div>
+    );
+  };
+}
+
+const mapStateToProps = (state: KialiAppState): StateProps => ({
+  kiosk: state.globalState.kiosk,
+  language: languageSelector(state),
+  metricsStats: state.metricsStats.data,
+  provider: state.tracingState.info?.provider,
+  ...mapAppearanceFromState(state)
+});
+
+const mapDispatchToProps = (dispatch: KialiDispatch): ReduxProps => ({
+  loadMetricsStats: (queries: MetricsStatsQuery[], isCompact: boolean) =>
+    dispatch(MetricsStatsThunkActions.load(queries, isCompact))
+});
+
+export const SpanTable = connect(mapStateToProps, mapDispatchToProps)(SpanTableComponent);

@@ -2,130 +2,200 @@
 # Targets for building of Kiali from source.
 #
 
+## check-ui: Check if the frontend UI is built
+check-ui:
+	@if [ ! -d ${ROOTDIR}/frontend/build ]; then \
+		echo "The frontend UI is not built. Please run 'make build-ui' first."; \
+		exit 1; \
+	fi
+
 ## clean: Clean ${GOPATH}/bin/kiali, ${GOPATH}/pkg/*, ${OUTDIR}/docker and the kiali binary
 clean:
 	@echo Cleaning...
 	@rm -f kiali
 	@rm -rf ${GOPATH}/bin/kiali
-	@[ -d ${GOPATH}/pkg ] && chmod -R +rw ${GOPATH}/pkg/* || true
+	@[ -d ${GOPATH}/pkg ] && chmod -R +rw ${GOPATH}/pkg/* 2>/dev/null || true
 	@rm -rf ${GOPATH}/pkg/*
 	@rm -rf ${OUTDIR}/docker
 
-## clean-all: Runs `make clean` internally and remove the _output dir
-clean-all: clean
+## clean-ui: Removes the UI build/ and node_modules/ directories.
+clean-ui:
+	@echo Cleaning UI ...
+	@rm -rf ${ROOTDIR}/frontend/node_modules
+	@rm -rf ${ROOTDIR}/frontend/build
+
+## clean-all: Runs `make clean` internally, removes the _output dir, and cleans the UI
+clean-all: clean clean-ui
 	@rm -rf ${OUTDIR}
 
 ## go-check: Check if the go version installed is supported by Kiali
 go-check:
 	@GO=${GO} hack/check_go_version.sh "${GO_VERSION_KIALI}"
+	@$(eval GO_ACTUAL_VERSION ?= $(shell ${GO} version | grep -Eo  '[0-9]+\.[0-9]+\.[0-9]+'))
+	@echo "Using actual Go version of: ${GO_ACTUAL_VERSION}"
 
 ## build: Runs `make go-check` internally and build Kiali binary
-build: go-check
+build: go-check check-ui
 	@echo Building...
 	${GO_BUILD_ENVVARS} ${GO} build \
-		-o ${GOPATH}/bin/kiali -ldflags "-X main.version=${VERSION} -X main.commitHash=${COMMIT_HASH}"
+		-o ${GO_BUILD_OUTPUT} -ldflags "-X github.com/kiali/kiali/cmd.version=${VERSION} -X github.com/kiali/kiali/cmd.commitHash=${COMMIT_HASH} -X github.com/kiali/kiali/cmd.goVersion=${GO_ACTUAL_VERSION}" ${GO_BUILD_FLAGS}
+
+.ensure-yarn-version:
+	@if ! command -v yarn >/dev/null 2>&1; then \
+		echo "Error: yarn not found in PATH."; \
+		echo "Yarn 4 is managed via corepack. Run 'corepack enable' to activate it."; \
+		exit 1; \
+	fi
+	@cd ${ROOTDIR}/frontend && if ! yarn --version 2>/dev/null | grep -qE '^[4-9]\.'; then \
+		echo "Error: Yarn 4+ is required but found $$(yarn --version 2>/dev/null || echo 'unknown')."; \
+		echo "Run 'corepack enable' to activate the version specified in frontend/package.json."; \
+		exit 1; \
+	fi
+
+## build-ui: Runs the yarn commands to build the frontend UI
+build-ui: .ensure-yarn-version
+	@cd ${ROOTDIR}/frontend && yarn install --immutable && yarn run build
+
+## build-ui-test: Runs the yarn commands to build the dev frontend UI and runs the UI tests
+build-ui-test: build-ui
+	@cd ${ROOTDIR}/frontend && yarn run test
+
+## run-backend: Run the backend with air for hot reloading
+# Uses .air.toml configuration file. Set KIALI_RUN_ARGS to append additional arguments.
+run-backend: go-check .ensure-air-exists
+	@echo "Starting Kiali backend with air (hot reloading enabled)..."
+	air -c ${ROOTDIR}/.air.toml run ${KIALI_RUN_ARGS}
 
 ## build-linux-multi-arch: Build Kiali binary with arch suffix for multi-arch
-build-linux-multi-arch:
+build-linux-multi-arch: go-check
 	@for arch in ${TARGET_ARCHS}; do \
 		echo "Building for architecture [$${arch}]"; \
 		${GO_BUILD_ENVVARS} GOOS=linux GOARCH=$${arch} ${GO} build \
-			-o ${GOPATH}/bin/kiali-$${arch} -ldflags "-X main.version=${VERSION} -X main.commitHash=${COMMIT_HASH}"; \
+			-o ${GOPATH}/bin/kiali-$${arch} -ldflags "-X github.com/kiali/kiali/cmd.version=${VERSION} -X github.com/kiali/kiali/cmd.commitHash=${COMMIT_HASH} -X github.com/kiali/kiali/cmd.goVersion=${GO_ACTUAL_VERSION}" ${GO_BUILD_FLAGS}; \
 	done
 
 ## install: Install missing dependencies. Runs `go install` internally
-install:
+install: go-check
 	@echo Installing...
 	${GO_BUILD_ENVVARS} ${GO} install \
-		-ldflags "-X main.version=${VERSION} -X main.commitHash=${COMMIT_HASH}"
+		-ldflags "-X github.com/kiali/kiali/cmd.version=${VERSION} -X github.com/kiali/kiali/cmd.commitHash=${COMMIT_HASH} -X github.com/kiali/kiali/cmd.goVersion=${GO_ACTUAL_VERSION}"
 
 ## format: Format all the files excluding vendor. Runs `gofmt` and `goimports` internally
 format:
 	@# Exclude more paths find . \( -path './vendor' -o -path <new_path_to_exclude> \) -prune -o -type f -iname '*.go' -print
 	@for gofile in $$(find . -path './vendor' -prune -o -type f -iname '*.go' -print); do \
 			${GOFMT} -w $$gofile; \
-	done; \
-	$(shell ./hack/fix_imports.sh)
+	done
+	@./hack/fix_imports.sh
 
 ## build-system-test: Building executable for system tests with code coverage enabled
-build-system-test:
+build-system-test: go-check
 	@echo Building executable for system tests with code coverage enabled
 	${GO} test -c -covermode=count -coverpkg $(shell ${GO} list ./... | grep -v test |  awk -vORS=, "{ print $$1 }" | sed "s/,$$//") \
-	  -o ${GOPATH}/bin/kiali -ldflags "-X main.version=${VERSION} -X main.commitHash=${COMMIT_HASH}"
+	  -o ${GOPATH}/bin/kiali -ldflags "-X github.com/kiali/kiali/cmd.version=${VERSION} -X github.com/kiali/kiali/cmd.commitHash=${COMMIT_HASH} -X github.com/kiali/kiali/cmd.goVersion=${GO_ACTUAL_VERSION}"
 
-## build-test: Run tests and install test deps, excluding third party tests under vendor. Runs `go test -i`
-build-test:
-	@echo Building and installing test dependencies to help speed up test runs.
-	${GO} test -i $(shell ${GO} list ./... | grep -v -e /vendor/)
-
-## test: Run tests, excluding third party tests under vendor. Runs `go test` internally
-test:
+## test: Run tests, excluding third party tests under vendor and frontend. Runs `go test` internally
+test: .ensure-envtest-bin-dir-exists
 	@echo Running tests, excluding third party tests under vendor
-	${GO} test $(shell ${GO} list ./... | grep -v -e /vendor/)
+	${GO} test -tags exclude_frontend ${GO_TEST_FLAGS} $(shell ${GO} list -tags exclude_frontend ./... | grep -v -e /vendor/ -e /frontend/ -e /tests/integration/)
 
-## test-debug: Run tests in debug mode, excluding third party tests under vendor. Runs `go test -v`
-test-debug:
-	@echo Running tests in debug mode, excluding third party tests under vendor
-	${GO} test -v $(shell ${GO} list ./... | grep -v -e /vendor/)
+## test-integration-setup: Setup go library for converting test result into junit xml
+test-integration-setup:
+	@echo Setting up Integration tests
+	go install github.com/jstemmer/go-junit-report@latest
 
-## test-race: Run tests with race detection, excluding third party tests under vendor. Runs `go test -race`
-test-race:
-	@echo Running tests with race detection, excluding third party tests under vendor
-	${GO} test -race $(shell ${GO} list ./... | grep -v -e /vendor/)
+## test-integration: Run Integration test suite
+test-integration: test-integration-setup
+	@echo Running Integration tests
+	cd tests/integration/tests && ${GO} test ${GO_TEST_FLAGS} -v -timeout 30m 2>&1 | tee >(go-junit-report > ../junit-rest-report.xml) ../int-test.log
+	@echo Test results can be found here: $$(ls -1 ${ROOTDIR}/tests/integration/junit-rest-report.xml)
 
-## test-e2e-setup: Setup Python environment for running test suite
-test-e2e-setup:
-	@echo Setting up E2E tests
-	cd tests/e2e && ./setup.sh
-
-## test-e2e: Run E2E test suite
-test-e2e:
-	@echo Running E2E tests
-	cd tests/e2e && source .kiali-e2e/bin/activate && pytest -s tests/
-
-#
-# Swagger Documentation
-#
-
-## swagger-install: Install swagger from github
-swagger-install:
-	@echo "Installing swagger binary to ${GOPATH}/bin..."
-ifeq ($(GOARCH), ppc64le)
-	curl https://github.com/go-swagger/go-swagger/archive/v${SWAGGER_VERSION}.tar.gz --create-dirs -Lo /tmp/v${SWAGGER_VERSION}.tar.gz && tar -xzf /tmp/v${SWAGGER_VERSION}.tar.gz -C /tmp/ && src_dir='pwd' && cd /tmp/go-swagger-${SWAGGER_VERSION} && ${GO} install ./cmd/swagger && cd ${src_dir}
-else
-	curl https://github.com/go-swagger/go-swagger/releases/download/v${SWAGGER_VERSION}/swagger_linux_${GOARCH} --create-dirs -Lo ${GOPATH}/bin/swagger && chmod +x ${GOPATH}/bin/swagger
-endif
-
-## swagger-validate: Validate that swagger.json is correctly. Runs `swagger validate` internally
-swagger-validate:
-	@swagger validate ./swagger.json
-
-## swagger-gen: Generate that swagger.json from Code. Runs `swagger generate` internally
-swagger-gen:
-	@swagger generate spec -o ./swagger.json
-
-## swagger-serve: Serve the swagger.json in a website in local. Runs `swagger serve` internally
-swagger-serve: swagger-validate
-	@swagger serve ./swagger.json
-
-## swagger-ci: Check that swagger.json is the correct one
-swagger-ci: swagger-validate
-	@swagger generate spec -o ./swagger_copy.json
-	@cmp -s swagger.json swagger_copy.json; \
-	RETVAL=$$?; \
-	if [ $$RETVAL -ne 0 ]; then \
-	  echo "SWAGGER FILE IS NOT CORRECT"; exit 1; \
+## test-integration-controller: Run controller integration test suite. These are not real e2e tests like the other integration tests.
+test-integration-controller: .ensure-envtest-bin-dir-exists .ensure-yq-exists
+	$(eval ISTIO_VERSION ?= $(shell helm show chart --repo https://blob.istio.io/istio-release/charts base | yq '.version'))
+	$(eval ISTIO_MINOR_VERSION := $(shell cut -d "." -f 1-2 <<< ${ISTIO_VERSION}))
+	@if [[ "$(ISTIO_MINOR_VERSION)" == *latest ]]; then \
+		$(eval latest := $(shell echo "$(ISTIO_MINOR_VERSION)" | sed 's/-latest$$//')) \
+		if [ -z "$$latest" ]; then \
+			$(eval ISTIO_MINOR_VERSION := $(shell echo ${latest})) \
+			echo "Istio minor with latest: ${latest}"; \
+		fi \
 	fi
+	$(eval CRD_FILE := tests/integration/controller/testdata/istio-crds/${ISTIO_MINOR_VERSION}.yaml)
+	@if [ ! -f "${CRD_FILE}" ]; then \
+		echo "the CRD yamls for Istio version '${ISTIO_MINOR_VERSION}' are missing at '${CRD_FILE}' - run 'make download-istio-crds' to download them and then check them into git" && exit 1; \
+	fi
+	@echo Running controller integration tests
+	cd tests/integration/controller && ${GO} test -v
 
 #
 # Lint targets
 #
 
+GOLANGCI_LINT_VERSION ?= v2.12.2
+GOLANGCI_LINT ?= $(shell ${GO} env GOPATH)/bin/golangci-lint
+
 ## lint-install: Installs golangci-lint
 lint-install:
-	curl -sfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $$(${GO} env GOPATH)/bin v1.23.8
+	${GO} install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@${GOLANGCI_LINT_VERSION}
 
 ## lint: Runs golangci-lint
-# doc.go is ommited for linting, because it generates lots of warnings.
 lint:
-	golangci-lint run --skip-files "doc\.go" --tests --timeout 5m
+	${GOLANGCI_LINT} run
+
+# Assuming here that if the bin dir exists then the tools also exist inside of it.
+.ensure-envtest-bin-dir-exists: .ensure-envtest-exists
+	@if [ ! -d "${OUTDIR}/k8s" ]; then \
+		setup-envtest use --bin-dir "${OUTDIR}"; \
+	fi
+
+## Download setup-envtest locally if necessary.
+.ensure-envtest-exists:
+	@if [ ! -x envtest ]; then \
+	  ${GO} install sigs.k8s.io/controller-runtime/tools/setup-envtest@release-0.20; \
+	fi
+
+YQ := $(shell command -v yq 2> /dev/null)
+.ensure-yq-exists:
+ifndef YQ
+	$(error "'yq' needs to be installed to run this command. Please install 'yq' and re-run this command.")
+endif
+
+AIR := $(shell command -v air 2> /dev/null)
+## Download and install air locally if necessary.
+.ensure-air-exists:
+ifndef AIR
+	@echo "Installing air for hot reloading..."
+	${GO} install github.com/air-verse/air@latest
+endif
+
+GOSWAGGER_VERSION ?= v0.36.6
+GOSWAGGER_DOCKER ?= quay.io/goswagger/swagger:$(GOSWAGGER_VERSION)
+
+## swagger-doc: Regenerate kiali_internal_api.md from swagger annotations (requires Docker)
+.PHONY: swagger-doc
+swagger-doc:
+	@mkdir -p ${OUTDIR}
+	@docker run --rm --user $$(id -u):$$(id -g) \
+		-e GOCACHE=/tmp \
+		-e GOPATH=$$($(GO) env GOPATH):/go \
+		-v $(HOME):$(HOME) \
+		-w $(ROOTDIR) \
+		$(GOSWAGGER_DOCKER) generate spec -o ./swagger.json
+	@python3 hack/swagger-set-spec-version.py ./swagger.json "$(VERSION)"
+	@docker run --rm --user $$(id -u):$$(id -g) \
+		-v $(HOME):$(HOME) \
+		-w $(ROOTDIR) \
+		$(GOSWAGGER_DOCKER) generate markdown --quiet --spec ./swagger.json --output ./kiali_internal_api.md
+	@rm -f $(ROOTDIR)/swagger.json
+
+## download-istio-crds: Download istio-crds to testdata dir if necessary. You can specify the istio version like: make ISTIO_VERSION=1.24 download-istio-crds
+download-istio-crds: .ensure-yq-exists
+	$(eval ISTIO_VERSION ?= $(shell helm show chart --repo https://blob.istio.io/istio-release/charts base | yq '.version'))
+	$(eval ISTIO_MINOR_VERSION := $(shell cut -d "." -f 1-2 <<< ${ISTIO_VERSION}))
+	$(eval CRD_FILE := tests/integration/controller/testdata/istio-crds/${ISTIO_MINOR_VERSION}.yaml)
+	@if [ ! -f "${CRD_FILE}" ]; then \
+		echo "Downloading istio crds to ${CRD_FILE}"; \
+		mkdir -p tests/integration/controller/testdata; \
+		helm template --include-crds --version ${ISTIO_VERSION} --repo https://blob.istio.io/istio-release/charts base | yq ea 'select(.kind == "CustomResourceDefinition")' > ${CRD_FILE}; \
+	fi

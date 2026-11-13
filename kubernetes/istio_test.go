@@ -1,139 +1,492 @@
-package kubernetes
+package kubernetes_test
 
 import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	apps_v1 "k8s.io/api/apps/v1"
+	core_v1 "k8s.io/api/core/v1"
 	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/kiali/kiali/config"
+	"github.com/kiali/kiali/kubernetes"
+	"github.com/kiali/kiali/kubernetes/kubetest"
 )
 
-func TestFilterByHost(t *testing.T) {
+func testIdentityForKubeHosts(conf *config.Config) string {
+	return config.ResolveIdentityDomain(conf.ExternalServices.Istio.IstioIdentityDomain, "")
+}
+
+func TestKubeServiceHostsSingleService(t *testing.T) {
+	assert := assert.New(t)
 	conf := config.NewConfig()
-	config.Set(conf)
 
-	assert.True(t, FilterByHost("reviews", "reviews", "bookinfo"))
-	assert.False(t, FilterByHost("reviews-bad", "reviews", "bookinfo"))
+	services := []core_v1.Service{
+		{
+			ObjectMeta: meta_v1.ObjectMeta{Name: "reviews", Namespace: "bookinfo"},
+			Spec: core_v1.ServiceSpec{
+				Ports: []core_v1.ServicePort{
+					{Name: "http", Protocol: core_v1.ProtocolTCP, Port: 9080},
+				},
+			},
+		},
+	}
 
-	assert.True(t, FilterByHost("reviews.bookinfo", "reviews", "bookinfo"))
-	assert.False(t, FilterByHost("reviews-bad.bookinfo", "reviews", "bookinfo"))
-	assert.False(t, FilterByHost("reviews.bookinfo-bad", "reviews", "bookinfo"))
+	hosts := kubernetes.NewKubeServiceHosts(services, testIdentityForKubeHosts(conf), nil)
 
-	assert.True(t, FilterByHost("reviews.bookinfo.svc.cluster.local", "reviews", "bookinfo"))
-	assert.False(t, FilterByHost("reviews-bad.bookinfo.svc.cluster.local", "reviews", "bookinfo"))
-	assert.False(t, FilterByHost("reviews.bookinfo-bad.svc.cluster.local", "reviews", "bookinfo"))
+	assert.True(hosts.HasHost("reviews.bookinfo.svc.cluster.local"))
+	assert.True(hosts.HasHost("reviews.bookinfo.svc"))
+	assert.True(hosts.HasHost("reviews.bookinfo"))
+	assert.False(hosts.HasHost("reviews.other-ns.svc.cluster.local"))
 }
 
-func TestFQDNHostname(t *testing.T) {
+func TestKubeServiceHostsMultipleServices(t *testing.T) {
+	assert := assert.New(t)
 	conf := config.NewConfig()
-	config.Set(conf)
 
-	assert.True(t, FilterByHost("reviews.bookinfo.svc", "reviews", "bookinfo"))
-	assert.True(t, FilterByHost("reviews.bookinfo.svc.cluster.local", "reviews", "bookinfo"))
-
-	assert.False(t, FilterByHost("reviews.foo.svc", "reviews", "bookinfo"))
-	assert.False(t, FilterByHost("reviews.foo.svc.cluster.local", "reviews", "bookinfo"))
-
-	assert.False(t, FilterByHost("ratings.bookinfo.svc", "reviews", "bookinfo"))
-	assert.False(t, FilterByHost("ratings.bookinfo.svc.cluster.local", "reviews", "bookinfo"))
-
-	assert.False(t, FilterByHost("ratings.foo.svc", "reviews", "bookinfo"))
-	assert.False(t, FilterByHost("ratings.foo.svc.cluster.local", "reviews", "bookinfo"))
-}
-
-func TestExactProtocolNameMatcher(t *testing.T) {
-	// http, http2, grpc, mongo, or redis
-	assert.True(t, MatchPortNameRule("http", "http"))
-	assert.True(t, MatchPortNameRule("http", "HTTP"))
-	assert.True(t, MatchPortNameRule("grpc", "grpc"))
-	assert.True(t, MatchPortNameRule("http2", "http2"))
-}
-
-func TestTCPAndUDPMatcher(t *testing.T) {
-	assert.True(t, MatchPortNameRule("tcp", "TCP"))
-	assert.True(t, MatchPortNameRule("tcp", "tcp"))
-	assert.True(t, MatchPortNameRule("udp", "UDP"))
-	assert.True(t, MatchPortNameRule("udp", "udp"))
-
-	assert.True(t, MatchPortNameRule("tcp-any", "UDP"))
-	assert.True(t, MatchPortNameRule("udp-any", "TCP"))
-
-	assert.True(t, MatchPortNameRule("doesnotmatter", "UDP"))
-	assert.True(t, MatchPortNameRule("everythingisvalid", "TCP"))
-}
-
-func TestValidProtocolNameMatcher(t *testing.T) {
-	assert.True(t, MatchPortNameRule("http-name", "http"))
-	assert.True(t, MatchPortNameRule("http2-name", "http2"))
-}
-
-func TestInvalidProtocolNameMatcher(t *testing.T) {
-	assert.False(t, MatchPortNameRule("http2-name", "http"))
-	assert.False(t, MatchPortNameRule("http-name", "http2"))
-
-	assert.False(t, MatchPortNameRule("httpname", "http"))
-	assert.False(t, MatchPortNameRule("name", "http"))
-}
-
-func TestValidPortNameMatcher(t *testing.T) {
-	assert.True(t, MatchPortNameWithValidProtocols("http-name"))
-	assert.True(t, MatchPortNameWithValidProtocols("http2-name"))
-}
-
-func TestInvalidPortNameMatcher(t *testing.T) {
-	assert.False(t, MatchPortNameWithValidProtocols("httpname"))
-	assert.False(t, MatchPortNameWithValidProtocols("name"))
-}
-
-func TestPolicyHasMtlsEnabledStructMode(t *testing.T) {
-	policy := createPeerAuthn("default", "bookinfo", map[string]interface{}{
-		"mode": map[string]interface{}{},
-	})
-
-	enabled, mode := PeerAuthnHasMTLSEnabled(policy)
-	assert.False(t, enabled)
-	assert.Equal(t, "", mode)
-}
-
-func TestPolicyHasMTLSEnabledStrictMode(t *testing.T) {
-	policy := createPeerAuthn("default", "bookinfo", map[string]interface{}{
-		"mode": "STRICT",
-	})
-
-	enabled, mode := PeerAuthnHasMTLSEnabled(policy)
-	assert.True(t, enabled)
-	assert.Equal(t, "STRICT", mode)
-}
-
-func TestPolicyHasMTLSEnabledStructMtls(t *testing.T) {
-	policy := createPeerAuthn("default", "bookinfo", map[string]interface{}{
-		"mode": "STRICT",
-	})
-
-	enabled, mode := PeerAuthnHasMTLSEnabled(policy)
-	assert.True(t, enabled)
-	assert.Equal(t, "STRICT", mode)
-}
-
-func TestPolicyHasMTLSEnabledPermissiveMode(t *testing.T) {
-	policy := createPeerAuthn("default", "bookinfo", map[string]interface{}{
-		"mode": "PERMISSIVE",
-	})
-
-	enabled, mode := PeerAuthnHasMTLSEnabled(policy)
-	assert.True(t, enabled)
-	assert.Equal(t, "PERMISSIVE", mode)
-}
-
-func createPeerAuthn(name, namespace string, mtls interface{}) IstioObject {
-	return (&GenericIstioObject{
-		ObjectMeta: meta_v1.ObjectMeta{
-			Name:      name,
-			Namespace: namespace,
+	services := []core_v1.Service{
+		{
+			ObjectMeta: meta_v1.ObjectMeta{Name: "reviews", Namespace: "bookinfo"},
+			Spec: core_v1.ServiceSpec{
+				Ports: []core_v1.ServicePort{{Name: "http", Protocol: core_v1.ProtocolTCP, Port: 9080}},
+			},
 		},
-		Spec: map[string]interface{}{
-			"mtls": mtls,
+		{
+			ObjectMeta: meta_v1.ObjectMeta{Name: "ratings", Namespace: "bookinfo"},
+			Spec: core_v1.ServiceSpec{
+				Ports: []core_v1.ServicePort{
+					{Name: "http", Protocol: core_v1.ProtocolTCP, Port: 9080},
+					{Name: "grpc", Protocol: core_v1.ProtocolTCP, Port: 9081},
+				},
+			},
 		},
-	}).DeepCopyIstioObject()
+		{
+			ObjectMeta: meta_v1.ObjectMeta{Name: "details", Namespace: "other-ns"},
+			Spec: core_v1.ServiceSpec{
+				Ports: []core_v1.ServicePort{{Name: "http", Protocol: core_v1.ProtocolTCP, Port: 8080}},
+			},
+		},
+	}
+
+	hosts := kubernetes.NewKubeServiceHosts(services, testIdentityForKubeHosts(conf), nil)
+
+	assert.True(hosts.HasHost("reviews.bookinfo.svc.cluster.local"))
+	assert.True(hosts.HasHost("ratings.bookinfo.svc.cluster.local"))
+	assert.True(hosts.HasHost("details.other-ns.svc.cluster.local"))
+	assert.False(hosts.HasHost("nonexistent.bookinfo.svc.cluster.local"))
+}
+
+func TestKubeServiceHostsEmptyInput(t *testing.T) {
+	assert := assert.New(t)
+	conf := config.NewConfig()
+
+	hosts := kubernetes.NewKubeServiceHosts([]core_v1.Service{}, testIdentityForKubeHosts(conf), nil)
+
+	assert.False(hosts.HasHost("anything"))
+}
+
+func TestKubeServiceHostsNoPorts(t *testing.T) {
+	assert := assert.New(t)
+	conf := config.NewConfig()
+
+	services := []core_v1.Service{
+		{
+			ObjectMeta: meta_v1.ObjectMeta{Name: "headless", Namespace: "bookinfo"},
+			Spec:       core_v1.ServiceSpec{},
+		},
+	}
+
+	hosts := kubernetes.NewKubeServiceHosts(services, testIdentityForKubeHosts(conf), nil)
+
+	assert.True(hosts.HasHost("headless.bookinfo.svc.cluster.local"))
+}
+
+func TestKubeServiceHostsCustomClusterDomain(t *testing.T) {
+	assert := assert.New(t)
+	conf := config.NewConfig()
+	conf.ExternalServices.Istio.IstioIdentityDomain = "svc.my-custom.domain"
+
+	services := []core_v1.Service{
+		{
+			ObjectMeta: meta_v1.ObjectMeta{Name: "reviews", Namespace: "bookinfo"},
+			Spec: core_v1.ServiceSpec{
+				Ports: []core_v1.ServicePort{{Name: "http", Protocol: core_v1.ProtocolTCP, Port: 9080}},
+			},
+		},
+	}
+
+	hosts := kubernetes.NewKubeServiceHosts(services, testIdentityForKubeHosts(conf), nil)
+
+	assert.True(hosts.HasHost("reviews.bookinfo.svc.my-custom.domain"))
+	assert.True(hosts.HasHost("reviews.bookinfo.svc"))
+	assert.True(hosts.HasHost("reviews.bookinfo"))
+	assert.False(hosts.HasHost("reviews.bookinfo.svc.cluster.local"))
+}
+
+func TestKubeServiceHostsNoExportToVisibleEverywhere(t *testing.T) {
+	assert := assert.New(t)
+	conf := config.NewConfig()
+
+	services := []core_v1.Service{
+		{
+			ObjectMeta: meta_v1.ObjectMeta{Name: "reviews", Namespace: "bookinfo"},
+			Spec: core_v1.ServiceSpec{
+				Ports: []core_v1.ServicePort{{Name: "http", Protocol: core_v1.ProtocolTCP, Port: 9080}},
+			},
+		},
+	}
+
+	hosts := kubernetes.NewKubeServiceHosts(services, testIdentityForKubeHosts(conf), nil)
+
+	assert.True(hosts.IsValidForNamespace("reviews.bookinfo.svc.cluster.local", "bookinfo"))
+	assert.True(hosts.IsValidForNamespace("reviews.bookinfo.svc.cluster.local", "other-ns"))
+	assert.True(hosts.IsValidForNamespace("reviews.bookinfo.svc.cluster.local", "istio-system"))
+}
+
+func TestKubeServiceHostsExportToStar(t *testing.T) {
+	assert := assert.New(t)
+	conf := config.NewConfig()
+
+	services := []core_v1.Service{
+		{
+			ObjectMeta: meta_v1.ObjectMeta{
+				Name:        "reviews",
+				Namespace:   "bookinfo",
+				Annotations: map[string]string{kubernetes.ExportToAnnotation: "*"},
+			},
+			Spec: core_v1.ServiceSpec{
+				Ports: []core_v1.ServicePort{{Name: "http", Protocol: core_v1.ProtocolTCP, Port: 9080}},
+			},
+		},
+	}
+
+	hosts := kubernetes.NewKubeServiceHosts(services, testIdentityForKubeHosts(conf), nil)
+
+	assert.True(hosts.IsValidForNamespace("reviews.bookinfo.svc.cluster.local", "bookinfo"))
+	assert.True(hosts.IsValidForNamespace("reviews.bookinfo.svc.cluster.local", "other-ns"))
+}
+
+func TestKubeServiceHostsExportToDot(t *testing.T) {
+	assert := assert.New(t)
+	conf := config.NewConfig()
+
+	services := []core_v1.Service{
+		{
+			ObjectMeta: meta_v1.ObjectMeta{
+				Name:        "reviews",
+				Namespace:   "bookinfo",
+				Annotations: map[string]string{kubernetes.ExportToAnnotation: "."},
+			},
+			Spec: core_v1.ServiceSpec{
+				Ports: []core_v1.ServicePort{{Name: "http", Protocol: core_v1.ProtocolTCP, Port: 9080}},
+			},
+		},
+	}
+
+	hosts := kubernetes.NewKubeServiceHosts(services, testIdentityForKubeHosts(conf), nil)
+
+	assert.True(hosts.IsValidForNamespace("reviews.bookinfo.svc.cluster.local", "bookinfo"))
+	assert.False(hosts.IsValidForNamespace("reviews.bookinfo.svc.cluster.local", "other-ns"))
+	assert.True(hosts.IsValidForNamespace("reviews.bookinfo.svc", "bookinfo"))
+	assert.False(hosts.IsValidForNamespace("reviews.bookinfo.svc", "other-ns"))
+	assert.True(hosts.IsValidForNamespace("reviews.bookinfo", "bookinfo"))
+	assert.False(hosts.IsValidForNamespace("reviews.bookinfo", "other-ns"))
+}
+
+func TestKubeServiceHostsExportToTilde(t *testing.T) {
+	assert := assert.New(t)
+	conf := config.NewConfig()
+
+	services := []core_v1.Service{
+		{
+			ObjectMeta: meta_v1.ObjectMeta{
+				Name:        "reviews",
+				Namespace:   "bookinfo",
+				Annotations: map[string]string{kubernetes.ExportToAnnotation: "~"},
+			},
+			Spec: core_v1.ServiceSpec{
+				Ports: []core_v1.ServicePort{{Name: "http", Protocol: core_v1.ProtocolTCP, Port: 9080}},
+			},
+		},
+	}
+
+	hosts := kubernetes.NewKubeServiceHosts(services, testIdentityForKubeHosts(conf), nil)
+
+	assert.True(hosts.HasHost("reviews.bookinfo.svc.cluster.local"))
+	assert.False(hosts.IsValidForNamespace("reviews.bookinfo.svc.cluster.local", "bookinfo"))
+	assert.False(hosts.IsValidForNamespace("reviews.bookinfo.svc.cluster.local", "other-ns"))
+}
+
+func TestKubeServiceHostsExportToSpecificNamespaces(t *testing.T) {
+	assert := assert.New(t)
+	conf := config.NewConfig()
+
+	services := []core_v1.Service{
+		{
+			ObjectMeta: meta_v1.ObjectMeta{
+				Name:        "reviews",
+				Namespace:   "bookinfo",
+				Annotations: map[string]string{kubernetes.ExportToAnnotation: "bookinfo,istio-system"},
+			},
+			Spec: core_v1.ServiceSpec{
+				Ports: []core_v1.ServicePort{{Name: "http", Protocol: core_v1.ProtocolTCP, Port: 9080}},
+			},
+		},
+	}
+
+	hosts := kubernetes.NewKubeServiceHosts(services, testIdentityForKubeHosts(conf), nil)
+
+	assert.True(hosts.IsValidForNamespace("reviews.bookinfo.svc.cluster.local", "bookinfo"))
+	assert.True(hosts.IsValidForNamespace("reviews.bookinfo.svc.cluster.local", "istio-system"))
+	assert.False(hosts.IsValidForNamespace("reviews.bookinfo.svc.cluster.local", "other-ns"))
+}
+
+func TestKubeServiceHostsExportToDotAndNamespace(t *testing.T) {
+	assert := assert.New(t)
+	conf := config.NewConfig()
+
+	services := []core_v1.Service{
+		{
+			ObjectMeta: meta_v1.ObjectMeta{
+				Name:        "reviews",
+				Namespace:   "bookinfo",
+				Annotations: map[string]string{kubernetes.ExportToAnnotation: ".,istio-system"},
+			},
+			Spec: core_v1.ServiceSpec{
+				Ports: []core_v1.ServicePort{{Name: "http", Protocol: core_v1.ProtocolTCP, Port: 9080}},
+			},
+		},
+	}
+
+	hosts := kubernetes.NewKubeServiceHosts(services, testIdentityForKubeHosts(conf), nil)
+
+	assert.True(hosts.IsValidForNamespace("reviews.bookinfo.svc.cluster.local", "bookinfo"))
+	assert.True(hosts.IsValidForNamespace("reviews.bookinfo.svc.cluster.local", "istio-system"))
+	assert.False(hosts.IsValidForNamespace("reviews.bookinfo.svc.cluster.local", "other-ns"))
+}
+
+func TestKubeServiceHostsExportToNonexistentHost(t *testing.T) {
+	assert := assert.New(t)
+	conf := config.NewConfig()
+
+	hosts := kubernetes.NewKubeServiceHosts([]core_v1.Service{}, testIdentityForKubeHosts(conf), nil)
+
+	assert.False(hosts.IsValidForNamespace("nonexistent.bookinfo.svc.cluster.local", "bookinfo"))
+}
+
+func TestKubeServiceHostsExportToWhitespaceHandling(t *testing.T) {
+	assert := assert.New(t)
+	conf := config.NewConfig()
+
+	services := []core_v1.Service{
+		{
+			ObjectMeta: meta_v1.ObjectMeta{
+				Name:        "reviews",
+				Namespace:   "bookinfo",
+				Annotations: map[string]string{kubernetes.ExportToAnnotation: " . , istio-system "},
+			},
+			Spec: core_v1.ServiceSpec{
+				Ports: []core_v1.ServicePort{{Name: "http", Protocol: core_v1.ProtocolTCP, Port: 9080}},
+			},
+		},
+	}
+
+	hosts := kubernetes.NewKubeServiceHosts(services, testIdentityForKubeHosts(conf), nil)
+
+	assert.True(hosts.IsValidForNamespace("reviews.bookinfo.svc.cluster.local", "bookinfo"))
+	assert.True(hosts.IsValidForNamespace("reviews.bookinfo.svc.cluster.local", "istio-system"))
+	assert.False(hosts.IsValidForNamespace("reviews.bookinfo.svc.cluster.local", "other-ns"))
+}
+
+func TestKubeServiceHostsMeshDefaultDotRestrictsToOwnNamespace(t *testing.T) {
+	assert := assert.New(t)
+	conf := config.NewConfig()
+
+	services := []core_v1.Service{
+		{
+			ObjectMeta: meta_v1.ObjectMeta{Name: "reviews", Namespace: "bookinfo"},
+			Spec: core_v1.ServiceSpec{
+				Ports: []core_v1.ServicePort{{Name: "http", Protocol: core_v1.ProtocolTCP, Port: 9080}},
+			},
+		},
+	}
+
+	hosts := kubernetes.NewKubeServiceHosts(services, testIdentityForKubeHosts(conf), []string{"."})
+
+	assert.True(hosts.IsValidForNamespace("reviews.bookinfo.svc.cluster.local", "bookinfo"))
+	assert.False(hosts.IsValidForNamespace("reviews.bookinfo.svc.cluster.local", "other-ns"))
+	assert.False(hosts.IsValidForNamespace("reviews.bookinfo.svc.cluster.local", "istio-system"))
+}
+
+func TestKubeServiceHostsMeshDefaultStarVisibleEverywhere(t *testing.T) {
+	assert := assert.New(t)
+	conf := config.NewConfig()
+
+	services := []core_v1.Service{
+		{
+			ObjectMeta: meta_v1.ObjectMeta{Name: "reviews", Namespace: "bookinfo"},
+			Spec: core_v1.ServiceSpec{
+				Ports: []core_v1.ServicePort{{Name: "http", Protocol: core_v1.ProtocolTCP, Port: 9080}},
+			},
+		},
+	}
+
+	hosts := kubernetes.NewKubeServiceHosts(services, testIdentityForKubeHosts(conf), []string{"*"})
+
+	assert.True(hosts.IsValidForNamespace("reviews.bookinfo.svc.cluster.local", "bookinfo"))
+	assert.True(hosts.IsValidForNamespace("reviews.bookinfo.svc.cluster.local", "other-ns"))
+}
+
+func TestKubeServiceHostsAnnotationOverridesMeshDefault(t *testing.T) {
+	assert := assert.New(t)
+	conf := config.NewConfig()
+
+	services := []core_v1.Service{
+		{
+			ObjectMeta: meta_v1.ObjectMeta{
+				Name:        "reviews",
+				Namespace:   "bookinfo",
+				Annotations: map[string]string{kubernetes.ExportToAnnotation: "*"},
+			},
+			Spec: core_v1.ServiceSpec{
+				Ports: []core_v1.ServicePort{{Name: "http", Protocol: core_v1.ProtocolTCP, Port: 9080}},
+			},
+		},
+	}
+
+	hosts := kubernetes.NewKubeServiceHosts(services, testIdentityForKubeHosts(conf), []string{"."})
+
+	assert.True(hosts.IsValidForNamespace("reviews.bookinfo.svc.cluster.local", "bookinfo"))
+	assert.True(hosts.IsValidForNamespace("reviews.bookinfo.svc.cluster.local", "other-ns"))
+}
+
+func TestKubeServiceHostsNilMeshDefaultVisibleEverywhere(t *testing.T) {
+	assert := assert.New(t)
+	conf := config.NewConfig()
+
+	services := []core_v1.Service{
+		{
+			ObjectMeta: meta_v1.ObjectMeta{Name: "reviews", Namespace: "bookinfo"},
+			Spec: core_v1.ServiceSpec{
+				Ports: []core_v1.ServicePort{{Name: "http", Protocol: core_v1.ProtocolTCP, Port: 9080}},
+			},
+		},
+	}
+
+	hosts := kubernetes.NewKubeServiceHosts(services, testIdentityForKubeHosts(conf), nil)
+
+	assert.True(hosts.IsValidForNamespace("reviews.bookinfo.svc.cluster.local", "bookinfo"))
+	assert.True(hosts.IsValidForNamespace("reviews.bookinfo.svc.cluster.local", "other-ns"))
+	assert.True(hosts.IsValidForNamespace("reviews.bookinfo.svc.cluster.local", "istio-system"))
+}
+
+func TestKubeServiceHostsWithNamespaceDefaults(t *testing.T) {
+	assert := assert.New(t)
+	conf := config.NewConfig()
+
+	services := []core_v1.Service{
+		{
+			ObjectMeta: meta_v1.ObjectMeta{Name: "reviews", Namespace: "bookinfo"},
+			Spec: core_v1.ServiceSpec{
+				Ports: []core_v1.ServicePort{{Name: "http", Protocol: core_v1.ProtocolTCP, Port: 9080}},
+			},
+		},
+		{
+			ObjectMeta: meta_v1.ObjectMeta{Name: "ratings", Namespace: "bookinfo2"},
+			Spec: core_v1.ServiceSpec{
+				Ports: []core_v1.ServicePort{{Name: "http", Protocol: core_v1.ProtocolTCP, Port: 9080}},
+			},
+		},
+	}
+
+	t.Run("nil map same as NewKubeServiceHosts with nil default", func(t *testing.T) {
+		hosts := kubernetes.NewKubeServiceHostsWithNamespaceDefaults(services, testIdentityForKubeHosts(conf), nil)
+		assert.True(hosts.IsValidForNamespace("reviews.bookinfo.svc.cluster.local", "bookinfo"))
+		assert.True(hosts.IsValidForNamespace("reviews.bookinfo.svc.cluster.local", "other-ns"))
+		assert.True(hosts.IsValidForNamespace("ratings.bookinfo2.svc.cluster.local", "bookinfo"))
+	})
+
+	t.Run("per-namespace exportTo", func(t *testing.T) {
+		namespaceToExportTo := map[string][]string{
+			"bookinfo":  {"."},
+			"bookinfo2": {"*"},
+		}
+		hosts := kubernetes.NewKubeServiceHostsWithNamespaceDefaults(services, testIdentityForKubeHosts(conf), namespaceToExportTo)
+		// bookinfo uses "." - visible only in bookinfo
+		assert.True(hosts.IsValidForNamespace("reviews.bookinfo.svc.cluster.local", "bookinfo"))
+		assert.False(hosts.IsValidForNamespace("reviews.bookinfo.svc.cluster.local", "other-ns"))
+		// bookinfo2 uses "*" - visible everywhere
+		assert.True(hosts.IsValidForNamespace("ratings.bookinfo2.svc.cluster.local", "bookinfo"))
+		assert.True(hosts.IsValidForNamespace("ratings.bookinfo2.svc.cluster.local", "bookinfo2"))
+		assert.True(hosts.IsValidForNamespace("ratings.bookinfo2.svc.cluster.local", "other-ns"))
+	})
+}
+
+func TestGetClusterInfoFromIstiod(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+
+	conf := config.NewConfig()
+	k8s := kubetest.NewFakeK8sClient(
+		kubetest.FakeNamespace("istio-system"),
+		&apps_v1.Deployment{
+			ObjectMeta: meta_v1.ObjectMeta{
+				Name:      "istiod",
+				Namespace: "istio-system",
+				Labels:    map[string]string{"app": "istiod"},
+			},
+			Spec: apps_v1.DeploymentSpec{
+				Template: core_v1.PodTemplateSpec{
+					Spec: core_v1.PodSpec{
+						Containers: []core_v1.Container{
+							{
+								Name: "istiod",
+								Env: []core_v1.EnvVar{
+									{
+										Name:  "CLUSTER_ID",
+										Value: "east",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	)
+	clusterID, err := kubernetes.ClusterNameFromIstiod(conf, k8s)
+	require.NoError(err)
+
+	assert.Equal("east", clusterID)
+}
+
+func TestGetClusterInfoFromIstiodFails(t *testing.T) {
+	require := require.New(t)
+
+	conf := config.NewConfig()
+	k8s := kubetest.NewFakeK8sClient(
+		kubetest.FakeNamespace("istio-system"),
+		&apps_v1.Deployment{
+			ObjectMeta: meta_v1.ObjectMeta{
+				Name:      "istiod",
+				Namespace: "istio-system",
+				Labels:    map[string]string{"app": "istiod"},
+			},
+			Spec: apps_v1.DeploymentSpec{
+				Template: core_v1.PodTemplateSpec{
+					Spec: core_v1.PodSpec{
+						Containers: []core_v1.Container{
+							{
+								Name: "istiod",
+								Env:  []core_v1.EnvVar{},
+							},
+						},
+					},
+				},
+			},
+		},
+	)
+	_, err := kubernetes.ClusterNameFromIstiod(conf, k8s)
+	require.Error(err)
 }

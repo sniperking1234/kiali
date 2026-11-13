@@ -1,10 +1,12 @@
 package models
 
 import (
+	"strings"
 	"time"
 
-	osproject_v1 "github.com/openshift/api/project/v1"
 	core_v1 "k8s.io/api/core/v1"
+
+	"github.com/kiali/kiali/config"
 )
 
 // A Namespace provide a scope for names
@@ -18,6 +20,22 @@ type Namespace struct {
 	// required: true
 	Name string `json:"name"`
 
+	// The name of the cluster
+	//
+	// example:  east
+	// required: true
+	Cluster string `json:"cluster"`
+
+	// If has the Ambient annotations
+	//
+	// required: true
+	IsAmbient bool `json:"isAmbient"`
+
+	// If the namespace is a control plane
+	//
+	// required: true
+	IsControlPlane bool `json:"isControlPlane"`
+
 	// Creation date of the namespace.
 	// There is no need to export this through the API. So, this is
 	// set to be ignored by JSON package.
@@ -27,44 +45,58 @@ type Namespace struct {
 
 	// Labels for Namespace
 	Labels map[string]string `json:"labels"`
+
+	// Specific annotations used in Kiali
+	Annotations map[string]string `json:"annotations"`
+
+	WaypointTrafficSplit *WaypointTrafficSplit `json:"waypointTrafficSplit,omitempty"`
+
+	// Revision managing this namespace.
+	// If the namespace has 'istio-injection: enabled' label,
+	// it will be set to the 'default' revision. Otherwise
+	// it matches on istio.io/rev. Note that his can also
+	// be a Tag and not the actual revision.
+	Revision string `json:"revision,omitempty"`
 }
 
-type Namespaces []Namespace
-type NamespaceNames []string
+type (
+	Namespaces     []Namespace
+	NamespaceNames []string
+)
 
-func CastNamespaceCollection(ns []core_v1.Namespace) []Namespace {
+func CastNamespaceCollection(ns []core_v1.Namespace, cluster string) []Namespace {
 	namespaces := make([]Namespace, len(ns))
 	for i, item := range ns {
-		namespaces[i] = CastNamespace(item)
+		namespaces[i] = CastNamespace(item, cluster)
 	}
 
 	return namespaces
 }
 
-func CastNamespace(ns core_v1.Namespace) Namespace {
+func CastNamespace(ns core_v1.Namespace, cluster string) Namespace {
 	namespace := Namespace{}
 	namespace.Name = ns.Name
+	namespace.Cluster = cluster
 	namespace.CreationTimestamp = ns.CreationTimestamp.Time
 	namespace.Labels = ns.Labels
+	namespace.Annotations = ns.Annotations
 
-	return namespace
-}
-
-func CastProjectCollection(ps []osproject_v1.Project) []Namespace {
-	namespaces := make([]Namespace, len(ps))
-	for i, project := range ps {
-		namespaces[i] = CastProject(project)
+	if ns.Labels != nil {
+		// Injection label takes precedence.
+		// See rules at: https://istio.io/latest/docs/setup/additional-setup/sidecar-injection/#controlling-the-injection-policy
+		if injectionLabel := ns.Labels[config.IstioInjectionLabelName]; injectionLabel == IstioInjectionDisabledLabelValue {
+			namespace.Revision = ""
+		} else if injectionLabel == IstioInjectionEnabledLabelValue {
+			namespace.Revision = DefaultRevisionLabel
+		} else if label, hasLabel := ns.Labels[config.IstioRevisionLabel]; hasLabel {
+			namespace.Revision = label
+		}
 	}
 
-	return namespaces
-}
-
-func CastProject(p osproject_v1.Project) Namespace {
-	namespace := Namespace{}
-	namespace.Name = p.Name
-	namespace.CreationTimestamp = p.CreationTimestamp.Time
-	namespace.Labels = p.Labels
-
+	if label, hasLabel := ns.Labels[config.IstioAmbientNamespaceLabel]; hasLabel && label == config.IstioAmbientNamespaceLabelValue {
+		namespace.IsAmbient = true
+	}
+	namespace.WaypointTrafficSplit = ResolveWaypointTrafficSplit(cluster, ns.Name, ns.Labels, ns.Annotations, "namespace")
 	return namespace
 }
 
@@ -77,12 +109,39 @@ func (nss Namespaces) Includes(namespace string) bool {
 	return false
 }
 
+func (nss Namespaces) IsNamespaceAmbient(namespace, cluster string) bool {
+	for _, ns := range nss {
+		if ns.Name == namespace && ns.Cluster == cluster {
+			return ns.IsAmbient
+		}
+	}
+	return false
+}
+
+func (nss Namespaces) GetNamespace(namespace, cluster string) *Namespace {
+	for _, ns := range nss {
+		if ns.Name == namespace && ns.Cluster == cluster {
+			return &ns
+		}
+	}
+	return nil
+}
+
 func (nss Namespaces) GetNames() []string {
-	names := make([]string, len(nss))
+	// Capacity only: appending to a slice preallocated with len(nss) would
+	// yield len(nss) leading empty strings before the real names.
+	names := make([]string, 0, len(nss))
 	for _, ns := range nss {
 		names = append(names, ns.Name)
 	}
 	return names
+}
+
+// ClusterNamespaceKey builds a composite map key for a (cluster, namespace)
+// pair. The NUL separator cannot occur in either name, so distinct pairs
+// cannot collide.
+func ClusterNamespaceKey(cluster, namespace string) string {
+	return cluster + "\x00" + namespace
 }
 
 func (nsn NamespaceNames) Includes(namespace string) bool {
@@ -90,6 +149,35 @@ func (nsn NamespaceNames) Includes(namespace string) bool {
 		if ns == namespace {
 			return true
 		}
+	}
+	return false
+}
+
+// MatchesPattern reports whether any known namespace matches an AuthorizationPolicy
+// source.namespaces entry (exact, prefix*, *suffix, or *).
+func (nsn NamespaceNames) MatchesPattern(pattern string) bool {
+	if pattern == "*" {
+		return len(nsn) > 0
+	}
+	if nsn.Includes(pattern) {
+		return true
+	}
+	for _, ns := range nsn {
+		if namespacePatternMatches(pattern, ns) {
+			return true
+		}
+	}
+	return false
+}
+
+func namespacePatternMatches(pattern, namespace string) bool {
+	if strings.HasSuffix(pattern, "*") {
+		prefix := strings.TrimSuffix(pattern, "*")
+		return prefix != "" && strings.HasPrefix(namespace, prefix)
+	}
+	if strings.HasPrefix(pattern, "*") {
+		suffix := strings.TrimPrefix(pattern, "*")
+		return suffix != "" && strings.HasSuffix(namespace, suffix)
 	}
 	return false
 }

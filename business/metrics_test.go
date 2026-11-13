@@ -1,6 +1,7 @@
 package business
 
 import (
+	"context"
 	"fmt"
 	"testing"
 	"time"
@@ -15,14 +16,15 @@ import (
 )
 
 func setupMocked() (*MetricsService, *prometheustest.PromAPIMock, error) {
-	config.Set(config.NewConfig())
+	conf := config.NewConfig()
+	config.Set(conf)
 	api := new(prometheustest.PromAPIMock)
-	client, err := prometheus.NewClient()
+	client, err := prometheus.NewClient(*conf, "")
 	if err != nil {
 		return nil, nil, err
 	}
 	client.Inject(api)
-	return NewMetricsService(client), api, nil
+	return NewMetricsService(client, config.Get()), api, nil
 }
 
 func TestGetServiceMetrics(t *testing.T) {
@@ -43,22 +45,30 @@ func TestGetServiceMetrics(t *testing.T) {
 	q.Quantiles = []string{"0.99"}
 
 	labels := `reporter="source",destination_service_name="productpage",destination_service_namespace="bookinfo"`
-	api.MockRangeRounded("sum(rate(istio_requests_total{"+labels+"}[5m]))", 2.5)
-	api.MockRangeErrRounded("sum(rate(istio_requests_total{"+labels+`,response_code=~"^0$|^[4-5]\\d\\d$"}[5m])) OR sum(rate(istio_requests_total{`+labels+`,grpc_response_status=~"^[1-9]$|^1[0-6]$",response_code!~"^0$|^[4-5]\\d\\d$"}[5m]))`, 4.5)
-	api.MockRangeRounded("sum(rate(istio_request_bytes_sum{"+labels+"}[5m]))", 1000)
-	api.MockRangeRounded("sum(rate(istio_response_bytes_sum{"+labels+"}[5m]))", 1001)
-	api.MockRangeRounded("sum(rate(istio_tcp_received_bytes_total{"+labels+"}[5m]))", 11)
-	api.MockRangeRounded("sum(rate(istio_tcp_sent_bytes_total{"+labels+"}[5m]))", 13)
+	api.MockRange("sum(rate(istio_requests_total{"+labels+"}[5m]))", 2.5)
+	api.MockRangeErr("sum(rate(istio_requests_total{"+labels+`,response_code=~"^0$|^[4-5]\\d\\d$"}[5m])) OR sum(rate(istio_requests_total{`+labels+`,grpc_response_status=~"^[1-9]$|^1[0-6]$",response_code!~"^0$|^[4-5]\\d\\d$"}[5m]))`, 4.5)
+	api.MockRange("sum(rate(istio_request_bytes_sum{"+labels+"}[5m]))", 1000)
+	api.MockRange("sum(rate(istio_response_bytes_sum{"+labels+"}[5m]))", 1001)
+	api.MockRange("sum(rate(istio_request_messages_total{"+labels+"}[5m]))", 10)
+	api.MockRange("sum(rate(istio_response_messages_total{"+labels+"}[5m]))", 20)
+	api.MockRange("sum(rate(istio_tcp_received_bytes_total{"+labels+"}[5m]))", 11)
+	api.MockRange("sum(rate(istio_tcp_sent_bytes_total{"+labels+"}[5m]))", 13)
+	api.MockRange("sum(rate(istio_tcp_connections_closed_total{"+labels+"}[5m]))", 31)
+	api.MockRange("sum(rate(istio_tcp_connections_opened_total{"+labels+"}[5m]))", 32)
 	api.MockHistoRange("istio_request_bytes", "{"+labels+"}[5m]", 0.35, 0.2, 0.3, 0.7)
 	api.MockHistoRange("istio_request_duration_seconds", "{"+labels+"}[5m]", 0.35, 0.2, 0.3, 0.8)
 	api.MockHistoRange("istio_request_duration_milliseconds", "{"+labels+"}[5m]", 0.35, 0.2, 0.3, 0.8)
 	api.MockHistoRange("istio_response_bytes", "{"+labels+"}[5m]", 0.35, 0.2, 0.3, 0.9)
 
 	// Test that range and rate interval are changed when needed (namespace bounds)
-	metrics, err := srv.GetMetrics(q, nil)
+	metrics, err := srv.GetMetrics(context.Background(), q, nil)
 
 	assert.Nil(err)
-	assert.Equal(9, len(metrics))
+	assert.Equal(13, len(metrics))
+	grpcRecIn := metrics["grpc_received"]
+	assert.NotNil(grpcRecIn)
+	grpcSentIn := metrics["grpc_sent"]
+	assert.NotNil(grpcSentIn)
 	rqCountIn := metrics["request_count"]
 	assert.NotNil(rqCountIn)
 	rqErrorCountIn := metrics["request_error_count"]
@@ -78,6 +88,8 @@ func TestGetServiceMetrics(t *testing.T) {
 	tcpSentIn := metrics["tcp_sent"]
 	assert.NotNil(tcpSentIn)
 
+	assert.Equal(20.0, float64(grpcRecIn[0].Datapoints[0].Value))
+	assert.Equal(10.0, float64(grpcSentIn[0].Datapoints[0].Value))
 	assert.Equal(2.5, float64(rqCountIn[0].Datapoints[0].Value))
 	assert.Equal(4.5, float64(rqErrorCountIn[0].Datapoints[0].Value))
 	assert.Equal(1000.0, float64(rqThroughput[0].Datapoints[0].Value))
@@ -85,8 +97,8 @@ func TestGetServiceMetrics(t *testing.T) {
 	assertHisto(assert, rqSizeIn, "0.99", 0.7)
 	assertHisto(assert, rqDurationMillisIn, "0.99", 0.8)
 	assertHisto(assert, rsSizeIn, "0.99", 0.9)
-	assert.Equal(11.0, float64(tcpRecIn[0].Datapoints[0].Value))
-	assert.Equal(13.0, float64(tcpSentIn[0].Datapoints[0].Value))
+	assert.Equal(13.0, float64(tcpRecIn[0].Datapoints[0].Value))  // L4 Telemetry is backwards
+	assert.Equal(11.0, float64(tcpSentIn[0].Datapoints[0].Value)) // L4 Telemetry is backwards
 }
 
 func assertHisto(assert *assert.Assertions, metrics []models.Metric, stat string, expected float64) {
@@ -117,12 +129,16 @@ func TestGetAppMetrics(t *testing.T) {
 		return
 	}
 	labels := `reporter="source",source_workload_namespace="bookinfo",source_canonical_service="productpage"`
-	api.MockRangeRounded("sum(rate(istio_requests_total{"+labels+"}[5m]))", 1.5)
-	api.MockRangeErrRounded("sum(rate(istio_requests_total{"+labels+`,response_code=~"^0$|^[4-5]\\d\\d$"}[5m])) OR sum(rate(istio_requests_total{`+labels+`,grpc_response_status=~"^[1-9]$|^1[0-6]$",response_code!~"^0$|^[4-5]\\d\\d$"}[5m]))`, 3.5)
-	api.MockRangeRounded("sum(rate(istio_request_bytes_sum{"+labels+"}[5m]))", 1000)
-	api.MockRangeRounded("sum(rate(istio_response_bytes_sum{"+labels+"}[5m]))", 1001)
-	api.MockRangeRounded("sum(rate(istio_tcp_received_bytes_total{"+labels+"}[5m]))", 10)
-	api.MockRangeRounded("sum(rate(istio_tcp_sent_bytes_total{"+labels+"}[5m]))", 12)
+	api.MockRange("sum(rate(istio_requests_total{"+labels+"}[5m]))", 1.5)
+	api.MockRangeErr("sum(rate(istio_requests_total{"+labels+`,response_code=~"^0$|^[4-5]\\d\\d$"}[5m])) OR sum(rate(istio_requests_total{`+labels+`,grpc_response_status=~"^[1-9]$|^1[0-6]$",response_code!~"^0$|^[4-5]\\d\\d$"}[5m]))`, 3.5)
+	api.MockRange("sum(rate(istio_request_bytes_sum{"+labels+"}[5m]))", 1000)
+	api.MockRange("sum(rate(istio_response_bytes_sum{"+labels+"}[5m]))", 1001)
+	api.MockRange("sum(rate(istio_request_messages_total{"+labels+"}[5m]))", 10)
+	api.MockRange("sum(rate(istio_response_messages_total{"+labels+"}[5m]))", 20)
+	api.MockRange("sum(rate(istio_tcp_received_bytes_total{"+labels+"}[5m]))", 10)
+	api.MockRange("sum(rate(istio_tcp_sent_bytes_total{"+labels+"}[5m]))", 12)
+	api.MockRange("sum(rate(istio_tcp_connections_closed_total{"+labels+"}[5m]))", 31)
+	api.MockRange("sum(rate(istio_tcp_connections_opened_total{"+labels+"}[5m]))", 32)
 	api.MockHistoRange("istio_request_bytes", "{"+labels+"}[5m]", 0.35, 0.2, 0.3, 0.4)
 	api.MockHistoRange("istio_request_duration_seconds", "{"+labels+"}[5m]", 0.35, 0.2, 0.3, 0.5)
 	api.MockHistoRange("istio_request_duration_milliseconds", "{"+labels+"}[5m]", 0.35, 0.2, 0.3, 0.5)
@@ -135,10 +151,14 @@ func TestGetAppMetrics(t *testing.T) {
 	q.FillDefaults()
 	q.RateInterval = "5m"
 	q.Quantiles = []string{"0.5", "0.95", "0.99"}
-	metrics, err := srv.GetMetrics(q, nil)
+	metrics, err := srv.GetMetrics(context.Background(), q, nil)
 
 	assert.Nil(err)
-	assert.Equal(9, len(metrics))
+	assert.Equal(13, len(metrics))
+	grpcRecIn := metrics["grpc_received"]
+	assert.NotNil(grpcRecIn)
+	grpcSentIn := metrics["grpc_sent"]
+	assert.NotNil(grpcSentIn)
 	rqCountIn := metrics["request_count"]
 	assert.NotNil(rqCountIn)
 	rqErrorCountIn := metrics["request_error_count"]
@@ -158,6 +178,8 @@ func TestGetAppMetrics(t *testing.T) {
 	tcpSentIn := metrics["tcp_sent"]
 	assert.NotNil(tcpSentIn)
 
+	assert.Equal(20.0, float64(grpcRecIn[0].Datapoints[0].Value))
+	assert.Equal(10.0, float64(grpcSentIn[0].Datapoints[0].Value))
 	assert.Equal(1.5, float64(rqCountIn[0].Datapoints[0].Value))
 	assert.Equal(3.5, float64(rqErrorCountIn[0].Datapoints[0].Value))
 	assert.Equal(1000.0, float64(rqThroughput[0].Datapoints[0].Value))
@@ -168,8 +190,8 @@ func TestGetAppMetrics(t *testing.T) {
 	assertHisto(assert, rqSizeIn, "0.99", 0.4)
 	assertHisto(assert, rqDurationMillisIn, "0.99", 0.5)
 	assertHisto(assert, rsSizeIn, "0.99", 0.6)
-	assert.Equal(10.0, float64(tcpRecIn[0].Datapoints[0].Value))
-	assert.Equal(12.0, float64(tcpSentIn[0].Datapoints[0].Value))
+	assert.Equal(12.0, float64(tcpRecIn[0].Datapoints[0].Value))  // L4 Telemetry is backwards
+	assert.Equal(10.0, float64(tcpSentIn[0].Datapoints[0].Value)) // L4 Telemetry is backwards
 }
 
 func TestGetFilteredAppMetrics(t *testing.T) {
@@ -179,7 +201,7 @@ func TestGetFilteredAppMetrics(t *testing.T) {
 		t.Error(err)
 		return
 	}
-	api.MockRangeRounded(`sum(rate(istio_requests_total{reporter="source",source_workload_namespace="bookinfo",source_canonical_service="productpage"}[5m]))`, 1.5)
+	api.MockRange(`sum(rate(istio_requests_total{reporter="source",source_workload_namespace="bookinfo",source_canonical_service="productpage"}[5m]))`, 1.5)
 	api.MockHistoRange("istio_request_bytes", `{reporter="source",source_workload_namespace="bookinfo",source_canonical_service="productpage"}[5m]`, 0.35, 0.2, 0.3, 0.4)
 	q := models.IstioMetricsQuery{
 		Namespace: "bookinfo",
@@ -188,7 +210,7 @@ func TestGetFilteredAppMetrics(t *testing.T) {
 	q.FillDefaults()
 	q.RateInterval = "5m"
 	q.Filters = []string{"request_count", "request_size"}
-	metrics, err := srv.GetMetrics(q, nil)
+	metrics, err := srv.GetMetrics(context.Background(), q, nil)
 
 	assert.Nil(err)
 	assert.Equal(2, len(metrics))
@@ -205,7 +227,7 @@ func TestGetAppMetricsInstantRates(t *testing.T) {
 		t.Error(err)
 		return
 	}
-	api.MockRangeRounded(`sum(irate(istio_requests_total{reporter="source",source_workload_namespace="bookinfo",source_canonical_service="productpage"}[1m]))`, 1.5)
+	api.MockRange(`sum(irate(istio_requests_total{reporter="source",source_workload_namespace="bookinfo",source_canonical_service="productpage"}[1m]))`, 1.5)
 	q := models.IstioMetricsQuery{
 		Namespace: "bookinfo",
 		App:       "productpage",
@@ -213,7 +235,7 @@ func TestGetAppMetricsInstantRates(t *testing.T) {
 	q.FillDefaults()
 	q.RateFunc = "irate"
 	q.Filters = []string{"request_count"}
-	metrics, err := srv.GetMetrics(q, nil)
+	metrics, err := srv.GetMetrics(context.Background(), q, nil)
 
 	assert.Nil(err)
 	assert.Equal(1, len(metrics))
@@ -229,7 +251,7 @@ func TestGetAppMetricsUnavailable(t *testing.T) {
 		return
 	}
 	// Mock everything to return empty data
-	api.MockEmptyRangeRounded(`sum(rate(istio_requests_total{reporter="source",source_workload_namespace="bookinfo",source_canonical_service="productpage"}[5m]))`)
+	api.MockEmptyRange(`sum(rate(istio_requests_total{reporter="source",source_workload_namespace="bookinfo",source_canonical_service="productpage"}[5m]))`)
 	api.MockEmptyHistoRange("istio_request_bytes", `{reporter="source",source_workload_namespace="bookinfo",source_canonical_service="productpage"}[5m]`)
 	q := models.IstioMetricsQuery{
 		Namespace: "bookinfo",
@@ -239,7 +261,7 @@ func TestGetAppMetricsUnavailable(t *testing.T) {
 	q.RateInterval = "5m"
 	q.Quantiles = []string{"0.5", "0.95", "0.99"}
 	q.Filters = []string{"request_count", "request_size"}
-	metrics, err := srv.GetMetrics(q, nil)
+	metrics, err := srv.GetMetrics(context.Background(), q, nil)
 
 	assert.Nil(err)
 	assert.Equal(2, len(metrics))
@@ -264,12 +286,16 @@ func TestGetNamespaceMetrics(t *testing.T) {
 		return
 	}
 	labels := `reporter="source",source_workload_namespace="bookinfo"`
-	api.MockRangeRounded("sum(rate(istio_requests_total{"+labels+"}[5m]))", 1.5)
-	api.MockRangeErrRounded("sum(rate(istio_requests_total{"+labels+`,response_code=~"^0$|^[4-5]\\d\\d$"}[5m])) OR sum(rate(istio_requests_total{`+labels+`,grpc_response_status=~"^[1-9]$|^1[0-6]$",response_code!~"^0$|^[4-5]\\d\\d$"}[5m]))`, 3.5)
-	api.MockRangeRounded("sum(rate(istio_request_bytes_sum{"+labels+"}[5m]))", 1000)
-	api.MockRangeRounded("sum(rate(istio_response_bytes_sum{"+labels+"}[5m]))", 1001)
-	api.MockRangeRounded("sum(rate(istio_tcp_received_bytes_total{"+labels+"}[5m]))", 10)
-	api.MockRangeRounded("sum(rate(istio_tcp_sent_bytes_total{"+labels+"}[5m]))", 12)
+	api.MockRange("sum(rate(istio_requests_total{"+labels+"}[5m]))", 1.5)
+	api.MockRangeErr("sum(rate(istio_requests_total{"+labels+`,response_code=~"^0$|^[4-5]\\d\\d$"}[5m])) OR sum(rate(istio_requests_total{`+labels+`,grpc_response_status=~"^[1-9]$|^1[0-6]$",response_code!~"^0$|^[4-5]\\d\\d$"}[5m]))`, 3.5)
+	api.MockRange("sum(rate(istio_request_bytes_sum{"+labels+"}[5m]))", 1000)
+	api.MockRange("sum(rate(istio_response_bytes_sum{"+labels+"}[5m]))", 1001)
+	api.MockRange("sum(rate(istio_request_messages_total{"+labels+"}[5m]))", 10)
+	api.MockRange("sum(rate(istio_response_messages_total{"+labels+"}[5m]))", 20)
+	api.MockRange("sum(rate(istio_tcp_received_bytes_total{"+labels+"}[5m]))", 10)
+	api.MockRange("sum(rate(istio_tcp_sent_bytes_total{"+labels+"}[5m]))", 12)
+	api.MockRange("sum(rate(istio_tcp_connections_closed_total{"+labels+"}[5m]))", 31)
+	api.MockRange("sum(rate(istio_tcp_connections_opened_total{"+labels+"}[5m]))", 32)
 	api.MockHistoRange("istio_request_bytes", "{"+labels+"}[5m]", 0.35, 0.2, 0.3, 0.4)
 	api.MockHistoRange("istio_request_duration_seconds", "{"+labels+"}[5m]", 0.35, 0.2, 0.3, 0.5)
 	api.MockHistoRange("istio_request_duration_milliseconds", "{"+labels+"}[5m]", 0.35, 0.2, 0.3, 0.5)
@@ -281,10 +307,14 @@ func TestGetNamespaceMetrics(t *testing.T) {
 	q.FillDefaults()
 	q.RateInterval = "5m"
 	q.Quantiles = []string{"0.5", "0.95", "0.99"}
-	metrics, err := srv.GetMetrics(q, nil)
+	metrics, err := srv.GetMetrics(context.Background(), q, nil)
 
 	assert.Nil(err)
-	assert.Equal(9, len(metrics))
+	assert.Equal(13, len(metrics))
+	grpcRecOut := metrics["grpc_received"]
+	assert.NotNil(grpcRecOut)
+	grpcSentOut := metrics["grpc_sent"]
+	assert.NotNil(grpcSentOut)
 	rqCountOut := metrics["request_count"]
 	assert.NotNil(rqCountOut)
 	rqErrorCountOut := metrics["request_error_count"]
@@ -304,6 +334,8 @@ func TestGetNamespaceMetrics(t *testing.T) {
 	tcpSentOut := metrics["tcp_sent"]
 	assert.NotNil(tcpSentOut)
 
+	assert.Equal(20.0, float64(grpcRecOut[0].Datapoints[0].Value))
+	assert.Equal(10.0, float64(grpcSentOut[0].Datapoints[0].Value))
 	assert.Equal(1.5, float64(rqCountOut[0].Datapoints[0].Value))
 	assert.Equal(3.5, float64(rqErrorCountOut[0].Datapoints[0].Value))
 	assert.Equal(1000.0, float64(rqThroughput[0].Datapoints[0].Value))
@@ -314,8 +346,8 @@ func TestGetNamespaceMetrics(t *testing.T) {
 	assertHisto(assert, rqSizeOut, "0.99", 0.4)
 	assertHisto(assert, rqDurationMillisOut, "0.99", 0.5)
 	assertHisto(assert, rsSizeOut, "0.99", 0.6)
-	assert.Equal(10.0, float64(tcpRecOut[0].Datapoints[0].Value))
-	assert.Equal(12.0, float64(tcpSentOut[0].Datapoints[0].Value))
+	assert.Equal(12.0, float64(tcpRecOut[0].Datapoints[0].Value))  // L4 Telemetry is backwards
+	assert.Equal(10.0, float64(tcpSentOut[0].Datapoints[0].Value)) // L4 Telemetry is backwards
 }
 
 func TestCreateMetricsLabelsBuilder(t *testing.T) {
@@ -326,7 +358,7 @@ func TestCreateMetricsLabelsBuilder(t *testing.T) {
 	}
 	q.FillDefaults()
 	q.Reporter = "source"
-	lb := createMetricsLabelsBuilder(&q)
+	lb := createMetricsLabelsBuilder(&q, config.Get())
 	assert.Equal(`{reporter="source",source_workload_namespace="bookinfo",source_canonical_service="productpage"}`, lb.Build())
 }
 
@@ -344,8 +376,27 @@ func TestCreateStatsMetricsLabelsBuilder(t *testing.T) {
 		Quantiles: []string{"0.90", "0.5"},
 		QueryTime: time.Now(),
 	}
-	lb := createStatsMetricsLabelsBuilder(&q)
+	lb := createStatsMetricsLabelsBuilder(&q, config.Get())
 	assert.Equal(`{reporter="destination",destination_workload_namespace="ns3",destination_canonical_service="foo"}`, lb.Build())
+}
+
+func TestCreateStatsMetricsLabelsBuilderWithWaypointReporter(t *testing.T) {
+	assert := assert.New(t)
+	q := models.MetricsStatsQuery{
+		Target: models.Target{
+			Namespace: "ns3",
+			Name:      "foo",
+			Kind:      "app",
+		},
+		Reporters: []string{"destination", "waypoint"},
+		Direction: "inbound",
+		Interval:  "3h",
+		Avg:       true,
+		Quantiles: []string{"0.90", "0.5"},
+		QueryTime: time.Now(),
+	}
+	lb := createStatsMetricsLabelsBuilder(&q, config.Get())
+	assert.Equal(`{reporter=~"destination|waypoint",destination_workload_namespace="ns3",destination_canonical_service="foo"}`, lb.Build())
 }
 
 func TestCreateStatsMetricsLabelsBuilderWithPeer(t *testing.T) {
@@ -367,7 +418,7 @@ func TestCreateStatsMetricsLabelsBuilderWithPeer(t *testing.T) {
 		Quantiles: []string{"0.90", "0.5"},
 		QueryTime: time.Now(),
 	}
-	lb := createStatsMetricsLabelsBuilder(&q)
+	lb := createStatsMetricsLabelsBuilder(&q, config.Get())
 	assert.Equal(`{reporter="destination",destination_workload_namespace="ns3",destination_canonical_service="foo",source_workload_namespace="ns4",source_canonical_service="bar"}`, lb.Build())
 }
 
@@ -386,6 +437,7 @@ func TestGetMetricsStats(t *testing.T) {
 			Name:      "foo",
 			Kind:      "app",
 		},
+		Reporters:    []string{"source", "waypoint"},
 		Direction:    "outbound",
 		Interval:     "30m",
 		RawInterval:  "30m",
@@ -403,6 +455,7 @@ func TestGetMetricsStats(t *testing.T) {
 			Name:      "w1",
 			Kind:      "workload",
 		},
+		Reporters:    []string{"destination", "waypoint"},
 		Direction:    "inbound",
 		Interval:     "3h",
 		RawInterval:  "3h",
@@ -417,18 +470,102 @@ func TestGetMetricsStats(t *testing.T) {
 	q1P95 := model.Vector{createSample(8)}
 	q2P50 := model.Vector{createSample(6.3)}
 	q2P95 := model.Vector{createSample(9.3)}
-	q1Labels := `reporter="source",source_workload_namespace="ns1",source_canonical_service="foo"`
-	q2Labels := `reporter="destination",destination_service_name="bar",destination_service_namespace="ns2",source_workload_namespace="ns3",source_workload="w1"`
-	api.MockHistoValue("istio_request_duration_milliseconds", "{"+q1Labels+"}[30m]", q1Avg, v0, q1P95, v0)
-	api.MockHistoValue("istio_request_duration_milliseconds", "{"+q2Labels+"}[3h]", v0, q2P50, q2P95, v0)
+	q1Labels := `reporter=~"source|waypoint",source_workload_namespace="ns1",source_canonical_service="foo"`
+	q2Labels := `reporter=~"destination|waypoint",destination_service_name="bar",destination_service_namespace="ns2",source_workload_namespace="ns3",source_workload="w1"`
+	api.MockHistoValue(context.Background(), "istio_request_duration_milliseconds", "{"+q1Labels+"}[30m]", q1Avg, v0, q1P95, v0)
+	api.MockHistoValue(context.Background(), "istio_request_duration_milliseconds", "{"+q2Labels+"}[3h]", v0, q2P50, q2P95, v0)
 
-	stats, err := srv.GetStats(queries)
+	stats, err := srv.GetStats(context.Background(), queries)
 
 	assert.Nil(err)
 	assert.Len(stats, 2)
 	fmt.Printf("%v\n", stats)
-	assert.Equal([]models.Stat{{Name: "0.95", Value: 8.0}, {Name: "avg", Value: 5.0}}, stats["ns1:app:foo::outbound:30m"].ResponseTimes)
-	assert.Equal([]models.Stat{{Name: "0.5", Value: 6.3}, {Name: "0.95", Value: 9.3}}, stats["ns2:service:bar:ns3:workload:w1:inbound:3h"].ResponseTimes)
+	assert.Equal([]models.Stat{{Name: "0.95", Value: 8.0}, {Name: "avg", Value: 5.0}}, stats["ns1:app:foo::outbound:30m:source,waypoint"].ResponseTimes)
+	assert.Equal([]models.Stat{{Name: "0.5", Value: 6.3}, {Name: "0.95", Value: 9.3}}, stats["ns2:service:bar:ns3:workload:w1:inbound:3h:destination,waypoint"].ResponseTimes)
+}
+
+func TestGetZtunnelMetrics(t *testing.T) {
+	assert := assert.New(t)
+	srv, api, err := setupMocked()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	q := models.IstioMetricsQuery{}
+	q.FillDefaults()
+	q.Namespace = "ztunnel"
+	q.RateInterval = "5m"
+
+	ztunnelLabels := `{app="ztunnel",namespace="ztunnel"}`
+	ztunnelContainerLabels := `{namespace="ztunnel",container="istio-proxy"}`
+	api.MockRange("sum(rate(istio_tcp_connections_opened_total"+ztunnelLabels+"[5m]))", 1.0)
+	api.MockRange("sum(rate(istio_tcp_connections_closed_total"+ztunnelLabels+"[5m]))", 2.0)
+	api.MockRange(`sum(istio_build{component="ztunnel"}) by (tag)`, 1.0)
+	api.MockRange("sum(container_memory_working_set_bytes"+ztunnelContainerLabels+")", 100.0)
+	api.MockRange("sum(irate(container_cpu_usage_seconds_total"+ztunnelContainerLabels+"[5m]))", 0.5)
+	api.MockRange("sum(rate(istio_tcp_received_bytes_total"+ztunnelLabels+"[5m]))", 10.0)
+	api.MockRange("sum(rate(istio_tcp_sent_bytes_total"+ztunnelLabels+"[5m]))", 20.0)
+	api.MockRange("sum(workload_manager_active_proxy_count"+ztunnelLabels+")", 3.0)
+
+	metrics, err := srv.GetZtunnelMetrics(context.Background(), q)
+	assert.NoError(err)
+	assert.Len(metrics, 6)
+
+	assert.Contains(metrics, "ztunnel_connections")
+	assert.Len(metrics["ztunnel_connections"], 2, "ztunnel_connections should have 2 series (opened + closed)")
+
+	assert.Contains(metrics, "ztunnel_bytes_transmitted")
+	assert.Len(metrics["ztunnel_bytes_transmitted"], 2, "ztunnel_bytes_transmitted should have 2 series (received + sent)")
+
+	assert.NotEmpty(metrics["ztunnel_versions"])
+	assert.NotEmpty(metrics["ztunnel_memory_usage"])
+	assert.NotEmpty(metrics["ztunnel_cpu_usage"])
+	assert.NotEmpty(metrics["ztunnel_workload_manager"])
+}
+
+func TestGetResourceMetrics(t *testing.T) {
+	assert := assert.New(t)
+	srv, api, err := setupMocked()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	q := models.IstioMetricsQuery{
+		App: "myapp",
+	}
+	q.FillDefaults()
+	q.RateInterval = "5m"
+
+	labels := `{pod=~"myapp-.*"}`
+	api.MockRange("sum(container_memory_working_set_bytes"+labels+") by (pod)", 50.0)
+	api.MockRange("sum(irate(container_cpu_usage_seconds_total{pod=~\"myapp-.*\"}[5m])) by (pod)", 0.25)
+
+	metrics, err := srv.GetResourceMetrics(context.Background(), q)
+	assert.NoError(err)
+	assert.Len(metrics, 2)
+
+	assert.Contains(metrics, "memory_usage")
+	assert.NotEmpty(metrics["memory_usage"], "memory_usage should have at least one series")
+
+	assert.Contains(metrics, "cpu_usage")
+	assert.NotEmpty(metrics["cpu_usage"], "cpu_usage should have at least one series")
+}
+
+func TestGetHealthStatusHistory(t *testing.T) {
+	assert := assert.New(t)
+	srv, api, err := setupMocked()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	q := prometheus.RangeQuery{}
+	q.FillDefaults()
+
+	api.MockRange(`max(max_over_time(kiali_health_status{cluster="cluster-default",namespace="bookinfo",health_type="workload",name="reviews-v1"}[15s]))`, 2.0)
+
+	metrics, err := srv.GetHealthStatusHistory(context.Background(), "cluster-default", "bookinfo", "workload", "reviews-v1", &q)
+	assert.NoError(err)
+	assert.NotEmpty(metrics, "should have at least one series")
 }
 
 func createSample(value float64) *model.Sample {

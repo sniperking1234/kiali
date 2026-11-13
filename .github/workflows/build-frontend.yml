@@ -1,0 +1,49 @@
+name: Build Frontend
+
+on:
+  workflow_call:
+    inputs:
+      target_branch:
+        required: true
+        type: string
+      build_branch:
+        required: true
+        type: string
+
+jobs:
+  build_frontend:
+    name: Build and unit test frontend
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        ref: ${{ inputs.build_branch }}
+
+    # Corepack must be enabled before setup-node so that setup-node's
+    # cache: yarn correctly detects the Yarn 4 cache directory.
+    - name: Enable corepack
+      run: corepack enable
+
+    - name: Setup node
+      uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      with:
+        node-version: "24"
+        cache: yarn
+        cache-dependency-path: frontend/yarn.lock
+
+    - name: Build
+      run: make clean-all build-ui
+
+    - name: Test frontend
+      run: |
+        cd frontend
+        yarn pretty-quick --check --verbose --branch ${{ inputs.target_branch }}
+        yarn test
+
+    - name: Upload frontend build
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: build
+        path: frontend/build/

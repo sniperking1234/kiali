@@ -2,85 +2,62 @@ package authorization
 
 import (
 	"fmt"
-	"reflect"
-	"regexp"
 	"strings"
 
-	"github.com/kiali/kiali/kubernetes"
+	api_security_v1 "istio.io/api/security/v1"
+	security_v1 "istio.io/client-go/pkg/apis/security/v1"
+
 	"github.com/kiali/kiali/models"
 	"github.com/kiali/kiali/util/httputil"
 )
 
-var methodMatcher = regexp.MustCompile(`^((\/[a-zA-Z\.]+)+)(\/[a-zA-Z]+)$`)
-
 type NamespaceMethodChecker struct {
-	AuthorizationPolicy kubernetes.IstioObject
+	AuthorizationPolicy *security_v1.AuthorizationPolicy
 	Namespaces          models.NamespaceNames
 }
 
 func (ap NamespaceMethodChecker) Check() ([]*models.IstioCheck, bool) {
 	checks, valid := make([]*models.IstioCheck, 0), true
 
-	// Getting rules array. If not present, quitting validation.
-	rulesStct, ok := ap.AuthorizationPolicy.GetSpec()["rules"]
-	if !ok {
-		return checks, valid
-	}
-
-	// Getting slice of Rules. Quitting if not an slice.
-	rules := reflect.ValueOf(rulesStct)
-	if rules.Kind() != reflect.Slice {
-		return checks, valid
-	}
-
-	for ruleIdx := 0; ruleIdx < rules.Len(); ruleIdx++ {
-		rule, ok := rules.Index(ruleIdx).Interface().(map[string]interface{})
-		if !ok || rule == nil {
+	for ruleIdx, rule := range ap.AuthorizationPolicy.Spec.Rules {
+		if rule == nil {
 			continue
 		}
-
-		if rule["from"] != nil {
-			toChecks, toValid := ap.validateFromField(ruleIdx, rule["from"])
+		if len(rule.From) > 0 {
+			toChecks, toValid := ap.validateFromField(ruleIdx, rule.From)
 			checks = append(checks, toChecks...)
 			valid = valid && toValid
 		}
-
-		if rule["to"] != nil {
-			fromChecks, fromValid := ap.validateToField(ruleIdx, rule["to"])
+		if len(rule.To) > 0 {
+			fromChecks, fromValid := ap.validateToField(ruleIdx, rule.To)
 			checks = append(checks, fromChecks...)
 			valid = valid && fromValid
 		}
-
 	}
-
 	return checks, valid
 }
 
-func (ap NamespaceMethodChecker) validateFromField(ruleIdx int, from interface{}) ([]*models.IstioCheck, bool) {
-	fromSl, ok := from.([]interface{})
-	if !ok {
+func (ap NamespaceMethodChecker) validateFromField(ruleIdx int, from []*api_security_v1.Rule_From) ([]*models.IstioCheck, bool) {
+	if len(from) == 0 {
 		return nil, true
 	}
 
-	checks, valid := make([]*models.IstioCheck, 0, len(fromSl)), true
-	for fromIdx, fromStc := range fromSl {
-		fromMap, ok := fromStc.(map[string]interface{})
-		if !ok {
+	checks, valid := make([]*models.IstioCheck, 0, len(from)), true
+	for fromIdx, f := range from {
+		if f == nil {
 			continue
 		}
 
-		sourceMap, ok := fromMap["source"].(map[string]interface{})
-		if !ok {
+		if f.Source == nil {
 			continue
 		}
 
-		nsList, ok := sourceMap["namespaces"].([]interface{})
-		if !ok {
+		if len(f.Source.Namespaces) == 0 {
 			continue
 		}
 
-		for i, n := range nsList {
-			if !ap.Namespaces.Includes(n.(string)) {
+		for i, n := range f.Source.Namespaces {
+			if !ap.Namespaces.MatchesPattern(n) {
 				valid = true
 				path := fmt.Sprintf("spec/rules[%d]/from[%d]/source/namespaces[%d]", ruleIdx, fromIdx, i)
 				validation := models.Build("authorizationpolicy.source.namespacenotfound", path)
@@ -92,31 +69,27 @@ func (ap NamespaceMethodChecker) validateFromField(ruleIdx int, from interface{}
 	return checks, valid
 }
 
-func (ap NamespaceMethodChecker) validateToField(ruleIdx int, to interface{}) ([]*models.IstioCheck, bool) {
-	toSl, ok := to.([]interface{})
-	if !ok {
+func (ap NamespaceMethodChecker) validateToField(ruleIdx int, to []*api_security_v1.Rule_To) ([]*models.IstioCheck, bool) {
+	if len(to) == 0 {
 		return nil, true
 	}
 
-	checks, valid := make([]*models.IstioCheck, 0, len(toSl)), true
-	for toIdx, toStc := range toSl {
-		toMap, ok := toStc.(map[string]interface{})
-		if !ok {
+	checks, valid := make([]*models.IstioCheck, 0, len(to)), true
+	for toIdx, t := range to {
+		if t == nil {
 			continue
 		}
 
-		sourceMap, ok := toMap["operation"].(map[string]interface{})
-		if !ok {
+		if t.Operation == nil {
 			continue
 		}
 
-		mthdList, ok := sourceMap["methods"].([]interface{})
-		if !ok {
+		if len(t.Operation.Methods) == 0 {
 			continue
 		}
 
-		for i, m := range mthdList {
-			if !validMethod(m.(string)) {
+		for i, m := range t.Operation.Methods {
+			if !validMethod(m) {
 				valid = true
 				path := fmt.Sprintf("spec/rules[%d]/to[%d]/operation/methods[%d]", ruleIdx, toIdx, i)
 				validation := models.Build("authorizationpolicy.to.wrongmethod", path)
@@ -129,13 +102,49 @@ func (ap NamespaceMethodChecker) validateToField(ruleIdx int, to interface{}) ([
 }
 
 func validMethod(m string) bool {
-	valid := false
-
-	for _, httpMethod := range httputil.HttpMethods() {
-		// HTTP methods allowed or
-		// For gRPC service, a fully-qualified name like “/package.service/method”
-		valid = valid || (strings.TrimSpace(strings.ToUpper(m)) == httpMethod || methodMatcher.MatchString(m))
+	method := strings.TrimSpace(m)
+	if method == "" {
+		return false
 	}
 
-	return valid
+	// Istio AuthorizationPolicy string fields support Exact / Prefix / Suffix / Presence:
+	// https://istio.io/latest/docs/reference/config/security/authorization-policy/
+	// Presence match: "*" matches when the HTTP method header is not empty.
+	if method == "*" {
+		return true
+	}
+
+	// Prefix match: "GET*" ; Suffix match: "*ET" (wildcard only at start or end, not both).
+	prefixMatch := strings.HasSuffix(method, "*") && !strings.HasPrefix(method, "*")
+	suffixMatch := strings.HasPrefix(method, "*") && !strings.HasSuffix(method, "*")
+
+	var pattern string
+	switch {
+	case prefixMatch:
+		pattern = strings.ToUpper(strings.TrimSuffix(method, "*"))
+	case suffixMatch:
+		pattern = strings.ToUpper(strings.TrimPrefix(method, "*"))
+	default:
+		pattern = strings.ToUpper(method)
+	}
+
+	// methods is the HTTP method (for gRPC this is always POST). gRPC FQNs belong in paths.
+	for _, httpMethod := range httputil.HttpMethods() {
+		switch {
+		case prefixMatch:
+			if pattern != "" && strings.HasPrefix(httpMethod, pattern) {
+				return true
+			}
+		case suffixMatch:
+			if pattern != "" && strings.HasSuffix(httpMethod, pattern) {
+				return true
+			}
+		default:
+			if httpMethod == pattern {
+				return true
+			}
+		}
+	}
+
+	return false
 }

@@ -8,31 +8,47 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"math/big"
 	rnd "math/rand"
 	"net"
 	"net/http"
 	"os"
+	rpprof "runtime/pprof"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/kiali/kiali/business"
+	"github.com/kiali/kiali/cache"
 	"github.com/kiali/kiali/config"
 	"github.com/kiali/kiali/config/security"
+	"github.com/kiali/kiali/grafana"
+	"github.com/kiali/kiali/kubernetes"
+	"github.com/kiali/kiali/kubernetes/kubetest"
+	"github.com/kiali/kiali/prometheus/prometheustest"
 	"github.com/kiali/kiali/util"
+	"github.com/kiali/kiali/util/filetest"
 )
+
+func newTestGrafanaService(t *testing.T, conf *config.Config) *grafana.Service {
+	t.Helper()
+	svc, err := grafana.NewService(conf, kubetest.NewFakeK8sClient())
+	require.NoError(t, err)
+	return svc
+}
 
 const (
 	testHostname = "127.0.0.1"
 )
 
-var tmpDir = os.TempDir()
-
 func TestRootContextPath(t *testing.T) {
 	testPort, err := getFreePort(testHostname)
 	if err != nil {
-		t.Fatalf("Cannot get a free port to run tests on host [%v]", testHostname)
+		t.Fatalf("Cannot get a free port to run tests on host [%v], err [%s]", testHostname, err)
 	} else {
 		t.Logf("Will use free port [%v] on host [%v] for tests", testPort, testHostname)
 	}
@@ -40,20 +56,21 @@ func TestRootContextPath(t *testing.T) {
 	testServerHostPort := fmt.Sprintf("%v:%v", testHostname, testPort)
 	testCustomRoot := "/customroot"
 
-	rnd.Seed(time.Now().UnixNano())
+	rnd.New(rnd.NewSource(time.Now().UnixNano()))
 	conf := new(config.Config)
-	conf.LoginToken.SigningKey = util.RandomString(10)
+	conf.LoginToken.SigningKey = config.Credential(util.RandomString(10))
 	conf.Server.WebRoot = testCustomRoot
 	conf.Server.Address = testHostname
 	conf.Server.Port = testPort
-	conf.Server.StaticContentRootDirectory = tmpDir
 	conf.Auth.Strategy = "anonymous"
+	conf.KubernetesConfig.ClusterName = config.DefaultClusterID
 
 	serverURL := fmt.Sprintf("http://%v", testServerHostPort)
 
-	config.Set(conf)
-
-	server := NewServer()
+	cf := kubernetes.NewTestingClientFactory(t, conf)
+	cpm := &business.FakeControlPlaneMonitor{}
+	cache := cache.NewTestingCacheWithFactory(t, cf, *conf)
+	server, _ := NewServer(t.Context(), cpm, cf, cache, conf, newTestGrafanaService(t, conf), nil, nil, nil, filetest.StaticAssetDir(t))
 	server.Start()
 	t.Logf("Started test http server: %v", serverURL)
 	defer func() {
@@ -103,16 +120,21 @@ func TestAnonymousMode(t *testing.T) {
 	conf := new(config.Config)
 	conf.Server.Address = testHostname
 	conf.Server.Port = testPort
-	conf.Server.StaticContentRootDirectory = tmpDir
 	conf.Auth.Strategy = "anonymous"
+	conf.KubernetesConfig.ClusterName = config.DefaultClusterID
 
 	serverURL := fmt.Sprintf("http://%v", testServerHostPort)
 	apiURLWithAuthentication := serverURL + "/api/authenticate"
 	apiURL := serverURL + "/api"
 
-	config.Set(conf)
+	assert.False(t, conf.IsServerHTTPS())
 
-	server := NewServer()
+	cf := kubernetes.NewTestingClientFactory(t, conf)
+	cpm := &business.FakeControlPlaneMonitor{}
+	cache := cache.NewTestingCacheWithFactory(t, cf, *conf)
+	prom := prometheustest.FakeClient{}
+
+	server, _ := NewServer(t.Context(), cpm, cf, cache, conf, newTestGrafanaService(t, conf), &prom, nil, nil, filetest.StaticAssetDir(t))
 	server.Start()
 	t.Logf("Started test http server: %v", serverURL)
 	defer func() {
@@ -145,6 +167,7 @@ func TestAnonymousMode(t *testing.T) {
 }
 
 func TestSecureComm(t *testing.T) {
+	require := require.New(t)
 	testPort, err := getFreePort(testHostname)
 	if err != nil {
 		t.Fatalf("Cannot get a free port to run tests on host [%v]", testHostname)
@@ -158,6 +181,7 @@ func TestSecureComm(t *testing.T) {
 		t.Logf("Will use free metrics port [%v] on host [%v] for tests", testMetricsPort, testHostname)
 	}
 
+	tmpDir := t.TempDir()
 	testServerCertFile := tmpDir + "/server-test-server.cert"
 	testServerKeyFile := tmpDir + "/server-test-server.key"
 	testServerHostPort := fmt.Sprintf("%v:%v", testHostname, testPort)
@@ -178,27 +202,33 @@ func TestSecureComm(t *testing.T) {
 	defer os.Remove(testClientCertFile)
 	defer os.Remove(testClientKeyFile)
 
-	rnd.Seed(time.Now().UnixNano())
+	rnd.New(rnd.NewSource(time.Now().UnixNano()))
 	conf := new(config.Config)
 	conf.Identity.CertFile = testServerCertFile
 	conf.Identity.PrivateKeyFile = testServerKeyFile
-	conf.LoginToken.SigningKey = util.RandomString(10)
+	conf.LoginToken.SigningKey = config.Credential(util.RandomString(10))
 	conf.Server.Address = testHostname
 	conf.Server.Port = testPort
-	conf.Server.StaticContentRootDirectory = tmpDir
-	conf.Server.MetricsEnabled = true
-	conf.Server.MetricsPort = testMetricsPort
+	conf.Server.Observability.Metrics.Enabled = true
+	conf.Server.Observability.Metrics.Port = testMetricsPort
+	conf.Server.Profiler.Enabled = true
 	conf.Auth.Strategy = "anonymous"
+	conf.KubernetesConfig.ClusterName = config.DefaultClusterID
 	util.Clock = util.RealClock{}
 
 	serverURL := fmt.Sprintf("https://%v", testServerHostPort)
 	apiURLWithAuthentication := serverURL + "/api/authenticate"
 	apiURL := serverURL + "/api"
-	metricsURL := fmt.Sprintf("http://%v:%v/", testHostname, testMetricsPort)
+	metricsURL := fmt.Sprintf("https://%v:%v/", testHostname, testMetricsPort)
+	profilerURL := serverURL + "/debug/pprof/"
+	assert.True(t, conf.IsServerHTTPS())
 
-	config.Set(conf)
-
-	server := NewServer()
+	cf := kubetest.NewFakeClientFactoryWithClient(conf, kubetest.NewFakeK8sClient())
+	cpm := &business.FakeControlPlaneMonitor{}
+	cache := cache.NewTestingCacheWithFactory(t, cf, *conf)
+	prom := prometheustest.FakeClient{}
+	server, err := NewServer(t.Context(), cpm, cf, cache, conf, newTestGrafanaService(t, conf), &prom, nil, nil, filetest.StaticAssetDir(t))
+	require.NoError(err)
 	server.Start()
 	t.Logf("Started test http server: %v", serverURL)
 	defer func() {
@@ -247,6 +277,24 @@ func TestSecureComm(t *testing.T) {
 		}
 	}
 
+	// check profiler endpoints
+
+	if _, err = getRequestResults(t, httpClient, profilerURL, noCredentials); err != nil {
+		t.Fatalf("Failed: Profiler URL shouldn't have failed with no credentials: %v", err)
+	}
+
+	for _, p := range rpprof.Profiles() {
+		if _, err = getRequestResults(t, httpClient, profilerURL+p.Name(), noCredentials); err != nil {
+			t.Fatalf("Failed to get profile [%v]: %v", p, err)
+		}
+	}
+	// note we do not test "profile" endpoint - it takes too long and besides that the test framework eventually times out
+	for _, p := range []string{"symbol", "trace"} {
+		if _, err = getRequestResults(t, httpClient, profilerURL+p, noCredentials); err != nil {
+			t.Fatalf("Failed to get profile [%v]: %v", p, err)
+		}
+	}
+
 	// Make sure the server rejects anything trying to use TLS 1.1 or under
 	httpConfigTLS11 := httpClientConfig{
 		Identity: &security.Identity{
@@ -266,7 +314,40 @@ func TestSecureComm(t *testing.T) {
 	if _, err = getRequestResults(t, httpClientTLS11, apiURL, noCredentials); err == nil {
 		t.Fatalf("Failed: Should not have been able to use TLS 1.1")
 	}
+}
 
+func TestTracingConfigured(t *testing.T) {
+	testPort, err := getFreePort(testHostname)
+	if err != nil {
+		t.Fatalf("Cannot get a free port to run tests on host [%v]", testHostname)
+	} else {
+		t.Logf("Will use free port [%v] on host [%v] for tests", testPort, testHostname)
+	}
+
+	testServerHostPort := fmt.Sprintf("%v:%v", testHostname, testPort)
+
+	conf := new(config.Config)
+	conf.Server.Address = testHostname
+	conf.Server.Port = testPort
+	conf.Server.Observability.Tracing.Enabled = true
+	conf.Server.Observability.Tracing.CollectorType = "otel"
+	conf.Auth.Strategy = "anonymous"
+	conf.KubernetesConfig.ClusterName = config.DefaultClusterID
+
+	// Set the global client factory.
+	cf := kubernetes.NewTestingClientFactory(t, conf)
+	serverURL := fmt.Sprintf("http://%v", testServerHostPort)
+
+	cpm := &business.FakeControlPlaneMonitor{}
+	cache := cache.NewTestingCacheWithFactory(t, cf, *conf)
+	prom := prometheustest.FakeClient{}
+	server, _ := NewServer(t.Context(), cpm, cf, cache, conf, newTestGrafanaService(t, conf), &prom, nil, nil, filetest.StaticAssetDir(t))
+	server.Start()
+	t.Logf("Started test http server: %v", serverURL)
+	defer func() {
+		server.Stop()
+		t.Logf("Stopped test server: %v", serverURL)
+	}()
 }
 
 func TestConfigureGzipHandler(t *testing.T) {
@@ -297,7 +378,7 @@ func getRequestResults(t *testing.T, httpClient *http.Client, url string, creden
 	} else {
 		defer resp.Body.Close()
 		if resp.StatusCode == http.StatusOK {
-			bodyBytes, err2 := ioutil.ReadAll(resp.Body)
+			bodyBytes, err2 := io.ReadAll(resp.Body)
 			if err2 != nil {
 				return "", err2
 			}
@@ -310,6 +391,7 @@ func getRequestResults(t *testing.T, httpClient *http.Client, url string, creden
 }
 
 func generateCertificate(t *testing.T, certPath string, keyPath string, host string) error {
+	t.Helper()
 	priv, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		return err
@@ -359,7 +441,7 @@ func generateCertificate(t *testing.T, certPath string, keyPath string, host str
 	_ = pem.Encode(certOut, &pem.Block{Type: "CERTIFICATE", Bytes: derBytes})
 	certOut.Close()
 
-	keyOut, err := os.OpenFile(keyPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+	keyOut, err := os.OpenFile(keyPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
 		return err
 	}
@@ -405,7 +487,6 @@ type httpClientConfig struct {
 }
 
 func (conf *httpClientConfig) buildHTTPClient() (*http.Client, error) {
-
 	// make our own copy of TLS config
 	tlsConfig := &tls.Config{}
 	if conf.TLSConfig != nil {

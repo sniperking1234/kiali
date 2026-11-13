@@ -7,8 +7,60 @@
 #
 ##############################################################################
 
-SCRIPT_DIR="$(cd $(dirname "${BASH_SOURCE[0]}") && pwd)"
-source ${SCRIPT_DIR}/env.sh $*
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source ${SCRIPT_DIR}/env.sh "$@"
+
+set -euo pipefail
+
+create_waypoint() {
+
+  local waypoint_yaml
+
+  waypoint_yaml=$(mktemp)
+  cat <<EOF > "${waypoint_yaml}"
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  labels:
+    istio.io/waypoint-for: service
+  name: waypoint
+  namespace: ${BOOKINFO_NAMESPACE}
+spec:
+  gatewayClassName: istio-waypoint
+  listeners:
+  - name: mesh
+    port: 15008
+    protocol: HBONE
+EOF
+
+  # Apply waypoint Gateway to both clusters
+  echo "==== APPLYING WAYPOINT GATEWAY TO CLUSTER #1 [${CLUSTER1_NAME}] - ${CLUSTER1_CONTEXT}"
+  ${CLIENT_EXE} --context="${CLUSTER1_CONTEXT}" apply -f "${waypoint_yaml}"
+
+  echo "==== APPLYING WAYPOINT GATEWAY TO CLUSTER #2 [${CLUSTER2_NAME}] - ${CLUSTER2_CONTEXT}"
+  ${CLIENT_EXE} --context="${CLUSTER2_CONTEXT}" apply -f "${waypoint_yaml}"
+
+  # Label waypoint service in both clusters (best-effort; the service may not exist immediately)
+  echo "==== LABELING WAYPOINT SERVICE IN CLUSTER #1 [${CLUSTER1_NAME}] - ${CLUSTER1_CONTEXT}"
+  ${CLIENT_EXE} --context="${CLUSTER1_CONTEXT}" label svc waypoint -n ${BOOKINFO_NAMESPACE} istio.io/global=true --overwrite || true
+
+  echo "==== LABELING WAYPOINT SERVICE IN CLUSTER #2 [${CLUSTER2_NAME}] - ${CLUSTER2_CONTEXT}"
+  ${CLIENT_EXE} --context="${CLUSTER2_CONTEXT}" label svc waypoint -n ${BOOKINFO_NAMESPACE} istio.io/global=true --overwrite || true
+
+  rm -f "${waypoint_yaml}"
+}
+
+configure_waypoint() {
+  echo "==== CONFIGURING WAYPOINT FOR BOOKINFO NAMESPACE IN BOTH CLUSTERS"
+
+  # Label bookinfo namespace in both clusters
+  echo "==== LABELING BOOKINFO NAMESPACE IN CLUSTER #1 [${CLUSTER1_NAME}] - ${CLUSTER1_CONTEXT}"
+  ${CLIENT_EXE} --context="${CLUSTER1_CONTEXT}" label ns ${BOOKINFO_NAMESPACE} istio.io/use-waypoint=waypoint --overwrite
+
+  echo "==== LABELING BOOKINFO NAMESPACE IN CLUSTER #2 [${CLUSTER2_NAME}] - ${CLUSTER2_CONTEXT}"
+  ${CLIENT_EXE} --context="${CLUSTER2_CONTEXT}" label ns ${BOOKINFO_NAMESPACE} istio.io/use-waypoint=waypoint --overwrite
+  echo "==== WAYPOINT CONFIGURATION COMPLETE"
+}
 
 if [ "${BOOKINFO_ENABLED}" != "true" ]; then
   echo "Will not install bookinfo demo"
@@ -24,14 +76,19 @@ install_bookinfo() {
   if [ "${traffic_gen_enabled}" == "true" ]; then
     traffic_gen_arg="-tg"
   fi
-
+  ambient_args=""
+  if [ "${AMBIENT}" == "true" ]; then
+    echo "Using Ambient args"
+    ambient_args="-ai false"
+  fi
   "${INSTALL_BOOKINFO_SCRIPT}"             \
     --client-exe "${CLIENT_EXE}"           \
     --istio-dir "${ISTIO_DIR}"             \
     --istio-namespace "${ISTIO_NAMESPACE}" \
     --namespace "${BOOKINFO_NAMESPACE}"    \
     --minikube-profile "${profile}"        \
-    ${traffic_gen_arg}
+    ${traffic_gen_arg}                     \
+    ${ambient_args}
 
   if [ "$?" != "0" ]; then
     echo "Failed to install bookinfo"
@@ -54,11 +111,76 @@ install_bookinfo "${CLUSTER1_CONTEXT}" "true"
 ${CLIENT_EXE} scale deploy -n ${BOOKINFO_NAMESPACE} reviews-v2 --replicas=0
 ${CLIENT_EXE} scale deploy -n ${BOOKINFO_NAMESPACE} reviews-v3 --replicas=0
 ${CLIENT_EXE} scale deploy -n ${BOOKINFO_NAMESPACE} ratings-v1 --replicas=0
+if [ "${WAYPOINT}" != "true" ]; then
+  # For the baseline bookinfo namespace, move all reviews versions to the west cluster. This is to ensure
+  # that some traffic always routes to the west cluster (for testing)
+  ${CLIENT_EXE} scale deploy -n ${BOOKINFO_NAMESPACE} reviews-v1 --replicas=0
+fi
 
-if [ "${IS_OPENSHIFT}" == "true" ]; then
-  INGRESS_HOST=$(${CLIENT_EXE} -n ${ISTIO_NAMESPACE} get route istio-ingressgateway -o jsonpath='{.spec.host}')
+create_traffic_shifting_rules() {
+  local cluster_context="${1}"
+  echo "==== CREATING TRAFFIC SHIFTING RULES FOR REVIEWS SERVICE FOR CLUSTER [${cluster_context}]"
+  # This is done to enforce traffic to all reviews workloads (there were ocassions where traffic was not being routed to v3 or v2)
+  cat <<EOF | ${CLIENT_EXE} --context ${cluster_context} apply -f -
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: reviews
+  namespace: ${BOOKINFO_NAMESPACE}
+spec:
+  hosts:
+    - reviews.bookinfo.svc.cluster.local
+  http:
+    - route:
+        - destination:
+            host: reviews.bookinfo.svc.cluster.local
+            subset: v1
+          weight: 33
+        - destination:
+            host: reviews.bookinfo.svc.cluster.local
+            subset: v2
+          weight: 33
+        - destination:
+            host: reviews.bookinfo.svc.cluster.local
+            subset: v3
+          weight: 34
+EOF
+
+  cat <<EOF | ${CLIENT_EXE} --context ${cluster_context} apply -f -
+kind: DestinationRule
+apiVersion: networking.istio.io/v1
+metadata:
+  name: reviews
+  namespace: ${BOOKINFO_NAMESPACE}
+spec:
+  host: reviews.bookinfo.svc.cluster.local
+  subsets:
+    - name: v1
+      labels:
+        version: v1
+    - name: v2
+      labels:
+        version: v2
+    - name: v3
+      labels:
+        version: v3
+EOF
+}
+
+if [ "${AMBIENT}" != "true" ]; then
+  create_traffic_shifting_rules "${CLUSTER1_CONTEXT}"
+
+  if [ "${IS_OPENSHIFT}" == "true" ]; then
+    INGRESS_HOST=$(${CLIENT_EXE} -n ${ISTIO_NAMESPACE} get route istio-ingressgateway -o jsonpath='{.spec.host}')
+  else
+    INGRESS_HOST=$(${CLIENT_EXE} -n ${ISTIO_NAMESPACE} get service istio-ingressgateway -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+  fi
 else
-  INGRESS_HOST=$(${CLIENT_EXE} -n ${ISTIO_NAMESPACE} get service istio-ingressgateway -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+  INGRESS_HOST="bookinfo-gateway-istio.${BOOKINFO_NAMESPACE}"
+  # Make the services global
+  ${CLIENT_EXE} label --context="${CLUSTER1_CONTEXT}" svc productpage -n ${BOOKINFO_NAMESPACE} istio.io/global="true"
+  ${CLIENT_EXE} label --context="${CLUSTER1_CONTEXT}" svc details -n ${BOOKINFO_NAMESPACE} istio.io/global="true"
+  ${CLIENT_EXE} label --context="${CLUSTER1_CONTEXT}" svc reviews -n ${BOOKINFO_NAMESPACE} istio.io/global="true"
 fi
 
 echo "==== INSTALL BOOKINFO ON CLUSTER #2 [${CLUSTER2_NAME}] - ${CLUSTER2_CONTEXT}"
@@ -66,7 +188,30 @@ switch_cluster "${CLUSTER2_CONTEXT}" "${CLUSTER2_USER}" "${CLUSTER2_PASS}"
 install_bookinfo "${CLUSTER2_CONTEXT}" "false"
 ${CLIENT_EXE} scale deploy -n ${BOOKINFO_NAMESPACE} productpage-v1 --replicas=0
 ${CLIENT_EXE} scale deploy -n ${BOOKINFO_NAMESPACE} details-v1 --replicas=0
-${CLIENT_EXE} scale deploy -n ${BOOKINFO_NAMESPACE} reviews-v1 --replicas=0
+if [ "${WAYPOINT}" == "true" ]; then
+  # For the waypoint bookinfo-waypoints namespace, keep the original split with reviews-v1 on east only.
+  ${CLIENT_EXE} scale deploy -n ${BOOKINFO_NAMESPACE} reviews-v1 --replicas=0
+fi
+
+if [ "${AMBIENT}" != "true" ]; then
+  # Only create traffic shifting rules on cluster2 if it has its own istiod (multi-primary).
+  # In primary-remote, cluster2 has no local istiod so the validation webhook can't reach
+  # istiod and VirtualService creation would fail. We cannot check for presence of CRDs
+  # because the Sail operator installs CRDs on the remote cluster.
+  if [ -n "$(${CLIENT_EXE} --context "${CLUSTER2_CONTEXT}" get deploy -l app=istiod -n "${ISTIO_NAMESPACE}" --ignore-not-found -o name 2>/dev/null)" ]; then
+    create_traffic_shifting_rules "${CLUSTER2_CONTEXT}"
+  fi
+else
+  # This will just create the waypoint, but won't be configured
+  create_waypoint
+
+  ${CLIENT_EXE} label --context="${CLUSTER2_CONTEXT}" svc ratings -n ${BOOKINFO_NAMESPACE} istio.io/global="true"
+  ${CLIENT_EXE} label --context="${CLUSTER2_CONTEXT}" svc reviews -n ${BOOKINFO_NAMESPACE} istio.io/global="true"
+fi
+
+# Configure waypoint for bookinfo namespace if requested
+if [ "${AMBIENT}" == "true" ] && [ "${WAYPOINT}" == "true" ]; then
+  configure_waypoint
+fi
 
 echo "Bookinfo application will be available soon at http://${INGRESS_HOST}/productpage"
-

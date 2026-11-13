@@ -1,0 +1,178 @@
+import type { MenuItem } from './types/Routes';
+import { Paths } from './config';
+import { WorkloadListPage } from './pages/WorkloadList/WorkloadListPage';
+import { ServiceListPage } from './pages/ServiceList/ServiceListPage';
+import { IstioConfigListPage } from './pages/IstioConfigList/IstioConfigListPage';
+import { AppListPage } from './pages/AppList/AppListPage';
+import { OverviewPage } from './pages/Overview/OverviewPage';
+import { NamespacesPage } from './pages/Namespaces/NamespacesPage';
+import { MeshPage } from 'pages/Mesh/MeshPage';
+import { ServiceDetailsRoute } from 'routes/ServiceDetailsRoute';
+import { WorkloadDetailsRoute } from 'routes/WorkloadDetailsRoute';
+import { AppDetailsRoute } from 'routes/AppDetailsRoute';
+import { IstioConfigDetailsRoute } from 'routes/IstioConfigDetailsRoute';
+import { IstioConfigNewRoute } from 'routes/IstioConfigNewRoute';
+import { GraphRoute } from 'routes/GraphRoute';
+import { GraphPage } from 'pages/Graph/GraphPage';
+import { t } from 'utils/I18nUtils';
+import type { RouteObject } from 'react-router-dom-v5-compat';
+import { WildcardRoute } from 'routes/WildcardRoute';
+import { NamespaceDetailsRoute } from 'routes/NamespaceDetailsRoute';
+import { AIDashboardPage } from 'pages/AIDashboard/AIDashboardPage';
+
+/**
+ * Return array of objects that describe vertical menu
+ * @return {array}
+ */
+const navMenuItems: MenuItem[] = [
+  {
+    id: 'overview',
+    title: t('Overview'),
+    to: '/overview',
+    pathsActive: [/^\/overview\/(.*)/]
+  },
+  {
+    id: 'traffic_graph',
+    title: t('Traffic Graph'),
+    to: '/graph/namespaces',
+    pathsActive: [/^\/graph\/(.*)/]
+  },
+  {
+    id: 'mesh',
+    separator: true,
+    title: t('Mesh'),
+    to: `/${Paths.MESH}`
+  },
+  {
+    id: 'namespaces',
+    title: t('Namespaces'),
+    to: `/${Paths.NAMESPACES}`,
+    pathsActive: [new RegExp(`^/${Paths.NAMESPACES}(?:\\?.*)?$`), new RegExp(`^/namespaces/[^/]+(?:\\?.*)?$`)]
+  },
+  {
+    id: 'applications',
+    title: t('Applications'),
+    to: `/${Paths.APPLICATIONS}`,
+    pathsActive: [new RegExp(`^/namespaces/(.*)/${Paths.APPLICATIONS}/(.*)`)]
+  },
+  {
+    id: 'services',
+    title: t('Services'),
+    to: `/${Paths.SERVICES}`,
+    pathsActive: [new RegExp(`^/namespaces/(.*)/${Paths.SERVICES}/(.*)`)]
+  },
+  {
+    id: 'workloads',
+    title: t('Workloads'),
+    to: `/${Paths.WORKLOADS}`,
+    pathsActive: [new RegExp(`^/namespaces/(.*)/${Paths.WORKLOADS}/(.*)`)]
+  },
+  {
+    id: 'istio',
+    separator: true,
+    title: t('Istio Config'),
+    to: `/${Paths.ISTIO}`,
+    pathsActive: [new RegExp(`^/namespaces/(.*)/${Paths.ISTIO}/(.*)`), new RegExp(`/${Paths.ISTIO}/new/(.*)`)]
+  },
+  {
+    id: 'tracing',
+    title: t('Distributed Tracing'),
+    to: `/${Paths.TRACING}`
+  },
+  {
+    id: 'ai',
+    title: t('AI Dashboard'),
+    to: '/ai',
+    pathsActive: [/^\/ai\/(.*)/]
+  }
+];
+
+const pathRoutes: RouteObject[] = [
+  {
+    path: `/${Paths.AI}`,
+    element: <AIDashboardPage />
+  },
+  {
+    path: `/${Paths.OVERVIEW}`,
+    element: <OverviewPage />
+  },
+  {
+    path: `/${Paths.NAMESPACES}`,
+    element: <NamespacesPage />
+  },
+  {
+    path: `/graph/node/namespaces/:namespace/${Paths.AGGREGATES}/:aggregate/:aggregateValue`,
+    element: <GraphRoute />
+  },
+  {
+    path: `/graph/node/namespaces/:namespace/${Paths.APPLICATIONS}/:app/versions/:version`,
+    element: <GraphRoute />
+  },
+  {
+    path: `/graph/node/namespaces/:namespace/${Paths.APPLICATIONS}/:app`,
+    element: <GraphRoute />
+  },
+  {
+    path: `/graph/node/namespaces/:namespace/${Paths.SERVICES}/:service`,
+    element: <GraphRoute />
+  },
+  {
+    path: `/graph/node/namespaces/:namespace/${Paths.WORKLOADS}/:workload`,
+    element: <GraphRoute />
+  },
+  {
+    path: '/graph/namespaces',
+    element: <GraphPage />
+  },
+  {
+    path: `/namespaces/:namespace/${Paths.SERVICES}/:service`,
+    element: <ServiceDetailsRoute />
+  },
+  {
+    path: `/namespaces/:namespace/${Paths.ISTIO}/:objectGroup/:objectVersion/:objectKind/:objectName`,
+    element: <IstioConfigDetailsRoute />
+  },
+  {
+    path: `/${Paths.SERVICES}`,
+    element: <ServiceListPage />
+  },
+  {
+    path: `/${Paths.APPLICATIONS}`,
+    element: <AppListPage />
+  },
+  {
+    path: `/namespaces/:namespace/${Paths.APPLICATIONS}/:app`,
+    element: <AppDetailsRoute />
+  },
+  {
+    path: `/${Paths.WORKLOADS}`,
+    element: <WorkloadListPage />
+  },
+  {
+    path: `/namespaces/:namespace/${Paths.WORKLOADS}/:workload`,
+    element: <WorkloadDetailsRoute />
+  },
+  {
+    path: '/namespaces/:namespace',
+    element: <NamespaceDetailsRoute />
+  },
+  {
+    path: `/${Paths.ISTIO}/new/:objectGroup/:objectVersion/:objectKind`,
+    element: <IstioConfigNewRoute />
+  },
+  {
+    path: `/${Paths.ISTIO}`,
+    element: <IstioConfigListPage />
+  },
+  {
+    path: `/${Paths.TRACING}`,
+    element: <></>
+  },
+  {
+    path: `/${Paths.MESH}`,
+    element: <MeshPage />
+  },
+  { path: '*', element: <WildcardRoute /> }
+];
+
+export { navMenuItems, pathRoutes };

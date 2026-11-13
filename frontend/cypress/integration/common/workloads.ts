@@ -1,0 +1,215 @@
+import { Given, Then, When } from '@badeball/cypress-cucumber-preprocessor';
+import { checkHealthIndicatorInTable, checkHealthStatusInTable, colExists } from './table';
+import { ensureKialiFinishedLoading } from './transition';
+
+// Helper function to wait for a workload to reach a specific health status
+const waitForWorkloadHealthStatus = (
+  namespace: string,
+  workload: string,
+  expectedStatus: string,
+  timeoutMs = 90000
+): Cypress.Chainable => {
+  const startTime = Date.now();
+  const pollInterval = 5000; // Check every 5 seconds
+
+  const checkHealth = (): Cypress.Chainable => {
+    return cy
+      .request({
+        url: `api/namespaces/${namespace}/workloads/${workload}?health=true`,
+        failOnStatusCode: false
+      })
+      .then(response => {
+        if (response.status !== 200) {
+          cy.log(`Health API returned ${response.status}, retrying...`);
+          if (Date.now() - startTime < timeoutMs) {
+            cy.wait(pollInterval);
+            return checkHealth();
+          } else {
+            throw new Error(`Timeout waiting for workload ${workload} health API to be available`);
+          }
+        }
+
+        const actualStatus = response.body?.health?.status?.status;
+        cy.log(`Workload ${workload} health status: ${actualStatus} (expecting ${expectedStatus})`);
+
+        if (actualStatus === expectedStatus) {
+          cy.log(`✓ Workload ${workload} reached ${expectedStatus} status`);
+          return cy.wrap(response.body);
+        } else if (Date.now() - startTime < timeoutMs) {
+          cy.wait(pollInterval);
+          return checkHealth();
+        } else {
+          throw new Error(
+            `Timeout after ${timeoutMs}ms: Workload ${workload} in namespace ${namespace} never reached ${expectedStatus} status. Last status: ${actualStatus}`
+          );
+        }
+      });
+  };
+
+  return checkHealth();
+};
+
+const activateFilter = (state: string): void => {
+  //decided to pause the refresh, because I'm intercepting the very same request that is used for the timed refresh
+  cy.get('button#workload-list-refresh-toggle').click();
+  cy.get('button[id="0"]').click();
+  ensureKialiFinishedLoading();
+
+  cy.intercept({
+    pathname: '**/api/clusters/workloads',
+    query: {
+      objects: ''
+    }
+  }).as('refresh');
+
+  cy.get('button#filter_select_value-toggle').click();
+  cy.contains('div#filter_select_value button', state).click();
+};
+
+Given('a healthy workload in the cluster', function () {
+  this.targetNamespace = 'bookinfo';
+  this.targetWorkload = 'productpage-v1';
+});
+
+//When you use this, you need to annotate test by @sleep-app-scaleup-after to revert this change after the test
+Given('an idle sleep workload in the cluster', function () {
+  this.targetNamespace = 'sleep';
+  this.targetWorkload = 'sleep';
+
+  cy.exec('kubectl scale -n sleep --replicas=0 deployment/sleep');
+
+  waitForWorkloadHealthStatus(this.targetNamespace, this.targetWorkload, 'Not Ready');
+});
+
+Given('a failing workload in the mesh', function () {
+  this.targetNamespace = 'alpha';
+  this.targetWorkload = 'v-server';
+
+  // Wait for the workload to actually be in Failure state before proceeding
+  waitForWorkloadHealthStatus(this.targetNamespace, this.targetWorkload, 'Failure');
+});
+
+Given('a degraded workload in the mesh', function () {
+  this.targetNamespace = 'alpha';
+  this.targetWorkload = 'b-client';
+
+  // Wait for the workload to actually be in Degraded state before proceeding
+  waitForWorkloadHealthStatus(this.targetNamespace, this.targetWorkload, 'Degraded');
+});
+
+When('user filters for workload type {string}', (workloadType: string) => {
+  cy.get('div#filter_select_value-toggle').find('button').click();
+  cy.contains('div#filter_select_value button', workloadType).click();
+
+  ensureKialiFinishedLoading();
+});
+
+Then('user sees {string} in workloads table', (workload: string) => {
+  cy.get('tbody').within(() => {
+    if (workload === 'no workloads') {
+      cy.contains('No workloads found');
+    } else if (workload === 'workloads') {
+      cy.contains('No workloads found').should('not.exist');
+    } else {
+      cy.contains('td', workload);
+    }
+  });
+});
+
+Then('user should only see healthy workloads in workloads table', () => {
+  cy.get('tbody').within(() => {
+    cy.get('span[class*="icon-healthy"]').should('be.visible');
+    cy.get('span[class*="icon-unhealthy"],span[class*="icon-degraded"],span[class*="icon-na"]').should('not.exist');
+  });
+});
+
+Then('user should only see workloads with the {string} label', (label: string) => {
+  cy.wait('@refresh');
+  cy.get('tbody').within(() => {
+    const regex = new RegExp(`\\b${label}=`);
+
+    cy.get('tr').each($item => {
+      cy.wrap($item)
+        .find('td')
+        .eq(4)
+        .within(() => {
+          cy.get('span').children().contains(regex);
+        });
+    });
+  });
+});
+
+Then('user should only see workloads with an app label', () => {
+  cy.wait('@refresh');
+  cy.get('tbody').within(() => {
+    const regex = new RegExp(`app=|service.istio.io/canonical-name=|app.kubernetes.io/name=`);
+
+    cy.get('tr').each($item => {
+      cy.wrap($item)
+        .find('td')
+        .eq(4)
+        .within(() => {
+          cy.get('span').children().contains(regex);
+        });
+    });
+  });
+});
+
+Then('user should only see workloads with a version label', () => {
+  cy.wait('@refresh');
+  cy.get('tbody').within(() => {
+    const regex = new RegExp(`version=|service.istio.io/canonical-revision=|app.kubernetes.io/version=`);
+
+    cy.get('tr').each($item => {
+      cy.wrap($item)
+        .find('td')
+        .eq(4)
+        .within(() => {
+          cy.get('span').children().contains(regex);
+        });
+    });
+  });
+});
+
+When('user filters for version {string}', (state: string) => {
+  activateFilter(state);
+});
+
+When('user filters for app label {string}', (state: string) => {
+  activateFilter(state);
+});
+
+Then('the workload should be listed as {string}', function (healthStatus: string) {
+  checkHealthIndicatorInTable(this.targetNamespace, 'Deployment', this.targetWorkload, healthStatus);
+});
+
+Then('the health status of the workload should be {string}', function (healthStatus: string) {
+  checkHealthStatusInTable(this.targetNamespace, 'Deployment', this.targetWorkload, healthStatus);
+});
+
+Then('user sees all the Workloads toggles', () => {
+  cy.get('[data-test="toggle-health"]').should('be.checked');
+  cy.get('[data-test="toggle-istioResources"]').should('be.checked');
+
+  colExists('Health', true);
+  colExists('Details', true);
+});
+
+// Ambient multi-primary workloads step definitions
+
+Then(
+  'user see the workload {string} from cluster {string} and namespace {string}',
+  (workload: string, cluster: string, namespace: string) => {
+    cy.waitForReact();
+
+    // Check workloads table for multi-cluster entries using VirtualItem_Cluster pattern
+    cy.get('table').should('exist');
+    cy.get('tbody').should('exist');
+
+    // Look for workloads from different clusters using VirtualItem_Cluster pattern
+    cy.get('tbody').within(() => {
+      // Check for VirtualItem entries from different clusters
+      cy.get(`[data-test*="VirtualItem_Cluster${cluster}_Ns${namespace}_Deployment_${workload}"]`).should('exist');
+    });
+  }
+);

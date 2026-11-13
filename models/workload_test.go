@@ -6,17 +6,19 @@ import (
 
 	osapps_v1 "github.com/openshift/api/apps/v1"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	apps_v1 "k8s.io/api/apps/v1"
 	core_v1 "k8s.io/api/core/v1"
 	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 
 	"github.com/kiali/kiali/config"
 )
 
 func TestParseDeploymentToWorkload(t *testing.T) {
 	assert := assert.New(t)
-	cfg := config.NewConfig()
-	cfg.AdditionalDisplayDetails = []config.AdditionalDisplayItem{
+	conf := config.NewConfig()
+	conf.AdditionalDisplayDetails = []config.AdditionalDisplayItem{
 		{
 			Annotation: "annotation-2",
 			Title:      "Annotation 2",
@@ -30,16 +32,18 @@ func TestParseDeploymentToWorkload(t *testing.T) {
 			Title:      "Annotation 4",
 		},
 	}
-	config.Set(cfg)
+	config.Set(conf)
 
 	w := Workload{}
-	w.ParseDeployment(fakeDeployment())
+	d := fakeDeployment()
+	w.ParseDeployment(d, conf)
 
 	assert.Equal("reviews-v1", w.Name)
 	assert.Equal("bar", w.Labels["foo"])
 	assert.Equal("v1", w.Labels["version"])
 	assert.Equal("2709198702082918", w.ResourceVersion)
-	assert.Equal("Deployment", w.Type)
+	assert.Equal("Deployment", w.WorkloadGVK.Kind)
+	assert.Equal("2018-03-08T14:44:00Z", w.CreatedAt)
 	assert.Equal(int32(1), w.DesiredReplicas)
 	assert.Equal(int32(1), w.CurrentReplicas)
 	assert.Equal(int32(1), w.AvailableReplicas)
@@ -48,30 +52,37 @@ func TestParseDeploymentToWorkload(t *testing.T) {
 	assert.Equal("value-annot-2", w.AdditionalDetails[0].Value)
 	assert.Equal("Annotation 1", w.AdditionalDetails[1].Title)
 	assert.Equal("value-annot-1", w.AdditionalDetails[1].Value)
+	// TODO: The parsing is actually clobbering the Deployment.Annotations if Template.Annotations
+	// is set but fixing it may cause unintended side effects so putting this test after the rest.
+	d.Spec.Template.Annotations = map[string]string{"food": "pizza", "drink": "soda"}
+	w.ParseDeployment(d, conf)
+	assert.Equal(w.TemplateAnnotations, d.Spec.Template.Annotations)
 }
 
 func TestParseReplicaSetToWorkload(t *testing.T) {
 	assert := assert.New(t)
-	cfg := config.NewConfig()
-	cfg.AdditionalDisplayDetails = []config.AdditionalDisplayItem{
+	conf := config.NewConfig()
+	conf.AdditionalDisplayDetails = []config.AdditionalDisplayItem{
 		{
 			Annotation: "annotation",
 			Title:      "Annotation",
 		},
 	}
-	config.Set(cfg)
+	config.Set(conf)
 
 	w := Workload{}
-	w.ParseReplicaSet(fakeReplicaSet())
+	w.ParseReplicaSet(fakeReplicaSet(), conf)
 
 	assert.Equal("reviews-v1", w.Name)
 	assert.Equal("bar", w.Labels["foo"])
 	assert.Equal("v1", w.Labels["version"])
 	assert.Equal("2709198702082918", w.ResourceVersion)
-	assert.Equal("ReplicaSet", w.Type)
+	assert.Equal("ReplicaSet", w.WorkloadGVK.Kind)
+	assert.Equal("2018-03-08T14:44:00Z", w.CreatedAt)
 	assert.Equal(int32(1), w.DesiredReplicas)
 	assert.Equal(int32(1), w.CurrentReplicas)
 	assert.Equal(int32(1), w.AvailableReplicas)
+	assert.Equal(map[string]string{"annotation": "value-annot"}, w.Annotations)
 	assert.Len(w.AdditionalDetails, 1)
 	assert.Equal("Annotation", w.AdditionalDetails[0].Title)
 	assert.Equal("value-annot", w.AdditionalDetails[0].Value)
@@ -79,23 +90,24 @@ func TestParseReplicaSetToWorkload(t *testing.T) {
 
 func TestParseReplicationControllerToWorkload(t *testing.T) {
 	assert := assert.New(t)
-	cfg := config.NewConfig()
-	cfg.AdditionalDisplayDetails = []config.AdditionalDisplayItem{
+	conf := config.NewConfig()
+	conf.AdditionalDisplayDetails = []config.AdditionalDisplayItem{
 		{
 			Annotation: "annotation",
 			Title:      "Annotation",
 		},
 	}
-	config.Set(cfg)
+	config.Set(conf)
 
 	w := Workload{}
-	w.ParseReplicationController(fakeReplicationController())
+	w.ParseReplicationController(fakeReplicationController(), conf)
 
 	assert.Equal("reviews-v1", w.Name)
 	assert.Equal("bar", w.Labels["foo"])
 	assert.Equal("v1", w.Labels["version"])
 	assert.Equal("2709198702082918", w.ResourceVersion)
-	assert.Equal("ReplicationController", w.Type)
+	assert.Equal("ReplicationController", w.WorkloadGVK.Kind)
+	assert.Equal("2018-03-08T14:44:00Z", w.CreatedAt)
 	assert.Equal(int32(1), w.DesiredReplicas)
 	assert.Equal(int32(1), w.CurrentReplicas)
 	assert.Equal(int32(1), w.AvailableReplicas)
@@ -106,22 +118,23 @@ func TestParseReplicationControllerToWorkload(t *testing.T) {
 
 func TestParseDeploymentConfigToWorkload(t *testing.T) {
 	assert := assert.New(t)
-	cfg := config.NewConfig()
-	cfg.AdditionalDisplayDetails = []config.AdditionalDisplayItem{
+	conf := config.NewConfig()
+	conf.AdditionalDisplayDetails = []config.AdditionalDisplayItem{
 		{
 			Annotation: "annotation",
 			Title:      "Annotation",
 		},
 	}
-	config.Set(cfg)
+	config.Set(conf)
 
 	w := Workload{}
-	w.ParseDeploymentConfig(fakeDeploymentConfig())
+	w.ParseDeploymentConfig(fakeDeploymentConfig(), conf)
 
 	assert.Equal("reviews-v1", w.Name)
 	assert.Equal("bar", w.Labels["foo"])
 	assert.Equal("v1", w.Labels["version"])
 	assert.Equal("2709198702082918", w.ResourceVersion)
+	assert.Equal("2018-03-08T14:44:00Z", w.CreatedAt)
 	assert.Equal(int32(1), w.DesiredReplicas)
 	assert.Equal(int32(1), w.CurrentReplicas)
 	assert.Equal(int32(1), w.AvailableReplicas)
@@ -132,23 +145,23 @@ func TestParseDeploymentConfigToWorkload(t *testing.T) {
 
 func TestParsePodToWorkload(t *testing.T) {
 	assert := assert.New(t)
-	cfg := config.NewConfig()
-	cfg.AdditionalDisplayDetails = []config.AdditionalDisplayItem{
+	conf := config.NewConfig()
+	conf.AdditionalDisplayDetails = []config.AdditionalDisplayItem{
 		{
 			Annotation: "annotation",
 			Title:      "Annotation",
 		},
 	}
-	config.Set(cfg)
+	config.Set(conf)
 
 	w := Workload{}
-	w.ParsePod(fakePod())
+	w.ParsePod(fakePod(), conf)
 
 	assert.Equal("reviews-v1", w.Name)
 	assert.Equal("bar", w.Labels["foo"])
 	assert.Equal("v1", w.Labels["version"])
 	assert.Equal("2709198702082918", w.ResourceVersion)
-	assert.Equal("Pod", w.Type)
+	assert.Equal("Pod", w.WorkloadGVK.Kind)
 	assert.Equal(int32(1), w.DesiredReplicas)
 	assert.Equal(int32(1), w.CurrentReplicas)
 	assert.Equal(int32(1), w.AvailableReplicas)
@@ -157,18 +170,45 @@ func TestParsePodToWorkload(t *testing.T) {
 	assert.Equal("value-annot", w.AdditionalDetails[0].Value)
 }
 
+func TestParseWaypointPodToWorkload(t *testing.T) {
+	assert := assert.New(t)
+
+	w := Workload{}
+	w.ParsePod(fakeWaypointPod(), config.Get())
+
+	assert.Equal("waypoint", w.Name)
+	assert.Equal("istio.io-mesh-controller", w.Labels["gateway.istio.io/managed"])
+	assert.Equal("waypoint", w.Labels["gateway.networking.k8s.io/gateway-name"])
+	assert.Equal("2709198702082918", w.ResourceVersion)
+	assert.Equal("Pod", w.WorkloadGVK.Kind)
+	assert.False(w.IsAmbient)
+	assert.True(w.IsWaypointWorkload())
+	assert.False(w.IsGatewayWorkload())
+	assert.Equal(int32(1), w.DesiredReplicas)
+	assert.Equal(int32(1), w.CurrentReplicas)
+	assert.Equal(int32(1), w.AvailableReplicas)
+}
+
+func TestWorkloadHasHTTPTrafficWithWaypoint(t *testing.T) {
+	workload := Workload{
+		WaypointWorkloads: []WorkloadReferenceInfo{{Name: "waypoint", Namespace: "bookinfo"}},
+	}
+
+	assert.True(t, workload.HasHTTPTraffic())
+}
+
 func TestParsePodsToWorkload(t *testing.T) {
 	assert := assert.New(t)
 	config.Set(config.NewConfig())
 
 	w := Workload{}
-	w.ParsePods("workload-from-controller", "Controller", []core_v1.Pod{*fakePod()})
+	w.ParsePods("workload-from-controller", schema.GroupVersionKind{Kind: "Controller"}, []core_v1.Pod{*fakePod()}, config.NewConfig())
 
 	assert.Equal("workload-from-controller", w.Name)
 	assert.Equal("bar", w.Labels["foo"])
 	assert.Equal("v1", w.Labels["version"])
 	assert.Equal("2709198702082918", w.ResourceVersion)
-	assert.Equal("Controller", w.Type)
+	assert.Equal("Controller", w.WorkloadGVK.Kind)
 	assert.Equal(int32(1), w.DesiredReplicas)
 	assert.Equal(int32(1), w.CurrentReplicas)
 	assert.Equal(int32(1), w.AvailableReplicas)
@@ -181,9 +221,90 @@ func TestParsePodWithoutLabelsToWorkload(t *testing.T) {
 	fakePod := fakePod()
 	fakePod.Labels = nil
 	w := Workload{}
-	w.ParsePod(fakePod)
+	w.ParsePod(fakePod, config.Get())
 
 	assert.Equal(map[string]string{}, w.Labels)
+}
+
+func TestIsGatewayLabelsToWorkload(t *testing.T) {
+	cases := map[string]struct {
+		Labels              map[string]string
+		ShouldBeGateway     bool
+		TemplateAnnotations map[string]string
+	}{
+		"istioctl created egress gateway should be a gateway": {
+			Labels: map[string]string{
+				"operator.istio.io/component": "EgressGateways",
+				"version":                     "v1",
+			},
+			ShouldBeGateway: true,
+		},
+		"istioctl created ingress gateway should be a gateway": {
+			Labels: map[string]string{
+				"operator.istio.io/component": "IngressGateways",
+				"version":                     "v1",
+			},
+			ShouldBeGateway: true,
+		},
+		"gateway with bad label should not be a gateway": {
+			Labels: map[string]string{
+				"operator.istio.io/component": "EgressGateway",
+				"istio-system":                "ingressgateway",
+			},
+			ShouldBeGateway: false,
+		},
+		"gateway-injection created gateway should be a gateway": {
+			TemplateAnnotations: map[string]string{
+				"inject.istio.io/templates": "gateway",
+			},
+			ShouldBeGateway: true,
+		},
+		"gateway-api created gateway with old label should be a gateway": {
+			Labels: map[string]string{
+				"istio.io/gateway-name": "gateway",
+			},
+			ShouldBeGateway: true,
+		},
+		"gateway-api created gateway with new label should be a gateway": {
+			Labels: map[string]string{
+				"gateway.istio.io/managed": "istio.io-gateway-controller",
+			},
+			ShouldBeGateway: true,
+		},
+		"gateway-api created gateway with new label but with waypoint value should not be a gateway": {
+			Labels: map[string]string{
+				"gateway.istio.io/managed": "istio.io-mesh-controller",
+			},
+			ShouldBeGateway: false,
+		},
+		"gateway with istio ingress label should be a gateway": {
+			Labels: map[string]string{
+				"istio": "ingressgateway",
+			},
+			ShouldBeGateway: true,
+		},
+		"gateway with istio egress label should be a gateway": {
+			Labels: map[string]string{
+				"istio": "egressgateway",
+			},
+			ShouldBeGateway: true,
+		},
+		"no labels and no annotations should not be a gateway": {
+			ShouldBeGateway: false,
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			require := require.New(t)
+
+			w := Workload{}
+			w.Labels = tc.Labels
+			w.TemplateAnnotations = tc.TemplateAnnotations
+
+			require.Equal(tc.ShouldBeGateway, w.IsGatewayWorkload())
+		})
+	}
 }
 
 func fakeDeployment() *apps_v1.Deployment {
@@ -314,6 +435,26 @@ func fakePod() *core_v1.Pod {
 			ResourceVersion:   "2709198702082918",
 			Labels:            map[string]string{"foo": "bar", "version": "v1"},
 			Annotations:       map[string]string{"annotation": "value-annot"},
+		},
+		Status: core_v1.PodStatus{
+			Phase: "Running",
+		},
+	}
+}
+
+func fakeWaypointPod() *core_v1.Pod {
+	t1, _ := time.Parse(time.RFC822Z, "08 Mar 18 17:44 +0300")
+
+	return &core_v1.Pod{
+		TypeMeta: meta_v1.TypeMeta{
+			Kind: "Pod",
+		},
+		ObjectMeta: meta_v1.ObjectMeta{
+			Name:              "waypoint",
+			CreationTimestamp: meta_v1.NewTime(t1),
+			ResourceVersion:   "2709198702082918",
+			Labels:            map[string]string{"gateway.istio.io/managed": "istio.io-mesh-controller", "gateway.networking.k8s.io/gateway-name": "waypoint"},
+			Annotations:       map[string]string{"istio.io/rev": "default"},
 		},
 		Status: core_v1.PodStatus{
 			Phase: "Running",

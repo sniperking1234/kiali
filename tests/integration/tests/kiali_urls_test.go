@@ -1,0 +1,112 @@
+package tests
+
+import (
+	"fmt"
+	"testing"
+
+	"github.com/stretchr/testify/require"
+
+	"github.com/kiali/kiali/business"
+	"github.com/kiali/kiali/tests/integration/utils/kiali"
+)
+
+func TestKialiStatus(t *testing.T) {
+	require := require.New(t)
+	response, statusCode, err := kiali.KialiStatus()
+
+	require.NoError(err)
+	require.True(response)
+	require.Equal(200, statusCode)
+}
+
+func TestKialiConfig(t *testing.T) {
+	require := require.New(t)
+	response, statusCode, err := kiali.KialiConfig()
+
+	require.NoError(err)
+	require.Equal(200, statusCode)
+	require.NotEmpty(response)
+}
+
+func TestIstioPermissions(t *testing.T) {
+	require := require.New(t)
+	response, statusCode, err := kiali.IstioPermissions()
+
+	require.NoError(err)
+	require.Equal(200, statusCode)
+	require.NotNil(response)
+}
+
+func TestJaeger(t *testing.T) {
+	require := require.New(t)
+	response, statusCode, err := kiali.Tracing()
+
+	if statusCode == 200 {
+		require.NoError(err)
+		require.NotNil(response)
+		require.True(response.Enabled)
+		require.True(response.Integration)
+		require.NotEmpty(response.URL)
+	} else {
+		require.Fail(fmt.Sprintf("Status code should be '200' but was: %d and error: %s", statusCode, err.Error()))
+	}
+}
+
+func TestGrafana(t *testing.T) {
+	require := require.New(t)
+	response, statusCode, err := kiali.Grafana()
+
+	if statusCode == 200 {
+		require.NoError(err)
+		require.NotNil(response)
+		require.NotEmpty(response.ExternalLinks)
+		for _, extLink := range response.ExternalLinks {
+			require.NotEmpty(extLink.Name)
+			require.NotEmpty(extLink.URL)
+		}
+	} else {
+		require.Fail(fmt.Sprintf("Status code should be '200' but was: %d and error: %s", statusCode, err))
+	}
+}
+
+func TestMeshTls(t *testing.T) {
+	require := require.New(t)
+	response, statusCode, err := kiali.MeshTls()
+
+	require.NoError(err)
+	require.Equal(200, statusCode)
+	require.NotNil(response)
+	require.NotNil(response.Status)
+	require.True(MTLSCorrect(response.Status))
+}
+
+func TestClusterNamespaceTls(t *testing.T) {
+	require := require.New(t)
+	response, statusCode, err := kiali.ClustersTls(kiali.BOOKINFO)
+
+	require.NoError(err)
+	require.Equal(200, statusCode)
+	require.NotNil(response)
+	require.NotEmpty(response)
+	require.NotNil((*response)[0])
+	require.NotNil((*response)[0].Status)
+	require.True(MTLSCorrect((*response)[0].Status))
+}
+
+func MTLSCorrect(status string) bool {
+	switch status {
+	case
+		business.MTLSDisabled,
+		business.MTLSEnabled,
+		business.MTLSEnabledExtended,
+		business.MTLSNotEnabled,
+		business.MTLSPartiallyEnabled,
+		business.MTLSUnset,
+		business.MTLSUnsetInheritedDisabled,
+		business.MTLSUnsetInheritedStrict,
+		business.MTLSValidationError:
+		return true
+	default:
+		return false
+	}
+}

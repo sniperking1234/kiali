@@ -1,157 +1,164 @@
 package destinationrules
 
 import (
-	"strings"
+	networking_v1 "istio.io/client-go/pkg/apis/networking/v1"
 
 	"github.com/kiali/kiali/kubernetes"
 	"github.com/kiali/kiali/models"
 )
 
-const DestinationRulesCheckerType = "destinationrule"
-
 type MultiMatchChecker struct {
-	DestinationRules []kubernetes.IstioObject
-	ServiceEntries   map[string][]string
-	Namespaces       models.Namespaces
+	Cluster          string
+	DestinationRules []*networking_v1.DestinationRule
+	IdentityDomain   string
+	Namespaces       []string
 }
 
 type subset struct {
-	Name     string
-	RuleName string
+	Name      string
+	Namespace string
+	RuleName  string
+}
+
+type rule struct {
+	Name      string
+	Namespace string
 }
 
 // Check validates that no two destinationRules target the same host+subset combination
 func (m MultiMatchChecker) Check() models.IstioValidations {
 	validations := models.IstioValidations{}
 
-	// Equality search is: [fqdn.Service][subset] except for ServiceEntry targets which use [host][subset]
-	seenHostSubsets := make(map[string]map[string][]string)
+	// Equality search is: [fqdn.String()][subset]
+	seenHostSubsets := make(map[string]map[string][]rule)
 
 	for _, dr := range m.DestinationRules {
-		if host, ok := dr.GetSpec()["host"]; ok {
-			destinationRulesName := dr.GetObjectMeta().Name
-			destinationRulesNamespace := dr.GetObjectMeta().Namespace
-			if dHost, ok := host.(string); ok {
-				fqdn := kubernetes.GetHost(dHost, dr.GetObjectMeta().Namespace, dr.GetObjectMeta().ClusterName, m.Namespaces.GetNames())
+		destinationRulesName := dr.Name
+		destinationRulesNamespace := dr.Namespace
+		fqdn := kubernetes.GetHost(dr.Spec.Host, dr.Namespace, m.Namespaces, m.IdentityDomain)
 
-				if fqdn.Namespace != dr.GetObjectMeta().Namespace && !strings.HasPrefix(fqdn.Service, "*") && fqdn.Namespace != "" {
-					// Unable to verify if the same host+subset combination is targeted from different namespace DRs
-					// "*" check removes the prefix errors
-					key, rrValidation := createError("validation.unable.cross-namespace", destinationRulesNamespace, destinationRulesName, true)
-					validations.MergeValidations(models.IstioValidations{key: rrValidation})
-					continue
-				}
+		// Skip mesh-wide / namespace-wide mTLS DestinationRules (e.g. *.local, *.ns.svc...).
+		// These are intended to coexist with more specific DRs and must not drive multi-match.
+		if isNonLocalmTLSForServiceEnabled(dr, m.IdentityDomain) {
+			continue
+		}
 
-				// Skip DR validation if it enables mTLS either namespace or mesh-wide
-				if isNonLocalmTLSForServiceEnabled(dr, fqdn.Service) {
-					continue
-				}
+		foundSubsets := extractSubsets(dr, destinationRulesName, destinationRulesNamespace)
+		currentHost := fqdn.String()
 
-				foundSubsets := extractSubsets(dr, destinationRulesName)
-
-				if fqdn.Service == "*" {
-					// We need to check the matching subsets from all hosts now
-					for _, h := range seenHostSubsets {
-						checkCollisions(validations, destinationRulesNamespace, destinationRulesName, foundSubsets, h)
-					}
-					// We add * later
-				}
-				// Search "*" first and then exact name
-				if previous, found := seenHostSubsets["*"]; found {
-					// Need to check subsets of "*"
-					checkCollisions(validations, destinationRulesNamespace, destinationRulesName, foundSubsets, previous)
-				}
-
-				if previous, found := seenHostSubsets[fqdn.Service]; found {
-					// Host found, need to check underlying subsets
-					checkCollisions(validations, destinationRulesNamespace, destinationRulesName, foundSubsets, previous)
-				}
-				// Nothing threw an error, so add these
-				if _, found := seenHostSubsets[fqdn.Service]; !found {
-					seenHostSubsets[fqdn.Service] = make(map[string][]string)
-				}
-				for _, s := range foundSubsets {
-					seenHostSubsets[fqdn.Service][s.Name] = append(seenHostSubsets[fqdn.Service][s.Name], destinationRulesName)
-				}
+		// Only collide with previously seen hosts that actually overlap this one.
+		// Wildcard hosts must honor the namespace/domain suffix (e.g. *.vault... must not
+		// collide with *.istio-test3...); previously any wildcard was compared to all hosts.
+		for hostKey, existing := range seenHostSubsets {
+			if hostsOverlap(currentHost, hostKey) {
+				checkCollisions(validations, destinationRulesNamespace, destinationRulesName, foundSubsets, existing, m.Cluster)
 			}
 		}
+
+		if _, found := seenHostSubsets[currentHost]; !found {
+			seenHostSubsets[currentHost] = make(map[string][]rule)
+		}
+		for _, s := range foundSubsets {
+			seenHostSubsets[currentHost][s.Name] = append(seenHostSubsets[currentHost][s.Name], rule{destinationRulesName, destinationRulesNamespace})
+		}
+
 	}
 
 	return validations
 }
 
-func isNonLocalmTLSForServiceEnabled(dr kubernetes.IstioObject, service string) bool {
-	return strings.HasPrefix(service, "*") && ismTLSEnabled(dr)
+// hostsOverlap reports whether two DestinationRule host keys select the same traffic.
+// Exact matches overlap; a bare "*" overlaps everything; otherwise a wildcard overlaps
+// a host (or a more specific wildcard) when the non-wildcard/more-specific side falls
+// within the wildcard's domain suffix.
+func hostsOverlap(a, b string) bool {
+	if a == b {
+		return true
+	}
+	if a == "*" || b == "*" {
+		return true
+	}
+	return kubernetes.HostWithinWildcardHost(b, a) || kubernetes.HostWithinWildcardHost(a, b)
 }
 
-func ismTLSEnabled(dr kubernetes.IstioObject) bool {
-	if trafficPolicy, trafficPresent := dr.GetSpec()["trafficPolicy"]; trafficPresent {
-		if trafficCasted, ok := trafficPolicy.(map[string]interface{}); ok {
-			if tls, found := trafficCasted["tls"]; found {
-				if tlsCasted, ok := tls.(map[string]interface{}); ok {
-					if mode, found := tlsCasted["mode"]; found {
-						if modeCasted, ok := mode.(string); ok {
-							return modeCasted == "ISTIO_MUTUAL"
-						}
-					}
-				}
-			}
-		}
+// isNonLocalmTLSForServiceEnabled reports whether dr is a mesh-wide or namespace-wide
+// ISTIO_MUTUAL DestinationRule that should be ignored by multi-match / traffic-policy
+// overlap checks.
+//
+// Istio's recommended pattern for enabling mTLS uses hosts like "*.local" (mesh) or
+// "*.{namespace}.{identityDomain}" (namespace). Those DRs are meant to set a default
+// TLS mode and coexist with more specific DestinationRules, so treating them as
+// host collisions would produce false KIA0201 warnings.
+//
+// Only those exact host shapes qualify. A service-scoped wildcard such as
+// "*.vault.svc.cluster.local" with ISTIO_MUTUAL is still a normal DestinationRule and
+// must not be skipped for multi-match or treated as non-local for traffic-policy checks
+// (previously any host starting with "*" was treated as non-local).
+func isNonLocalmTLSForServiceEnabled(dr *networking_v1.DestinationRule, identityDomain string) bool {
+	if enabled, _ := kubernetes.DestinationRuleHasMeshWideMTLSEnabled(dr); enabled {
+		return true
+	}
+	if enabled, _ := kubernetes.DestinationRuleHasNamespaceWideMTLSEnabled(dr.Namespace, dr, identityDomain); enabled {
+		return true
 	}
 	return false
 }
 
-func extractSubsets(dr kubernetes.IstioObject, destinationRulesName string) []subset {
-	if subsets, found := dr.GetSpec()["subsets"]; found {
-		if subsetSlice, ok := subsets.([]interface{}); ok {
-			foundSubsets := make([]subset, 0, len(subsetSlice))
-			for _, se := range subsetSlice {
-				if element, ok := se.(map[string]interface{}); ok {
-					if name, found := element["name"]; found {
-						if n, ok := name.(string); ok {
-							foundSubsets = append(foundSubsets, subset{n, destinationRulesName})
-						}
-					}
-				}
-			}
-			return foundSubsets
-		}
+func ismTLSEnabled(dr *networking_v1.DestinationRule) bool {
+	if dr.Spec.TrafficPolicy != nil && dr.Spec.TrafficPolicy.Tls != nil {
+		mode := dr.Spec.TrafficPolicy.Tls.Mode.String()
+		return mode == "ISTIO_MUTUAL"
 	}
-	// Matches all the subsets:~
-	return []subset{{"~", destinationRulesName}}
+	return false
 }
 
-func checkCollisions(validations models.IstioValidations, namespace, destinationRulesName string, foundSubsets []subset, existing map[string][]string) {
+func extractSubsets(dr *networking_v1.DestinationRule, destinationRulesName string, destinationRulesNamespace string) []subset {
+	if len(dr.Spec.Subsets) > 0 {
+		foundSubsets := []subset{}
+		for _, ss := range dr.Spec.Subsets {
+			foundSubsets = append(foundSubsets, subset{
+				Name:      ss.Name,
+				Namespace: destinationRulesNamespace,
+				RuleName:  destinationRulesName,
+			})
+		}
+		return foundSubsets
+	}
+	// Matches all the subsets:~
+	return []subset{{"~", destinationRulesNamespace, destinationRulesName}}
+}
+
+func checkCollisions(validations models.IstioValidations, namespace, destinationRulesName string, foundSubsets []subset, existing map[string][]rule, cluster string) {
 	// If current subset is ~
 	if len(foundSubsets) == 1 && foundSubsets[0].Name == "~" {
 		// This should match any subset in the same hostname
 		for _, v := range existing {
 			for _, e := range v {
-				addError(validations, namespace, []string{destinationRulesName, e})
+				addError(validations, []string{namespace, e.Namespace}, []string{destinationRulesName, e.Name}, cluster)
 			}
 		}
 	}
 
 	// If we have existing subset with ~
-	if ruleNames, found := existing["~"]; found {
-		for _, ruleName := range ruleNames {
-			addError(validations, namespace, []string{destinationRulesName, ruleName})
+	if rules, found := existing["~"]; found {
+		for _, rule := range rules {
+			addError(validations, []string{namespace, rule.Namespace}, []string{destinationRulesName, rule.Name}, cluster)
 		}
 	}
 
 	for _, s := range foundSubsets {
-		if ruleNames, found := existing[s.Name]; found {
-			for _, ruleName := range ruleNames {
-				addError(validations, namespace, []string{destinationRulesName, ruleName})
+		if rules, found := existing[s.Name]; found {
+			for _, rule := range rules {
+				addError(validations, []string{namespace, rule.Namespace}, []string{destinationRulesName, rule.Name}, cluster)
 			}
 		}
 	}
 }
 
-// addError links new validation errors to the validations. destinationRuleNames must always be a pair
-func addError(validations models.IstioValidations, namespace string, destinationRuleNames []string) models.IstioValidations {
-	key0, rrValidation0 := createError("destinationrules.multimatch", namespace, destinationRuleNames[0], true)
-	key1, rrValidation1 := createError("destinationrules.multimatch", namespace, destinationRuleNames[1], true)
+// addError links new validation errors to the validations. namespaces nad destinationRuleNames must always be a pair
+func addError(validations models.IstioValidations, namespaces []string, destinationRuleNames []string, cluster string) models.IstioValidations {
+	key0, rrValidation0 := createError("destinationrules.multimatch", namespaces[0], destinationRuleNames[0], cluster, true)
+	key1, rrValidation1 := createError("destinationrules.multimatch", namespaces[1], destinationRuleNames[1], cluster, true)
 
 	rrValidation0.References = append(rrValidation0.References, key1)
 	rrValidation1.References = append(rrValidation1.References, key0)
@@ -162,13 +169,14 @@ func addError(validations models.IstioValidations, namespace string, destination
 	return validations
 }
 
-func createError(errorText, namespace, destinationRuleName string, valid bool) (models.IstioValidationKey, *models.IstioValidation) {
-	key := models.IstioValidationKey{Name: destinationRuleName, Namespace: namespace, ObjectType: DestinationRulesCheckerType}
+func createError(errorText, namespace, destinationRuleName, cluster string, valid bool) (models.IstioValidationKey, *models.IstioValidation) {
+	key := models.IstioValidationKey{Name: destinationRuleName, Namespace: namespace, ObjectGVK: kubernetes.DestinationRules, Cluster: cluster}
 	checks := models.Build(errorText, "spec/host")
 	rrValidation := &models.IstioValidation{
-		Name:       destinationRuleName,
-		ObjectType: DestinationRulesCheckerType,
-		Valid:      valid,
+		Cluster:   cluster,
+		Name:      destinationRuleName,
+		ObjectGVK: key.ObjectGVK,
+		Valid:     valid,
 		Checks: []*models.IstioCheck{
 			&checks,
 		},

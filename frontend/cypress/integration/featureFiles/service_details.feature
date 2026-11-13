@@ -1,0 +1,96 @@
+@service-details
+# don't change first line of this file - the tag is used for the test scripts to identify the test suite
+
+Feature: Kiali Service Details page
+
+  User opens the Services page and sees the bookinfo namespaces,
+  clicks in the productpage service, and page loads correctly.
+
+  Background:
+    Given user is at administrator perspective
+    And user is at the details page for the "service" "bookinfo/productpage" located in the "" cluster
+
+  # TODO: offline - no tracing details yet
+  @bookinfo-app
+  @core-caching
+  @lpinterop
+  Scenario: See details for productpage
+    Then sd::user sees a list with content "Overview"
+    Then sd::user sees a list with content "Traffic"
+    Then sd::user sees a list with content "Inbound Metrics"
+    Then sd::user sees a list with content "Traces"
+    Then sd::user sees the service actions
+
+  # TODO: offline - no "Hostname" found but this doesn't exist in regular runs either?
+  @bookinfo-app
+  @core-caching
+  @lpinterop
+  Scenario: See details for service
+    Then sd::user sees "productpage" details information for service "v1"
+    Then sd::user sees Resources card
+    Then sd::user sees Network card
+    Then sd::user sees Istio Config
+    Then sd::user sees Labels card
+    Then sd::user sees Annotations card
+
+  @bookinfo-app
+  @core-caching
+  Scenario: See service Traffic information
+    Then sd::user sees inbound and outbound traffic information
+    And the "Cluster" column "disappears"
+
+  @bookinfo-app
+  @core-caching
+  Scenario: See Inbound Metrics for productpage service details
+    Then sd::user sees "Request volume" graph
+    Then sd::user sees "Request duration" graph
+    Then sd::user sees "Request size" graph
+    Then sd::user sees "Response size" graph
+    Then sd::user sees "Request throughput" graph
+    Then sd::user sees "Response throughput" graph
+    Then sd::user sees "gRPC received" graph
+    Then sd::user sees "gRPC sent" graph
+    Then sd::user sees "TCP opened" graph
+    Then sd::user sees "TCP closed" graph
+    Then sd::user sees "TCP received" graph
+    Then sd::user sees "TCP sent" graph
+
+  @bookinfo-app
+  @core-caching
+  Scenario: See Graph data for productpage service details Inbound Metrics graphs
+    Then sd::user does not see No data message in the "Request volume" graph
+
+  # TODO: offline - no tracing details yet
+  @bookinfo-app
+  @tracing
+  @waypoint-tracing
+  Scenario: See graph traces for details service details
+    And user is at the details page for the "service" "bookinfo/details" located in the "" cluster
+    And user sees trace information
+    When user selects a trace
+    Then user sees trace details
+
+  # TODO: offline - no tracing details yet
+  # waypoint tracing does not emit traces for productpage
+  @bookinfo-app
+  @tracing
+  @waypoint-tracing
+  Scenario: See span info after selecting service span
+    Given user is at the details page for the "service" "bookinfo/details" located in the "" cluster
+    And user sees trace information
+    When user selects a trace with at least 4 spans
+    Then user sees span details
+
+  @waypoint-tracing
+  # TODO: Switch this back to travel-agency/insurances once the travels demo image is updated.
+  Scenario: See tracing tooltip heat map for reviews service in bookinfo
+    Given the tracing data is ready for the "service" "bookinfo/reviews"
+    And user is at the details page for the "service" "bookinfo/reviews" located in the "" cluster
+    And user sees trace information
+    When user hovers over a trace with at least 4 spans
+    Then user sees the tracing tooltip heat map
+
+  @ambient-multi-primary
+  # TODO: offline - ambient support.
+  Scenario: See ambient label for service
+    Then user sees "Ambient" badge for service

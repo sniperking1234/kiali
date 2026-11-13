@@ -1,271 +1,480 @@
 package handlers
 
 import (
-	"io/ioutil"
 	"net/http"
 	"strings"
-	"sync"
 
 	"github.com/gorilla/mux"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 
 	"github.com/kiali/kiali/business"
+	"github.com/kiali/kiali/cache"
 	"github.com/kiali/kiali/config"
+	"github.com/kiali/kiali/grafana"
+	"github.com/kiali/kiali/istio"
+	"github.com/kiali/kiali/kubernetes"
 	"github.com/kiali/kiali/log"
 	"github.com/kiali/kiali/models"
+	"github.com/kiali/kiali/prometheus"
+	"github.com/kiali/kiali/tracing"
 )
 
-func IstioConfigList(w http.ResponseWriter, r *http.Request) {
-	params := mux.Vars(r)
-	namespace := params["namespace"]
-	query := r.URL.Query()
-	objects := ""
-	parsedTypes := make([]string, 0)
-	if _, ok := query["objects"]; ok {
-		objects = strings.ToLower(query.Get("objects"))
-		if len(objects) > 0 {
-			parsedTypes = strings.Split(objects, ",")
+func IstioConfigList(
+	conf *config.Config,
+	kialiCache cache.KialiCache,
+	clientFactory kubernetes.ClientFactory,
+	prom prometheus.ClientInterface,
+	traceClientLoader func() tracing.ClientInterface,
+	discovery istio.MeshDiscovery,
+	cpm business.ControlPlaneMonitor,
+	grafana *grafana.Service,
+) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+
+		params := mux.Vars(r)
+		namespace := params["namespace"]
+		query := r.URL.Query()
+
+		listParams, err := parseIstioConfigListParams(conf, query)
+		if respondQueryParamError(w, err) {
+			return
 		}
-	}
 
-	includeValidations := false
-	if _, found := query["validate"]; found {
-		includeValidations = true
-	}
+		parsedTypes := make([]string, 0)
+		if len(listParams.Objects) > 0 {
+			parsedTypes = strings.Split(listParams.Objects, ";")
+		}
 
-	labelSelector := ""
-	if _, found := query["labelSelector"]; found {
-		labelSelector = query.Get("labelSelector")
-	}
+		criteria := business.ParseIstioConfigCriteria(listParams.Objects, listParams.LabelSelector, listParams.WorkloadSelector)
+		cluster := listParams.ClusterName
+		includeValidations := listParams.IncludeValidations
 
-	workloadSelector := ""
-	if _, found := query["workloadSelector"]; found {
-		workloadSelector = query.Get("workloadSelector")
-	}
+		business, err := getLayer(r, conf, kialiCache, clientFactory, cpm, prom, traceClientLoader, grafana, discovery)
+		if err != nil {
+			RespondWithError(w, http.StatusInternalServerError, "Services initialization error: "+err.Error())
+			return
+		}
 
-	criteria := business.ParseIstioConfigCriteria(namespace, objects, labelSelector, workloadSelector)
+		var istioConfig *models.IstioConfigList
+		if namespace != "" {
+			istioConfig, err = business.IstioConfig.GetIstioConfigListForNamespace(r.Context(), cluster, namespace, criteria)
+			if err != nil {
+				handleErrorResponse(w, err)
+				return
+			}
+		} else {
+			istioConfig, err = business.IstioConfig.GetIstioConfigList(r.Context(), cluster, criteria)
+			if err != nil {
+				handleErrorResponse(w, err)
+				return
+			}
+		}
 
-	// Get business layer
-	business, err := getBusiness(r)
-	if err != nil {
-		RespondWithError(w, http.StatusInternalServerError, "Services initialization error: "+err.Error())
-		return
-	}
+		if includeValidations {
+			// Namespace-scoped list should only return validations for that namespace.
+			// Cluster-wide list (/api/istio/config) keeps cluster validations.
+			if namespace != "" {
+				istioConfig.IstioValidations, err = business.Validations.GetValidationsForNamespace(r.Context(), cluster, namespace)
+			} else {
+				istioConfig.IstioValidations, err = business.Validations.GetValidations(r.Context(), cluster)
+			}
+			if err != nil {
+				// A denied namespace surfaces as an AccessibleNamespaceError:
+				// 403 like every other namespace-scoped read on this endpoint,
+				// not a 500.
+				handleErrorResponse(w, err)
+				return
+			}
 
-	var istioConfigValidations models.IstioValidations
-
-	wg := sync.WaitGroup{}
-	if includeValidations {
-		wg.Add(1)
-		go func(namespace string, istioConfigValidations *models.IstioValidations, err *error) {
-			defer wg.Done()
 			// We don't filter by objects when calling validations, because certain validations require fetching all types to get the correct errors
-			istioConfigValidationResults, errValidations := business.Validations.GetValidations(namespace, "")
-			if errValidations != nil && *err == nil {
-				*err = errValidations
-			} else {
-				if len(parsedTypes) > 0 {
-					istioConfigValidationResults = istioConfigValidationResults.FilterByTypes(parsedTypes)
-				}
-				*istioConfigValidations = istioConfigValidationResults
+			if len(parsedTypes) > 0 {
+				istioConfig.IstioValidations = istioConfig.IstioValidations.FilterByTypes(parsedTypes)
 			}
-		}(namespace, &istioConfigValidations, &err)
-	}
+		}
 
-	istioConfig, err := business.IstioConfig.GetIstioConfigList(criteria)
-	if includeValidations {
-		// Add validation results to the IstioConfigList once they're available (previously done in the UI layer)
-		wg.Wait()
-		istioConfig.IstioValidations = istioConfigValidations
+		RespondWithAPIResponse(w, http.StatusOK, istioConfig)
 	}
-
-	if err != nil {
-		handleErrorResponse(w, err)
-		return
-	}
-
-	RespondWithJSON(w, http.StatusOK, istioConfig)
 }
 
-func IstioConfigDetails(w http.ResponseWriter, r *http.Request) {
-	params := mux.Vars(r)
-	namespace := params["namespace"]
-	objectType := params["object_type"]
-	object := params["object"]
+func IstioConfigDetails(
+	conf *config.Config,
+	kialiCache cache.KialiCache,
+	clientFactory kubernetes.ClientFactory,
+	prom prometheus.ClientInterface,
+	traceClientLoader func() tracing.ClientInterface,
+	discovery istio.MeshDiscovery,
+	cpm business.ControlPlaneMonitor,
+	grafana *grafana.Service,
+) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
 
-	includeValidations := false
-	query := r.URL.Query()
-	if _, found := query["validate"]; found {
-		includeValidations = true
-	}
+		params := mux.Vars(r)
+		namespace := params["namespace"]
+		objectGroup := params["group"]
+		objectVersion := params["version"]
+		objectKind := params["kind"]
+		object := params["object"]
 
-	if !checkObjectType(objectType) {
-		RespondWithError(w, http.StatusBadRequest, "Object type not managed: "+objectType)
-		return
-	}
+		query := r.URL.Query()
+		detailsParams, err := parseIstioConfigDetailsParams(conf, query)
+		if respondQueryParamError(w, err) {
+			return
+		}
 
-	// Get business layer
-	business, err := getBusiness(r)
-	if err != nil {
-		RespondWithError(w, http.StatusInternalServerError, "Services initialization error: "+err.Error())
-		return
-	}
+		cluster := detailsParams.ClusterName
+		includeValidations := detailsParams.IncludeValidations
+		includeHelp := detailsParams.IncludeHelp
 
-	var istioConfigValidations models.IstioValidations
+		gvk := schema.GroupVersionKind{
+			Group:   objectGroup,
+			Version: objectVersion,
+			Kind:    objectKind,
+		}
 
-	wg := sync.WaitGroup{}
-	if includeValidations {
-		wg.Add(1)
-		go func(istioConfigValidations *models.IstioValidations, err *error) {
-			defer wg.Done()
-			istioConfigValidationResults, errValidations := business.Validations.GetIstioObjectValidations(namespace, objectType, object)
-			if errValidations != nil && *err == nil {
-				*err = errValidations
-			} else {
-				*istioConfigValidations = istioConfigValidationResults
+		if !checkObjectType(gvk) {
+			RespondWithError(w, http.StatusBadRequest, "Object type not managed: "+gvk.String())
+			return
+		}
+
+		business, err := getLayer(r, conf, kialiCache, clientFactory, cpm, prom, traceClientLoader, grafana, discovery)
+		if err != nil {
+			RespondWithError(w, http.StatusInternalServerError, "Services initialization error: "+err.Error())
+			return
+		}
+
+		istioConfigDetails, err := business.IstioConfig.GetIstioConfigDetails(r.Context(), cluster, namespace, gvk, object)
+		if err != nil {
+			handleErrorResponse(w, err)
+			return
+		}
+
+		istioConfigValidations := models.IstioValidations{}
+		istioConfigReferences := models.IstioReferencesMap{}
+
+		validationsResult := make(chan error)
+		if includeValidations {
+			go func(istioConfigValidations *models.IstioValidations, istioConfigReferences *models.IstioReferencesMap) {
+				defer func() {
+					close(validationsResult)
+				}()
+				// ValidateIstioObject validates the object from its own namespace and
+				// from every namespace it is exported to, matching the background
+				// validation that produces the list-view results.
+				istioConfigValidationResults, istioConfigReferencesResults, err := business.Validations.ValidateIstioObject(r.Context(), cluster, namespace, gvk, object)
+				if err != nil {
+					validationsResult <- err
+					return
+				}
+				*istioConfigValidations = istioConfigValidations.MergeValidations(istioConfigValidationResults)
+				*istioConfigReferences = istioConfigReferences.MergeReferencesMap(istioConfigReferencesResults)
+			}(&istioConfigValidations, &istioConfigReferences)
+		}
+
+		if includeHelp {
+			istioConfigDetails.IstioConfigHelpFields = models.IstioConfigHelpMessages[gvk.String()]
+		}
+
+		if includeValidations {
+			err := <-validationsResult
+			if err != nil {
+				handleErrorResponse(w, err)
+				return
 			}
-		}(&istioConfigValidations, &err)
+
+			if validation, found := istioConfigValidations[models.IstioValidationKey{ObjectGVK: gvk, Namespace: namespace, Name: object, Cluster: cluster}]; found {
+				istioConfigDetails.IstioValidation = validation
+			}
+			if references, found := istioConfigReferences[models.IstioReferenceKey{ObjectGVK: gvk, Namespace: namespace, Name: object}]; found {
+				istioConfigDetails.IstioReferences = references
+			}
+		}
+
+		RespondWithJSON(w, http.StatusOK, istioConfigDetails)
 	}
+}
 
-	istioConfigDetails, err := business.IstioConfig.GetIstioConfigDetails(namespace, objectType, object)
+func IstioConfigDelete(
+	conf *config.Config,
+	kialiCache cache.KialiCache,
+	clientFactory kubernetes.ClientFactory,
+	prom prometheus.ClientInterface,
+	traceClientLoader func() tracing.ClientInterface,
+	discovery istio.MeshDiscovery,
+	cpm business.ControlPlaneMonitor,
+	grafana *grafana.Service,
+) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
 
-	if includeValidations && err == nil {
-		wg.Wait()
+		params := mux.Vars(r)
+		namespace := params["namespace"]
+		objectGroup := params["group"]
+		objectVersion := params["version"]
+		objectKind := params["kind"]
+		object := params["object"]
 
-		if validation, found := istioConfigValidations[models.IstioValidationKey{ObjectType: models.ObjectTypeSingular[objectType], Namespace: namespace, Name: object}]; found {
-			istioConfigDetails.IstioValidation = validation
+		query := r.URL.Query()
+		cluster, err := parseIstioConfigClusterParams(conf, query)
+		if respondQueryParamError(w, err) {
+			return
+		}
+
+		gvk := schema.GroupVersionKind{
+			Group:   objectGroup,
+			Version: objectVersion,
+			Kind:    objectKind,
+		}
+
+		if !business.GetIstioAPI(gvk) {
+			RespondWithError(w, http.StatusBadRequest, "Object type not managed: "+gvk.String())
+			return
+		}
+
+		business, err := getLayer(r, conf, kialiCache, clientFactory, cpm, prom, traceClientLoader, grafana, discovery)
+		if err != nil {
+			RespondWithError(w, http.StatusInternalServerError, "Services initialization error: "+err.Error())
+			return
+		}
+		err = business.IstioConfig.DeleteIstioConfigDetail(r.Context(), cluster, namespace, gvk, object)
+		if err != nil {
+			handleErrorResponse(w, err)
+			return
+		} else {
+			audit(r, "DELETE", namespace, gvk.String(), "Name: ["+object+"]")
+			RespondWithCode(w, http.StatusOK)
 		}
 	}
-
-	if err != nil {
-		handleErrorResponse(w, err)
-		return
-	}
-
-	RespondWithJSON(w, http.StatusOK, istioConfigDetails)
 }
 
-func IstioConfigDelete(w http.ResponseWriter, r *http.Request) {
-	params := mux.Vars(r)
-	namespace := params["namespace"]
-	objectType := params["object_type"]
-	object := params["object"]
+func IstioConfigUpdate(
+	conf *config.Config,
+	kialiCache cache.KialiCache,
+	clientFactory kubernetes.ClientFactory,
+	prom prometheus.ClientInterface,
+	traceClientLoader func() tracing.ClientInterface,
+	discovery istio.MeshDiscovery,
+	cpm business.ControlPlaneMonitor,
+	grafana *grafana.Service,
+) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
 
-	api := business.GetIstioAPI(objectType)
-	if api == "" {
-		RespondWithError(w, http.StatusBadRequest, "Object type not managed: "+objectType)
-		return
-	}
+		params := mux.Vars(r)
+		namespace := params["namespace"]
+		objectGroup := params["group"]
+		objectVersion := params["version"]
+		objectKind := params["kind"]
+		object := params["object"]
 
-	// Get business layer
-	business, err := getBusiness(r)
-	if err != nil {
-		RespondWithError(w, http.StatusInternalServerError, "Services initialization error: "+err.Error())
-		return
-	}
-	err = business.IstioConfig.DeleteIstioConfigDetail(api, namespace, objectType, object)
-	if err != nil {
-		handleErrorResponse(w, err)
-		return
-	} else {
-		audit(r, "DELETE on Namespace: "+namespace+" Type: "+objectType+" Name: "+object)
-		RespondWithCode(w, http.StatusOK)
+		query := r.URL.Query()
+		cluster, err := parseIstioConfigClusterParams(conf, query)
+		if respondQueryParamError(w, err) {
+			return
+		}
+
+		gvk := schema.GroupVersionKind{
+			Group:   objectGroup,
+			Version: objectVersion,
+			Kind:    objectKind,
+		}
+
+		if !business.GetIstioAPI(gvk) {
+			RespondWithError(w, http.StatusBadRequest, "Object type not managed: "+gvk.String())
+			return
+		}
+
+		business, err := getLayer(r, conf, kialiCache, clientFactory, cpm, prom, traceClientLoader, grafana, discovery)
+		if err != nil {
+			RespondWithError(w, http.StatusInternalServerError, "Services initialization error: "+err.Error())
+			return
+		}
+
+		body, err := boundedReadAll(r)
+		if err != nil {
+			RespondWithError(w, http.StatusBadRequest, "Update request with bad update patch: "+err.Error())
+			return
+		}
+		jsonPatch := string(body)
+		updatedConfigDetails, err := business.IstioConfig.UpdateIstioConfigDetail(r.Context(), cluster, namespace, gvk, object, jsonPatch)
+		if err != nil {
+			handleErrorResponse(w, err)
+			return
+		}
+
+		audit(r, "UPDATE", namespace, gvk.String(), "Name: ["+object+"], Patch: "+jsonPatch)
+		RespondWithJSON(w, http.StatusOK, updatedConfigDetails)
 	}
 }
 
-func IstioConfigUpdate(w http.ResponseWriter, r *http.Request) {
-	params := mux.Vars(r)
-	namespace := params["namespace"]
-	objectType := params["object_type"]
-	object := params["object"]
+func IstioConfigCreate(
+	conf *config.Config,
+	kialiCache cache.KialiCache,
+	clientFactory kubernetes.ClientFactory,
+	prom prometheus.ClientInterface,
+	traceClientLoader func() tracing.ClientInterface,
+	discovery istio.MeshDiscovery,
+	cpm business.ControlPlaneMonitor,
+	grafana *grafana.Service,
+) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
 
-	api := business.GetIstioAPI(objectType)
-	if api == "" {
-		RespondWithError(w, http.StatusBadRequest, "Object type not managed: "+objectType)
-		return
+		// Feels kinda replicated for multiple functions..
+		params := mux.Vars(r)
+		namespace := params["namespace"]
+		objectGroup := params["group"]
+		objectVersion := params["version"]
+		objectKind := params["kind"]
+
+		query := r.URL.Query()
+		cluster, err := parseIstioConfigClusterParams(conf, query)
+		if respondQueryParamError(w, err) {
+			return
+		}
+
+		gvk := schema.GroupVersionKind{
+			Group:   objectGroup,
+			Version: objectVersion,
+			Kind:    objectKind,
+		}
+
+		if !business.GetIstioAPI(gvk) {
+			RespondWithError(w, http.StatusBadRequest, "Object type not managed: "+gvk.String())
+			return
+		}
+
+		business, err := getLayer(r, conf, kialiCache, clientFactory, cpm, prom, traceClientLoader, grafana, discovery)
+		if err != nil {
+			RespondWithError(w, http.StatusInternalServerError, "Services initialization error: "+err.Error())
+			return
+		}
+
+		body, err := boundedReadAll(r)
+		if err != nil {
+			RespondWithError(w, http.StatusBadRequest, "Create request could not be read: "+err.Error())
+			return
+		}
+
+		createdConfigDetails, err := business.IstioConfig.CreateIstioConfigDetail(r.Context(), cluster, namespace, gvk, body)
+		if err != nil {
+			handleErrorResponse(w, err)
+			return
+		}
+
+		audit(r, "CREATE", namespace, gvk.String(), "Object: "+string(body))
+		RespondWithJSON(w, http.StatusOK, createdConfigDetails)
 	}
-
-	// Get business layer
-	business, err := getBusiness(r)
-	if err != nil {
-		RespondWithError(w, http.StatusInternalServerError, "Services initialization error: "+err.Error())
-		return
-	}
-
-	body, err := ioutil.ReadAll(r.Body)
-	if err != nil {
-		RespondWithError(w, http.StatusBadRequest, "Update request with bad update patch: "+err.Error())
-	}
-	jsonPatch := string(body)
-	updatedConfigDetails, err := business.IstioConfig.UpdateIstioConfigDetail(api, namespace, objectType, object, jsonPatch)
-
-	if err != nil {
-		handleErrorResponse(w, err)
-		return
-	}
-
-	audit(r, "UPDATE on Namespace: "+namespace+" Type: "+objectType+" Name: "+object+" Patch: "+jsonPatch)
-	RespondWithJSON(w, http.StatusOK, updatedConfigDetails)
 }
 
-func IstioConfigCreate(w http.ResponseWriter, r *http.Request) {
-	// Feels kinda replicated for multiple functions..
-	params := mux.Vars(r)
-	namespace := params["namespace"]
-	objectType := params["object_type"]
-
-	api := business.GetIstioAPI(objectType)
-	if api == "" {
-		RespondWithError(w, http.StatusBadRequest, "Object type not managed: "+objectType)
-		return
-	}
-
-	// Get business layer
-	business, err := getBusiness(r)
-	if err != nil {
-		RespondWithError(w, http.StatusInternalServerError, "Services initialization error: "+err.Error())
-		return
-	}
-
-	body, err := ioutil.ReadAll(r.Body)
-	if err != nil {
-		RespondWithError(w, http.StatusBadRequest, "Create request could not be read: "+err.Error())
-	}
-
-	createdConfigDetails, err := business.IstioConfig.CreateIstioConfigDetail(api, namespace, objectType, body)
-	if err != nil {
-		handleErrorResponse(w, err)
-		return
-	}
-
-	audit(r, "CREATE on Namespace: "+namespace+" Type: "+objectType+" Object: "+string(body))
-	RespondWithJSON(w, http.StatusOK, createdConfigDetails)
+func checkObjectType(gvk schema.GroupVersionKind) bool {
+	return business.GetIstioAPI(gvk)
 }
 
-func checkObjectType(objectType string) bool {
-	return business.GetIstioAPI(objectType) != ""
-}
-
-func audit(r *http.Request, message string) {
+func audit(r *http.Request, operation, namespace, gvk, message string) {
 	if config.Get().Server.AuditLog {
 		user := r.Header.Get("Kiali-User")
-		log.Infof("AUDIT User [%s] Msg [%s]", user, message)
+		log.FromRequest(r).
+			Info().
+			Str("operation", operation).
+			Str("namespace", namespace).
+			Str("gvk", gvk).
+			Str("user", user).
+			Msgf("AUDIT: %s", message)
 	}
 }
 
-func IstioConfigPermissions(w http.ResponseWriter, r *http.Request) {
-	// query params
-	params := r.URL.Query()
-	namespaces := params.Get("namespaces") // csl of namespaces
+func IstioConfigPermissions(
+	conf *config.Config,
+	kialiCache cache.KialiCache,
+	clientFactory kubernetes.ClientFactory,
+	prom prometheus.ClientInterface,
+	traceClientLoader func() tracing.ClientInterface,
+	discovery istio.MeshDiscovery,
+	cpm business.ControlPlaneMonitor,
+	grafana *grafana.Service,
+) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
 
-	business, err := getBusiness(r)
-	if err != nil {
-		RespondWithError(w, http.StatusInternalServerError, "Services initialization error: "+err.Error())
-		return
+		// query params
+		params := r.URL.Query()
+		cluster, namespaces, err := parseIstioConfigNamespacesParams(conf, params)
+		if respondQueryParamError(w, err) {
+			return
+		}
+
+		business, err := getLayer(r, conf, kialiCache, clientFactory, cpm, prom, traceClientLoader, grafana, discovery)
+		if err != nil {
+			RespondWithError(w, http.StatusInternalServerError, "Services initialization error: "+err.Error())
+			return
+		}
+
+		if !business.Mesh.IsValidCluster(cluster) {
+			RespondWithError(w, http.StatusBadRequest, "Cluster [%s] does not exist "+cluster)
+			return
+		}
+
+		istioConfigPermissions := models.IstioConfigPermissions{}
+		if len(namespaces) > 0 {
+			ns := strings.Split(namespaces, ",")
+			istioConfigPermissions = business.IstioConfig.GetIstioConfigPermissions(r.Context(), ns, cluster)
+		}
+		RespondWithJSON(w, http.StatusOK, istioConfigPermissions)
 	}
-	istioConfigPermissions := models.IstioConfigPermissions{}
-	if len(namespaces) > 0 {
-		ns := strings.Split(namespaces, ",")
-		istioConfigPermissions = business.IstioConfig.GetIstioConfigPermissions(ns)
+}
+
+// IstioConfigValidationSummary is the API handler to fetch validations summary to be displayed.
+// It is related to all the Istio Objects within given namespaces
+func IstioConfigValidationSummary(
+	conf *config.Config,
+	kialiCache cache.KialiCache,
+	clientFactory kubernetes.ClientFactory,
+	prom prometheus.ClientInterface,
+	cpm business.ControlPlaneMonitor,
+	traceClientLoader func() tracing.ClientInterface,
+	grafana *grafana.Service,
+	discovery *istio.Discovery,
+) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+
+		params := r.URL.Query()
+		cluster, namespaces, err := parseIstioConfigNamespacesParams(conf, params)
+		if respondQueryParamError(w, err) {
+			return
+		}
+		nss := []string{}
+		if len(namespaces) > 0 {
+			nss = strings.Split(namespaces, ",")
+		}
+
+		business, err := getLayer(r, conf, kialiCache, clientFactory, cpm, prom, traceClientLoader, grafana, discovery)
+		if err != nil {
+			RespondWithError(w, http.StatusInternalServerError, "Services initialization error: "+err.Error())
+			return
+		}
+
+		if len(nss) == 0 {
+			// Fail closed: if the accessible set cannot be determined, reject
+			// rather than return an empty (200) result set.
+			loadedNamespaces, errNs := business.Namespace.GetClusterNamespaces(r.Context(), cluster)
+			if errNs != nil {
+				RespondWithError(w, http.StatusInternalServerError, "Error fetching namespaces: "+errNs.Error())
+				return
+			}
+			for _, ns := range loadedNamespaces {
+				nss = append(nss, ns.Name)
+			}
+		}
+
+		validationSummaries := []models.IstioValidationSummary{}
+		for _, ns := range nss {
+			istioConfigValidationResults, errValidations := business.Validations.GetValidationsForNamespace(r.Context(), cluster, ns)
+			if errValidations != nil {
+				log.FromRequest(r).Error().Msg(errValidations.Error())
+				// An inaccessible namespace is an authorization failure (403),
+				// not a server error.
+				handleErrorResponse(w, errValidations)
+				return
+			}
+			validationSummaries = append(validationSummaries, *istioConfigValidationResults.SummarizeValidation(ns, cluster))
+		}
+
+		RespondWithJSON(w, http.StatusOK, validationSummaries)
 	}
-	RespondWithJSON(w, http.StatusOK, istioConfigPermissions)
 }

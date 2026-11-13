@@ -1,0 +1,58 @@
+import * as React from 'react';
+import type { TargetPanelCommonProps } from './TargetPanelCommon';
+import { renderNodeHeader, targetBodyStyle, targetPanelHR, targetPanelStyle } from './TargetPanelCommon';
+import type { MeshNodeData, NodeTarget } from 'types/Mesh';
+import { isExternal, MeshInfraType } from 'types/Mesh';
+import { classes } from 'typestyle';
+import { panelHeadingStyle, panelStyle } from 'pages/Graph/SummaryPanelStyle';
+import { useKialiTranslation } from 'utils/I18nUtils';
+import { UNKNOWN } from 'types/Graph';
+import { TargetPanelEditor } from './TargetPanelEditor';
+import { TracingDiagnose } from '../../../components/Mesh/TracingDiagnose';
+import { WaypointGatewayCanaryPanel } from '../../../components/Ambient/WaypointCanarySummary';
+import type { GatewayWaypointTrafficSplitConfig } from 'types/WaypointTraffic';
+
+type TargetPanelNodeProps<T extends MeshNodeData> = TargetPanelCommonProps & {
+  target: NodeTarget<T>;
+};
+
+export const TargetPanelNode: React.FC<TargetPanelNodeProps<MeshNodeData>> = (
+  props: TargetPanelNodeProps<MeshNodeData>
+) => {
+  const { t } = useKialiTranslation();
+
+  const node = props.target;
+
+  if (!node) {
+    return null;
+  }
+
+  const data = node.elem.getData()!;
+  const isWaypoint = data.infraType === MeshInfraType.WAYPOINT;
+
+  return (
+    <div id="target-panel-node" className={classes(panelStyle, targetPanelStyle)}>
+      <div className={panelHeadingStyle}>{renderNodeHeader(data, { nameOnly: isExternal(data.cluster) })}</div>
+      <div className={targetBodyStyle}>
+        <div style={{ display: 'flex' }}>
+          <span>{t('Version: {{version}}', { version: data.version || t(UNKNOWN) })}</span>
+          {data.infraType === MeshInfraType.TRACE_STORE && (
+            <TracingDiagnose cluster={data.cluster} configData={data.infraData} />
+          )}
+        </div>
+        {targetPanelHR}
+
+        {isWaypoint && (
+          <WaypointGatewayCanaryPanel
+            cluster={data.cluster}
+            configs={data.infraData?.WaypointTrafficSplitConfigs as GatewayWaypointTrafficSplitConfig[] | undefined}
+            namespace={data.namespace}
+            workload={data.infraName}
+          />
+        )}
+
+        <TargetPanelEditor configData={data.infraData} targetName={data.infraName}></TargetPanelEditor>
+      </div>
+    </div>
+  );
+};

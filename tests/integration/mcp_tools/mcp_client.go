@@ -1,0 +1,146 @@
+package mcp_tools
+
+import (
+	"bytes"
+	"crypto/tls"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"strings"
+	"time"
+
+	"github.com/kiali/kiali/log"
+)
+
+var mcpClient *MCPClient
+
+const (
+	MCPTimeout     = 90 * time.Second
+	MCPMaxAttempts = 4
+	MCPRetryWait   = 2 * time.Second
+)
+
+type MCPClient struct {
+	kialiURL   string
+	httpClient *http.Client
+	transport  *http.Transport
+}
+
+type MCPResponse struct {
+	Body       []byte
+	StatusCode int
+	Parsed     map[string]interface{}
+}
+
+func init() {
+	mcpClient = newMCPClient()
+}
+
+func newMCPClient() *MCPClient {
+	url := strings.TrimRight(os.Getenv("URL"), "/")
+	if url == "" {
+		log.Fatalf("URL environment variable is required.")
+	}
+	transport := &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	}
+	return &MCPClient{
+		kialiURL: url,
+		httpClient: &http.Client{
+			Timeout:   MCPTimeout,
+			Transport: transport,
+		},
+		transport: transport,
+	}
+}
+
+func mcpToolURL(toolName string) string {
+	return fmt.Sprintf("%s/api/chat/mcp/%s", mcpClient.kialiURL, toolName)
+}
+
+func isTransientMCPError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "context deadline exceeded") ||
+		strings.Contains(msg, "Client.Timeout") ||
+		strings.Contains(msg, "connection reset") ||
+		strings.Contains(msg, "connection refused") ||
+		strings.Contains(msg, "EOF")
+}
+
+// mcpRetryWait returns exponential backoff: 2s, 4s, 8s for attempts 1..3.
+func mcpRetryWait(attempt int) time.Duration {
+	return MCPRetryWait * time.Duration(1<<(attempt-1))
+}
+
+func CallMCPTool(toolName string, args map[string]interface{}) (*MCPResponse, error) {
+	var lastErr error
+	for attempt := 1; attempt <= MCPMaxAttempts; attempt++ {
+		resp, err := callMCPToolOnce(toolName, args)
+		if err == nil {
+			return resp, nil
+		}
+		lastErr = err
+		if attempt < MCPMaxAttempts && isTransientMCPError(err) {
+			// Drop poisoned keep-alive connections so the next attempt opens a fresh one.
+			mcpClient.transport.CloseIdleConnections()
+			wait := mcpRetryWait(attempt)
+			log.Warningf("MCP tool %q attempt %d/%d failed with transient error, retrying in %s: %v",
+				toolName, attempt, MCPMaxAttempts, wait, err)
+			time.Sleep(wait)
+			continue
+		}
+		return nil, err
+	}
+	return nil, lastErr
+}
+
+func callMCPToolOnce(toolName string, args map[string]interface{}) (*MCPResponse, error) {
+	var body []byte
+	var err error
+	if args != nil {
+		body, err = json.Marshal(args)
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal args: %w", err)
+		}
+	} else {
+		body = []byte("{}")
+	}
+
+	url := mcpToolURL(toolName)
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	httpResp, err := mcpClient.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("POST %s failed: %w", url, err)
+	}
+	defer httpResp.Body.Close()
+
+	respBody, err := io.ReadAll(httpResp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response: %w", err)
+	}
+
+	resp := &MCPResponse{
+		Body:       respBody,
+		StatusCode: httpResp.StatusCode,
+	}
+
+	if len(respBody) > 0 {
+		_ = json.Unmarshal(respBody, &resp.Parsed)
+	}
+
+	return resp, nil
+}
+
+func CallMCPToolEmptyBody(toolName string) (*MCPResponse, error) {
+	return CallMCPTool(toolName, nil)
+}

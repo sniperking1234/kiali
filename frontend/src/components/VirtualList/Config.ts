@@ -1,0 +1,333 @@
+import * as React from 'react';
+import deepFreeze from 'deep-freeze';
+import { PopoverPosition } from '@patternfly/react-core';
+import { Th } from '@patternfly/react-table';
+import { AppListItem } from '../../types/AppList';
+import { AppWorkload } from 'types/App';
+import { WorkloadListItem, Workload } from '../../types/Workload';
+import { ServiceListItem } from '../../types/ServiceList';
+import { dicTypeToGVK, IstioConfigItem } from '../../types/IstioConfigList';
+import * as Renderers from './Renderers';
+import { Health } from '../../types/Health';
+import { isIstioNamespace, serverConfig } from 'config/ServerConfig';
+import { NamespaceInfo } from '../../types/NamespaceInfo';
+import { StatefulFiltersRef } from '../Filters/StatefulFilters';
+import { PFBadges, PFBadgeType } from '../../components/Pf/PfBadges';
+import { getGVKTypeString, kindToStringIncludeK8s } from '../../utils/IstioConfigUtils';
+import { TypePopoverBody, TypePopoverHeader } from '../../pages/Namespaces/TypeHeader';
+import { HealthPopoverBody, HealthPopoverHeader } from '../../pages/Namespaces/HealthHeader';
+
+export type SortResource = AppListItem | WorkloadListItem | ServiceListItem;
+export type TResource = SortResource | IstioConfigItem;
+export type RenderResource = TResource | NamespaceInfo;
+export type Renderer<R extends RenderResource> = (
+  item: R,
+  config: Resource,
+  badge: PFBadgeType,
+  health?: Health,
+  statefulFilter?: StatefulFiltersRef
+) => JSX.Element | undefined;
+
+// Health type guard
+export const hasHealth = (r: RenderResource): r is SortResource => {
+  return (r as SortResource).health !== undefined;
+};
+
+export const hasMissingSidecar = (workload: Workload | WorkloadListItem | AppWorkload | AppListItem): boolean => {
+  const isSpireServer = workload.spireInfo?.isSpireServer ?? false;
+  return (
+    (!serverConfig.ambientEnabled &&
+      !workload.istioSidecar &&
+      !workload.isGateway &&
+      !isSpireServer &&
+      !isIstioNamespace(workload.namespace)) ||
+    (serverConfig.ambientEnabled &&
+      !workload.isAmbient &&
+      !workload.istioSidecar &&
+      !isSpireServer &&
+      !workload.isWaypoint &&
+      !workload.isGateway &&
+      !isIstioNamespace(workload.namespace))
+  );
+};
+
+export const noAmbientLabels = (r: SortResource): boolean => {
+  return !isIstioNamespace(r.namespace) && !r.isAmbient;
+};
+
+export type ResourceType<R extends RenderResource> = {
+  /** Stable id for column order and hidden columns (optional; falls back to name.toLowerCase()). */
+  id?: string;
+  info?: React.ComponentProps<typeof Th>['info'];
+  name: string;
+  param?: string;
+  renderer?: Renderer<R>;
+  sortable: boolean;
+  textCenter?: boolean;
+  title: string;
+  width?: 10 | 15 | 20 | 25 | 30 | 35 | 40 | 45 | 50 | 60 | 70 | 80 | 90 | 100;
+};
+
+// NamespaceInfo
+const istioConfiguration: ResourceType<NamespaceInfo> = {
+  id: 'istioconfiguration',
+  name: 'IstioConfiguration',
+  param: 'ic',
+  title: 'Istio config',
+  sortable: true,
+  renderer: Renderers.istioConfig
+};
+
+// General
+const item: ResourceType<TResource> = {
+  id: 'name',
+  name: 'Item',
+  param: 'wn',
+  title: 'Name',
+  sortable: true,
+  width: 25,
+  renderer: Renderers.item
+};
+
+const serviceItem: ResourceType<ServiceListItem> = {
+  id: 'name',
+  name: 'Item',
+  param: 'sn',
+  title: 'Name',
+  sortable: true,
+  width: 20,
+  renderer: Renderers.item
+};
+
+const istioItem: ResourceType<IstioConfigItem> = {
+  id: 'name',
+  name: 'Item',
+  param: 'in',
+  title: 'Name',
+  sortable: true,
+  width: 25,
+  renderer: Renderers.item
+};
+
+const cluster: ResourceType<TResource> = {
+  id: 'cluster',
+  name: 'Cluster',
+  param: 'cl',
+  title: 'Cluster',
+  sortable: true,
+  renderer: Renderers.cluster
+};
+
+const namespace: ResourceType<TResource> = {
+  id: 'namespace',
+  name: 'Namespace',
+  param: 'ns',
+  title: 'Namespace',
+  sortable: true,
+  renderer: Renderers.namespace
+};
+
+const labels: ResourceType<RenderResource> = {
+  id: 'labels',
+  name: 'Labels',
+  param: 'lb',
+  title: 'Labels',
+  sortable: false,
+  width: 10,
+  renderer: Renderers.labels
+};
+
+const health: ResourceType<TResource> = {
+  id: 'health',
+  name: 'Health',
+  param: 'he',
+  title: 'Health',
+  sortable: true,
+  width: 10,
+  renderer: Renderers.health
+};
+
+const details: ResourceType<AppListItem | WorkloadListItem | ServiceListItem> = {
+  id: 'details',
+  name: 'Details',
+  param: 'is',
+  title: 'Details',
+  sortable: true,
+  renderer: Renderers.details
+};
+
+const serviceConfiguration: ResourceType<ServiceListItem> = {
+  id: 'configuration',
+  name: 'Configuration',
+  param: 'cv',
+  title: 'Configuration',
+  sortable: true,
+  renderer: Renderers.serviceConfiguration
+};
+
+const istioObjectConfiguration: ResourceType<IstioConfigItem> = {
+  id: 'configuration',
+  name: 'Configuration',
+  param: 'cv',
+  title: 'Configuration',
+  sortable: true,
+  renderer: Renderers.istioConfiguration
+};
+
+const workloadType: ResourceType<WorkloadListItem> = {
+  id: 'type',
+  name: 'WorkloadType',
+  param: 'wt',
+  title: 'Type',
+  sortable: true,
+  renderer: Renderers.workloadType
+};
+
+const istioType: ResourceType<IstioConfigItem> = {
+  id: 'type',
+  name: 'IstioType',
+  param: 'it',
+  title: 'Type',
+  sortable: true,
+  renderer: Renderers.istioType
+};
+
+export const GVKToBadge: { [gvk: string]: PFBadgeType } = {};
+
+Object.values(dicTypeToGVK).forEach(value => {
+  GVKToBadge[getGVKTypeString(value)] = PFBadges[kindToStringIncludeK8s(value.Group, value.Kind)];
+});
+
+export type Resource = {
+  badge?: PFBadgeType;
+  caption?: string;
+  columns: ResourceType<any>[];
+  name: string;
+};
+
+const namespacesHealth: ResourceType<NamespaceInfo> = {
+  id: 'health',
+  info: {
+    popover: React.createElement(HealthPopoverBody),
+    popoverProps: {
+      headerContent: React.createElement(HealthPopoverHeader),
+      position: PopoverPosition.top
+    }
+  },
+  name: 'Health',
+  param: 'h',
+  renderer: Renderers.nsHealth,
+  sortable: true,
+  title: 'Health',
+  width: 10
+};
+
+const typeNamespaces: ResourceType<NamespaceInfo> = {
+  id: 'type',
+  info: {
+    popover: React.createElement(TypePopoverBody),
+    popoverProps: {
+      headerContent: React.createElement(TypePopoverHeader),
+      position: PopoverPosition.top
+    }
+  },
+  name: 'Type',
+  param: 'type',
+  renderer: Renderers.nsType,
+  sortable: true,
+  title: 'Type'
+};
+
+const modeNamespaces: ResourceType<NamespaceInfo> = {
+  id: 'mode',
+  name: 'Mode',
+  param: 'mode',
+  renderer: Renderers.nsMode,
+  sortable: true,
+  title: 'Mode'
+};
+
+const revisionNamespaces: ResourceType<NamespaceInfo> = {
+  id: 'revision',
+  name: 'Revision',
+  param: 'rev',
+  renderer: Renderers.nsRevision,
+  sortable: true,
+  title: 'Revision'
+};
+
+const nsItemNamespaces: ResourceType<NamespaceInfo> = {
+  id: 'namespace',
+  name: 'Namespace',
+  param: 'ns',
+  renderer: Renderers.nsItem,
+  sortable: true,
+  title: 'Namespace',
+  width: 15
+};
+
+const tlsStatusNamespaces: ResourceType<NamespaceInfo> = {
+  id: 'mtls',
+  name: 'mTLS',
+  param: 'm',
+  renderer: Renderers.nsTls,
+  sortable: true,
+  title: 'mTLS'
+};
+
+const namespacesList: Resource = {
+  name: 'namespaces',
+  columns: [
+    nsItemNamespaces,
+    typeNamespaces,
+    modeNamespaces,
+    revisionNamespaces,
+    cluster,
+    namespacesHealth,
+    tlsStatusNamespaces,
+    istioConfiguration,
+    labels
+  ],
+  badge: PFBadges.Namespace
+};
+
+const workloads: Resource = {
+  name: 'workloads',
+  columns: [health, item, namespace, cluster, workloadType, labels, details],
+  badge: PFBadges.Workload
+};
+
+const applications: Resource = {
+  name: 'applications',
+  columns: [health, item, namespace, cluster, labels, details],
+  badge: PFBadges.App
+};
+
+const services: Resource = {
+  name: 'services',
+  columns: [health, serviceItem, namespace, cluster, labels, serviceConfiguration, details],
+  badge: PFBadges.Service
+};
+
+const istio: Resource = {
+  name: 'istio',
+  columns: [istioItem, namespace, cluster, istioType, istioObjectConfiguration]
+};
+
+type Config = {
+  applications: Resource;
+  istio: Resource;
+  namespaces: Resource;
+  services: Resource;
+  workloads: Resource;
+};
+
+const conf: Config = {
+  applications: applications,
+  istio: istio,
+  namespaces: namespacesList,
+  services: services,
+  workloads: workloads
+};
+
+export const config: Config = deepFreeze(conf) as typeof conf;

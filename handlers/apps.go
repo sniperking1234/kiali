@@ -4,48 +4,154 @@ import (
 	"net/http"
 
 	"github.com/gorilla/mux"
+
+	"github.com/kiali/kiali/business"
+	"github.com/kiali/kiali/cache"
+	"github.com/kiali/kiali/config"
+	"github.com/kiali/kiali/grafana"
+	"github.com/kiali/kiali/handlers/queryparams"
+	"github.com/kiali/kiali/istio"
+	"github.com/kiali/kiali/kubernetes"
+	"github.com/kiali/kiali/log"
+	"github.com/kiali/kiali/models"
+	"github.com/kiali/kiali/prometheus"
+	"github.com/kiali/kiali/tracing"
 )
 
-// AppList is the API handler to fetch all the apps to be displayed, related to a single namespace
-func AppList(w http.ResponseWriter, r *http.Request) {
-	params := mux.Vars(r)
+// appParams holds the path and query parameters for appList and appDetails
+//
+// swagger:parameters appList AppDetails
+type appParams struct {
+	baseHealthParams
+	AppName string `json:"app"`
+	// Optional
+	IncludeHealth         bool `json:"health"`
+	IncludeIstioResources bool `json:"istioResources"`
+}
 
-	// Get business layer
-	business, err := getBusiness(r)
+// Package-level schema — documents the app list/details query contract.
+var appQueryParams = []queryparams.Param{
+	queryparams.BoolParam("health", true),
+	queryparams.BoolParam("istioResources", true),
+	queryparams.StringParam("namespaces", ""),
+}
+
+func (p *appParams) extract(r *http.Request, conf *config.Config) error {
+	vars := mux.Vars(r)
+	result, err := p.parseSchema(conf, r, appQueryParams...)
 	if err != nil {
-		RespondWithError(w, http.StatusInternalServerError, "Apps initialization error: "+err.Error())
-		return
+		return err
 	}
-	namespace := params["namespace"]
+	p.Namespace = vars["namespace"]
+	p.AppName = vars["app"]
+	p.IncludeHealth = result.Bool("health")
+	p.IncludeIstioResources = result.Bool("istioResources")
+	return nil
+}
 
-	// Fetch and build apps
-	appList, err := business.App.GetAppList(namespace)
-	if err != nil {
-		handleErrorResponse(w, err)
-		return
+// ClusterApps is the API handler to fetch all the apps to be displayed, related to a single cluster
+func ClusterApps(
+	conf *config.Config,
+	kialiCache cache.KialiCache,
+	clientFactory kubernetes.ClientFactory,
+	prom prometheus.ClientInterface,
+	cpm business.ControlPlaneMonitor,
+	traceClientLoader func() tracing.ClientInterface,
+	grafana *grafana.Service,
+	discovery *istio.Discovery,
+) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		log.FromRequest(r).Debug().Msg("Fetching all apps in single cluster")
+		query := r.URL.Query()
+		namespacesQueryParam := query.Get("namespaces") // csl of namespaces
+		p := appParams{}
+		if err := p.extract(r, conf); err != nil {
+			RespondWithQueryParamError(w, err.Error())
+			return
+		}
+
+		businessLayer, err := getLayer(r, conf, kialiCache, clientFactory, cpm, prom, traceClientLoader, grafana, discovery)
+		if err != nil {
+			RespondWithError(w, http.StatusInternalServerError, "Apps initialization error: "+err.Error())
+			return
+		}
+
+		// The accessible namespace names for the cluster, narrowed to the
+		// namespaces query parameter when it is set (fail closed on error).
+		nss, ok := accessibleNamespaceNames(w, r.Context(), businessLayer, p.ClusterName, namespacesQueryParam)
+		if !ok {
+			return
+		}
+
+		clusterAppsList := &models.ClusterApps{
+			Apps:    []models.AppListItem{},
+			Cluster: p.ClusterName,
+		}
+
+		for _, ns := range nss {
+			criteria := business.AppCriteria{
+				Cluster: p.ClusterName, IncludeHealth: p.IncludeHealth, IncludeIstioResources: p.IncludeIstioResources,
+				Namespace: ns, QueryTime: p.QueryTime, RateInterval: p.RateInterval,
+			}
+
+			if p.IncludeHealth {
+				rateInterval, err := adjustRateInterval(r.Context(), businessLayer, ns, p.RateInterval, p.QueryTime, p.ClusterName)
+				if err != nil {
+					handleErrorResponse(w, err, "Adjust rate interval error: "+err.Error())
+					return
+				}
+				criteria.RateInterval = rateInterval
+			}
+
+			// Fetch and build apps
+			appList, err := businessLayer.App.GetClusterAppList(r.Context(), criteria)
+			if err != nil {
+				handleErrorResponse(w, err)
+				return
+			}
+			clusterAppsList.Apps = append(clusterAppsList.Apps, appList.Apps...)
+		}
+
+		RespondWithJSON(w, http.StatusOK, clusterAppsList)
 	}
-
-	RespondWithJSON(w, http.StatusOK, appList)
 }
 
 // AppDetails is the API handler to fetch all details to be displayed, related to a single app
-func AppDetails(w http.ResponseWriter, r *http.Request) {
-	params := mux.Vars(r)
-	// Get business layer
-	business, err := getBusiness(r)
-	if err != nil {
-		RespondWithError(w, http.StatusInternalServerError, "Services initialization error: "+err.Error())
-		return
-	}
-	namespace := params["namespace"]
-	app := params["app"]
+func AppDetails(
+	conf *config.Config,
+	kialiCache cache.KialiCache,
+	clientFactory kubernetes.ClientFactory,
+	prom prometheus.ClientInterface,
+	cpm business.ControlPlaneMonitor,
+	traceClientLoader func() tracing.ClientInterface,
+	grafana *grafana.Service,
+	discovery *istio.Discovery,
+) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		p := appParams{}
+		if err := p.extract(r, conf); err != nil {
+			RespondWithQueryParamError(w, err.Error())
+			return
+		}
 
-	// Fetch and build app
-	appDetails, err := business.App.GetApp(namespace, app)
-	if err != nil {
-		handleErrorResponse(w, err)
-		return
-	}
+		criteria := business.AppCriteria{
+			Namespace: p.Namespace, AppName: p.AppName, IncludeIstioResources: p.IncludeIstioResources, IncludeHealth: p.IncludeHealth,
+			RateInterval: p.RateInterval, QueryTime: p.QueryTime, Cluster: p.ClusterName,
+		}
 
-	RespondWithJSON(w, http.StatusOK, appDetails)
+		business, err := getLayer(r, conf, kialiCache, clientFactory, cpm, prom, traceClientLoader, grafana, discovery)
+		if err != nil {
+			RespondWithError(w, http.StatusInternalServerError, "Services initialization error: "+err.Error())
+			return
+		}
+
+		// Fetch and build app
+		appDetails, err := business.App.GetAppDetails(r.Context(), criteria)
+		if err != nil {
+			handleErrorResponse(w, err)
+			return
+		}
+
+		RespondWithJSON(w, http.StatusOK, appDetails)
+	}
 }

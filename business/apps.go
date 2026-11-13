@@ -1,27 +1,58 @@
 package business
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
-	core_v1 "k8s.io/api/core/v1"
+	"golang.org/x/exp/slices"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/labels"
 
+	"github.com/kiali/kiali/cache"
 	"github.com/kiali/kiali/config"
+	"github.com/kiali/kiali/grafana"
 	"github.com/kiali/kiali/kubernetes"
 	"github.com/kiali/kiali/log"
 	"github.com/kiali/kiali/models"
+	"github.com/kiali/kiali/observability"
 	"github.com/kiali/kiali/prometheus"
 	"github.com/kiali/kiali/prometheus/internalmetrics"
+	"github.com/kiali/kiali/util/sliceutil"
 )
+
+func NewAppService(businessLayer *Layer, conf *config.Config, kialiCache cache.KialiCache, prom prometheus.ClientInterface, grafana *grafana.Service, userClients map[string]kubernetes.UserClientInterface) AppService {
+	return AppService{
+		businessLayer: businessLayer,
+		conf:          conf,
+		grafana:       grafana,
+		kialiCache:    kialiCache,
+		prom:          prom,
+		userClients:   userClients,
+	}
+}
 
 // AppService deals with fetching Workloads group by "app" label, which will be identified as an "application"
 type AppService struct {
-	prom          prometheus.ClientInterface
-	k8s           kubernetes.ClientInterface
 	businessLayer *Layer
+	conf          *config.Config
+	grafana       *grafana.Service
+	kialiCache    cache.KialiCache
+	prom          prometheus.ClientInterface
+	userClients   map[string]kubernetes.UserClientInterface
+}
+
+type AppCriteria struct {
+	AppName               string
+	Cluster               string
+	IncludeHealth         bool
+	IncludeIstioResources bool
+	Namespace             string
+	QueryTime             time.Time
+	RateInterval          string
 }
 
 func joinMap(m1 map[string][]string, m2 map[string]string) {
@@ -48,53 +79,388 @@ func buildFinalLabels(m map[string][]string) map[string]string {
 	return consolidated
 }
 
-// GetAppList is the API handler to fetch the list of applications in a given namespace
-func (in *AppService) GetAppList(namespace string) (models.AppList, error) {
-	var err error
-	promtimer := internalmetrics.GetGoFunctionMetric("business", "AppService", "GetAppList")
-	defer promtimer.ObserveNow(&err)
+// GetClusterAppList is the API handler to fetch the list of applications in a given namespace and cluster
+func (in *AppService) GetClusterAppList(ctx context.Context, criteria AppCriteria) (models.ClusterApps, error) {
+	var end observability.EndFunc
+	ctx, end = observability.StartSpan(ctx, "GetClusterAppList",
+		observability.Attribute("package", "business"),
+		observability.Attribute("namespace", criteria.Namespace),
+		observability.Attribute(observability.TracingClusterTag, criteria.Cluster),
+		observability.Attribute("includeHealth", criteria.IncludeHealth),
+		observability.Attribute("includeIstioResources", criteria.IncludeIstioResources),
+		observability.Attribute("rateInterval", criteria.RateInterval),
+		observability.Attribute("queryTime", criteria.QueryTime),
+	)
+	defer end()
 
-	appList := &models.AppList{
-		Namespace: models.Namespace{Name: namespace},
-		Apps:      []models.AppListItem{},
+	appList := &models.ClusterApps{
+		Apps: []models.AppListItem{},
 	}
-	apps, err := fetchNamespaceApps(in.businessLayer, namespace, "")
-	if err != nil {
+
+	namespace := criteria.Namespace
+	cluster := criteria.Cluster
+
+	if _, ok := in.userClients[cluster]; !ok {
+		return *appList, fmt.Errorf("Cluster [%s] is not found or is not accessible for Kiali", cluster)
+	}
+
+	if _, err := in.businessLayer.Namespace.GetClusterNamespace(ctx, namespace, cluster); err != nil {
 		return *appList, err
 	}
 
-	for keyApp, valueApp := range apps {
+	allApps, err := in.businessLayer.App.fetchNamespaceApps(ctx, namespace, cluster, "")
+	if err != nil {
+		log.Errorf("Error fetching Applications for cluster [%s] per namespace [%s]: %s", cluster, namespace, err)
+		return *appList, err
+	}
+
+	icCriteria := IstioConfigCriteria{
+		IncludeAuthorizationPolicies:  true,
+		IncludeDestinationRules:       true,
+		IncludeEnvoyFilters:           true,
+		IncludeGateways:               true,
+		IncludePeerAuthentications:    true,
+		IncludeRequestAuthentications: true,
+		IncludeSidecars:               true,
+		IncludeVirtualServices:        true,
+		IncludeWorkloadGroups:         true,
+	}
+	istioConfigList := &models.IstioConfigList{}
+
+	if criteria.IncludeIstioResources {
+		istioConfigList, err = in.businessLayer.IstioConfig.GetIstioConfigListForNamespace(ctx, cluster, namespace, icCriteria)
+		if err != nil {
+			log.Errorf("Error fetching Istio Config for Cluster [%s] per namespace [%s]: %s", cluster, namespace, err)
+			return *appList, err
+		}
+	}
+
+	// Try to get cached health for this namespace
+	var cachedHealth *models.CachedHealthData
+	if criteria.IncludeHealth {
+		cachedHealth, _ = in.kialiCache.GetHealth(cluster, namespace, internalmetrics.HealthTypeApp)
+	}
+
+	identityDomain := resolveIdentityDomainWithLayer(ctx, in.businessLayer, cluster, in.conf.ExternalServices.Istio.IstioIdentityDomain)
+	for keyApp, valueApp := range allApps {
 		appItem := &models.AppListItem{
-			Name:         keyApp,
-			IstioSidecar: true,
+			Name:   keyApp,
+			Health: models.EmptyAppHealth(),
 		}
-		labels := make(map[string][]string)
+		applabels := make(map[string][]string)
+		svcReferences := make([]*models.IstioValidationKey, 0)
 		for _, srv := range valueApp.Services {
-			joinMap(labels, srv.Labels)
+			joinMap(applabels, srv.Labels)
+			if criteria.IncludeIstioResources {
+				vsFiltered := kubernetes.FilterVirtualServicesByService(istioConfigList.VirtualServices, srv.Namespace, srv.Name, identityDomain)
+				for _, v := range vsFiltered {
+					ref := models.BuildKey(kubernetes.VirtualServices, v.Name, v.Namespace, cluster)
+					svcReferences = append(svcReferences, &ref)
+				}
+				drFiltered := kubernetes.FilterDestinationRulesByService(istioConfigList.DestinationRules, srv.Namespace, srv.Name, identityDomain)
+				for _, d := range drFiltered {
+					ref := models.BuildKey(kubernetes.DestinationRules, d.Name, d.Namespace, cluster)
+					svcReferences = append(svcReferences, &ref)
+				}
+				gwFiltered := kubernetes.FilterGatewaysByVirtualServices(istioConfigList.Gateways, istioConfigList.VirtualServices)
+				for _, g := range gwFiltered {
+					ref := models.BuildKey(kubernetes.Gateways, g.Name, g.Namespace, cluster)
+					svcReferences = append(svcReferences, &ref)
+				}
+
+			}
+
 		}
+
+		wkdReferences := make([]*models.IstioValidationKey, 0)
 		for _, wrk := range valueApp.Workloads {
-			joinMap(labels, wrk.Labels)
-		}
-		appItem.Labels = buildFinalLabels(labels)
-		for _, w := range valueApp.Workloads {
-			if appItem.IstioSidecar = w.IstioSidecar; !appItem.IstioSidecar {
-				break
+			joinMap(applabels, wrk.Labels)
+			if criteria.IncludeIstioResources {
+				wkdReferences = append(wkdReferences, FilterWorkloadReferences(in.conf, wrk.Labels, *istioConfigList, cluster)...)
 			}
 		}
-		(*appList).Apps = append((*appList).Apps, *appItem)
+		appItem.Labels = buildFinalLabels(applabels)
+		appItem.IstioReferences = FilterUniqueIstioReferences(append(svcReferences, wkdReferences...))
+
+		for _, w := range valueApp.Workloads {
+			// If any workload has these properties then consider the whole app to have them.
+			// If some worklodas have a sidecar and some don't for example then all workloads will be
+			// considered to have a sidecar, ambient, gateway etc.
+			if w.IstioSidecar {
+				appItem.IstioSidecar = true
+			}
+			if w.HasIstioAmbient() {
+				appItem.IsAmbient = true
+			}
+			if w.IsGatewayWorkload() {
+				appItem.IsGateway = true
+			}
+		}
+		if criteria.IncludeHealth {
+			// Try cache first, fall back to on-demand calculation
+			if cachedHealth != nil {
+				if health, found := cachedHealth.AppHealth[appItem.Name]; found {
+					appItem.Health = *health
+				} else {
+					// Cache miss for this specific app - compute on-demand (also updates cache)
+					log.Debugf("App health cache miss for cluster=%s namespace=%s app=%s", cluster, namespace, appItem.Name)
+					appItem.Health, err = in.businessLayer.Health.GetAppHealth(ctx, namespace, cluster, appItem.Name, criteria.RateInterval, criteria.QueryTime, valueApp)
+					if err != nil {
+						log.Errorf("Error fetching Health in namespace %s for app %s: %s", namespace, appItem.Name, err)
+					}
+				}
+			} else {
+				// No cached data for namespace - compute on-demand (also updates cache)
+				log.Debugf("App health cache miss (no namespace data) for cluster=%s namespace=%s app=%s", cluster, namespace, appItem.Name)
+				appItem.Health, err = in.businessLayer.Health.GetAppHealth(ctx, namespace, cluster, appItem.Name, criteria.RateInterval, criteria.QueryTime, valueApp)
+				if err != nil {
+					log.Errorf("Error fetching Health in namespace %s for app %s: %s", namespace, appItem.Name, err)
+				}
+			}
+		}
+		appItem.Cluster = cluster
+		appItem.Namespace = namespace
+		appList.Apps = append(appList.Apps, *appItem)
+	}
+
+	return *appList, nil
+}
+
+// GetAppList is the API handler to fetch the list of applications in a given namespace
+func (in *AppService) GetAppList(ctx context.Context, criteria AppCriteria) (models.AppList, error) {
+	var end observability.EndFunc
+	ctx, end = observability.StartSpan(ctx, "GetAppList",
+		observability.Attribute("package", "business"),
+		observability.Attribute("namespace", criteria.Namespace),
+		observability.Attribute(observability.TracingClusterTag, criteria.Cluster),
+		observability.Attribute("includeHealth", criteria.IncludeHealth),
+		observability.Attribute("includeIstioResources", criteria.IncludeIstioResources),
+		observability.Attribute("rateInterval", criteria.RateInterval),
+		observability.Attribute("queryTime", criteria.QueryTime),
+	)
+	defer end()
+
+	appList := &models.AppList{
+		Namespace: models.Namespace{Name: criteria.Namespace},
+		Cluster:   criteria.Cluster,
+		Apps:      []models.AppListItem{},
+	}
+
+	var err error
+	var allApps []namespaceApps
+
+	// Avoid cross-cluster fan-out and redundant Istio config fetches when the caller
+	// already knows which cluster it wants.
+	if criteria.Cluster != "" {
+		if _, ok := in.userClients[criteria.Cluster]; !ok {
+			return *appList, fmt.Errorf("Cluster [%s] is not found or is not accessible for Kiali", criteria.Cluster)
+		}
+		nsApps, err2 := in.fetchNamespaceApps(ctx, criteria.Namespace, criteria.Cluster, "")
+		if err2 != nil {
+			return models.AppList{}, err2
+		}
+		allApps = append(allApps, nsApps)
+	} else {
+		wg := &sync.WaitGroup{}
+		type result struct {
+			cluster string
+			nsApps  namespaceApps
+			err     error
+		}
+		resultsCh := make(chan result)
+
+		go func() {
+			for cluster := range in.userClients {
+				wg.Add(1)
+				go func(c string) {
+					defer wg.Done()
+					nsApps, error2 := in.fetchNamespaceApps(ctx, criteria.Namespace, c, "")
+					if error2 != nil {
+						resultsCh <- result{cluster: c, nsApps: nil, err: error2}
+					} else {
+						resultsCh <- result{cluster: c, nsApps: nsApps, err: nil}
+					}
+				}(cluster)
+			}
+			wg.Wait()
+			close(resultsCh)
+		}()
+
+		for resultCh := range resultsCh {
+			if resultCh.err != nil {
+				if resultCh.cluster == in.conf.KubernetesConfig.ClusterName && len(in.userClients) == 1 {
+					log.Errorf("Error fetching Applications for local cluster [%s]: %s", resultCh.cluster, resultCh.err)
+					return models.AppList{}, resultCh.err
+				} else {
+					log.Infof("Error fetching Applications for cluster [%s]: %s", resultCh.cluster, resultCh.err)
+				}
+			}
+			allApps = append(allApps, resultCh.nsApps)
+		}
+	}
+
+	icCriteria := IstioConfigCriteria{
+		IncludeAuthorizationPolicies:  true,
+		IncludeDestinationRules:       true,
+		IncludeEnvoyFilters:           true,
+		IncludeGateways:               true,
+		IncludePeerAuthentications:    true,
+		IncludeRequestAuthentications: true,
+		IncludeSidecars:               true,
+		IncludeVirtualServices:        true,
+		IncludeWorkloadGroups:         true,
+	}
+
+	var istioConfigMap models.IstioConfigMap
+	if criteria.IncludeIstioResources {
+		if criteria.Cluster != "" {
+			icl, err2 := in.businessLayer.IstioConfig.GetIstioConfigListForCluster(ctx, criteria.Cluster, criteria.Namespace, icCriteria)
+			if err2 != nil {
+				log.Errorf("Error fetching Istio Config per namespace %s: %s", criteria.Namespace, err2)
+				return models.AppList{}, err2
+			}
+			istioConfigMap = models.IstioConfigMap{criteria.Cluster: *icl}
+		} else {
+			// TODO: MC - when multi-cluster validations are implemented, this path
+			// should also scope Istio config per-cluster for validation purposes.
+			istioConfigMap, err = in.businessLayer.IstioConfig.GetIstioConfigMap(ctx, criteria.Namespace, icCriteria)
+			if err != nil {
+				log.Errorf("Error fetching Istio Config per namespace %s: %s", criteria.Namespace, err)
+				return models.AppList{}, err
+			}
+		}
+	}
+
+	// Pre-fetch cached health for namespaces we'll be processing
+	cachedHealthByCluster := make(map[string]*models.CachedHealthData)
+	if criteria.IncludeHealth {
+		for _, clusterApps := range allApps {
+			for _, valueApp := range clusterApps {
+				if _, exists := cachedHealthByCluster[valueApp.cluster]; !exists {
+					cachedHealth, _ := in.kialiCache.GetHealth(valueApp.cluster, criteria.Namespace, internalmetrics.HealthTypeApp)
+					cachedHealthByCluster[valueApp.cluster] = cachedHealth
+				}
+			}
+		}
+	}
+
+	for _, clusterApps := range allApps {
+		var clusterIdentityDomain string
+		for keyApp, valueApp := range clusterApps {
+			if clusterIdentityDomain == "" {
+				clusterIdentityDomain = resolveIdentityDomainWithLayer(ctx, in.businessLayer, valueApp.cluster, in.conf.ExternalServices.Istio.IstioIdentityDomain)
+			}
+			appItem := &models.AppListItem{
+				Name:         keyApp,
+				IstioSidecar: true,
+				Health:       models.EmptyAppHealth(),
+			}
+
+			istioConfigList := models.IstioConfigList{}
+			if criteria.IncludeIstioResources {
+				if icl, ok := istioConfigMap[valueApp.cluster]; ok {
+					istioConfigList = icl
+				}
+			}
+
+			applabels := make(map[string][]string)
+			svcReferences := make([]*models.IstioValidationKey, 0)
+			for _, srv := range valueApp.Services {
+				joinMap(applabels, srv.Labels)
+				if criteria.IncludeIstioResources {
+					vsFiltered := kubernetes.FilterVirtualServicesByService(istioConfigList.VirtualServices, srv.Namespace, srv.Name, clusterIdentityDomain)
+					for _, v := range vsFiltered {
+						ref := models.BuildKey(kubernetes.VirtualServices, v.Name, v.Namespace, valueApp.cluster)
+						svcReferences = append(svcReferences, &ref)
+					}
+					drFiltered := kubernetes.FilterDestinationRulesByService(istioConfigList.DestinationRules, srv.Namespace, srv.Name, clusterIdentityDomain)
+					for _, d := range drFiltered {
+						ref := models.BuildKey(kubernetes.DestinationRules, d.Name, d.Namespace, valueApp.cluster)
+						svcReferences = append(svcReferences, &ref)
+					}
+					gwFiltered := kubernetes.FilterGatewaysByVirtualServices(istioConfigList.Gateways, istioConfigList.VirtualServices)
+					for _, g := range gwFiltered {
+						ref := models.BuildKey(kubernetes.Gateways, g.Name, g.Namespace, valueApp.cluster)
+						svcReferences = append(svcReferences, &ref)
+					}
+
+				}
+
+			}
+
+			wkdReferences := make([]*models.IstioValidationKey, 0)
+			for _, wrk := range valueApp.Workloads {
+				joinMap(applabels, wrk.Labels)
+				if criteria.IncludeIstioResources {
+					wkdReferences = append(wkdReferences, FilterWorkloadReferences(in.conf, wrk.Labels, istioConfigList, valueApp.cluster)...)
+				}
+			}
+			appItem.Labels = buildFinalLabels(applabels)
+			appItem.IstioReferences = FilterUniqueIstioReferences(append(svcReferences, wkdReferences...))
+
+			for _, w := range valueApp.Workloads {
+				if appItem.IstioSidecar = w.IstioSidecar; !appItem.IstioSidecar {
+					break
+				}
+			}
+			for _, w := range valueApp.Workloads {
+				if appItem.IsAmbient = w.HasIstioAmbient(); !appItem.IsAmbient {
+					break
+				}
+			}
+			if criteria.IncludeHealth {
+				// Try cache first, fall back to on-demand calculation
+				cachedHealth := cachedHealthByCluster[valueApp.cluster]
+				if cachedHealth != nil {
+					if health, found := cachedHealth.AppHealth[appItem.Name]; found {
+						appItem.Health = *health
+					} else {
+						// Cache miss for this specific app - compute on-demand (also updates cache)
+						log.Debugf("App health cache miss for cluster=%s namespace=%s app=%s", valueApp.cluster, criteria.Namespace, appItem.Name)
+						appItem.Health, err = in.businessLayer.Health.GetAppHealth(ctx, criteria.Namespace, valueApp.cluster, appItem.Name, criteria.RateInterval, criteria.QueryTime, valueApp)
+						if err != nil {
+							log.Errorf("Error fetching Health in namespace %s for app %s: %s", criteria.Namespace, appItem.Name, err)
+						}
+					}
+				} else {
+					// No cached data for namespace - compute on-demand (also updates cache)
+					log.Debugf("App health cache miss (no namespace data) for cluster=%s namespace=%s app=%s", valueApp.cluster, criteria.Namespace, appItem.Name)
+					appItem.Health, err = in.businessLayer.Health.GetAppHealth(ctx, criteria.Namespace, valueApp.cluster, appItem.Name, criteria.RateInterval, criteria.QueryTime, valueApp)
+					if err != nil {
+						log.Errorf("Error fetching Health in namespace %s for app %s: %s", criteria.Namespace, appItem.Name, err)
+					}
+				}
+			}
+			appItem.Cluster = valueApp.cluster
+			appItem.Namespace = criteria.Namespace
+			appList.Apps = append(appList.Apps, *appItem)
+		}
 	}
 
 	return *appList, nil
 }
 
 // GetApp is the API handler to fetch the details for a given namespace and app name
-func (in *AppService) GetApp(namespace string, appName string) (models.App, error) {
-	var err error
-	promtimer := internalmetrics.GetGoFunctionMetric("business", "AppService", "GetApp")
-	defer promtimer.ObserveNow(&err)
+func (in *AppService) GetAppDetails(ctx context.Context, criteria AppCriteria) (models.App, error) {
+	var end observability.EndFunc
+	ctx, end = observability.StartSpan(ctx, "GetApp",
+		observability.Attribute("package", "business"),
+		observability.Attribute("namespace", criteria.Namespace),
+		observability.Attribute(observability.TracingClusterTag, criteria.Cluster),
+		observability.Attribute("appName", criteria.AppName),
+		observability.Attribute("rateInterval", criteria.RateInterval),
+		observability.Attribute("queryTime", criteria.QueryTime),
+	)
+	defer end()
 
-	appInstance := &models.App{Namespace: models.Namespace{Name: namespace}, Name: appName}
-	namespaceApps, err := fetchNamespaceApps(in.businessLayer, namespace, appName)
+	appInstance := &models.App{Namespace: models.Namespace{Name: criteria.Namespace}, Name: criteria.AppName, Health: models.EmptyAppHealth(), Cluster: criteria.Cluster}
+	ns, err := in.businessLayer.Namespace.GetClusterNamespace(ctx, criteria.Namespace, criteria.Cluster)
+	if err != nil {
+		return *appInstance, err
+	}
+	appInstance.Namespace = *ns
+
+	namespaceApps, err := in.fetchNamespaceApps(ctx, criteria.Namespace, criteria.Cluster, criteria.AppName)
 	if err != nil {
 		return *appInstance, err
 	}
@@ -102,27 +468,39 @@ func (in *AppService) GetApp(namespace string, appName string) (models.App, erro
 	var appDetails *appDetails
 	var ok bool
 	// Send a NewNotFound if the app is not found in the deployment list, instead to send an empty result
-	if appDetails, ok = namespaceApps[appName]; !ok {
-		return *appInstance, kubernetes.NewNotFound(appName, "Kiali", "App")
+	if appDetails, ok = namespaceApps[criteria.AppName]; !ok {
+		return *appInstance, kubernetes.NewNotFound(criteria.AppName, "Kiali", "App")
 	}
 
-	(*appInstance).Workloads = make([]models.WorkloadItem, len(appDetails.Workloads))
+	appInstance.Workloads = make([]models.WorkloadItem, len(appDetails.Workloads))
 	for i, wkd := range appDetails.Workloads {
-		wkdSvc := &models.WorkloadItem{WorkloadName: wkd.Name}
-		wkdSvc.IstioSidecar = wkd.IstioSidecar
-		(*appInstance).Workloads[i] = *wkdSvc
+		appInstance.Workloads[i] = models.WorkloadItem{WorkloadName: wkd.Name, Namespace: wkd.Namespace, WorkloadGVK: wkd.WorkloadGVK, IstioSidecar: wkd.IstioSidecar, Labels: wkd.Labels, IsAmbient: wkd.IsAmbient, ServiceAccountNames: wkd.Pods.ServiceAccounts(), SpireInfo: wkd.SpireInfo, WaypointWorkloads: wkd.WaypointWorkloads}
 	}
 
-	(*appInstance).ServiceNames = make([]string, len(appDetails.Services))
+	appInstance.ServiceNames = make([]string, len(appDetails.Services))
 	for i, svc := range appDetails.Services {
-		(*appInstance).ServiceNames[i] = svc.Name
+		appInstance.ServiceNames[i] = svc.Name
 	}
 
 	pods := models.Pods{}
+	isAmbient := len(appDetails.Workloads) > 0
+
 	for _, workload := range appDetails.Workloads {
 		pods = append(pods, workload.Pods...)
+		if !workload.IsAmbient {
+			isAmbient = false
+		}
 	}
-	(*appInstance).Runtimes = NewDashboardsService().GetCustomDashboardRefs(namespace, appName, "", pods)
+
+	appInstance.Runtimes = NewDashboardsService(in.conf, in.grafana, in.prom, ns, nil).GetCustomDashboardRefs(ctx, criteria.Namespace, criteria.AppName, "", pods)
+	if criteria.IncludeHealth {
+		appInstance.Health, err = in.businessLayer.Health.GetAppHealth(ctx, criteria.Namespace, criteria.Cluster, criteria.AppName, criteria.RateInterval, criteria.QueryTime, appDetails)
+		if err != nil {
+			log.FromContext(ctx).Error().Msgf("Error fetching Health in namespace [%s] for app [%s]: %v", criteria.Namespace, criteria.AppName, err)
+		}
+	}
+	appInstance.IsAmbient = isAmbient
+	appInstance.Cluster = appDetails.cluster
 
 	return *appInstance, nil
 }
@@ -130,100 +508,151 @@ func (in *AppService) GetApp(namespace string, appName string) (models.App, erro
 // AppDetails holds Services and Workloads having the same "app" label
 type appDetails struct {
 	app       string
-	Services  []core_v1.Service
+	cluster   string
+	Services  []models.ServiceOverview
 	Workloads models.Workloads
 }
 
-// NamespaceApps is a map of app_name x AppDetails
+// NamespaceApps is a map of app_name and cluster x AppDetails
 type namespaceApps = map[string]*appDetails
 
-func castAppDetails(services []core_v1.Service, ws models.Workloads) namespaceApps {
-	allEntities := make(namespaceApps)
-	appLabel := config.Get().IstioLabels.AppLabelName
-	for _, service := range services {
-		if app, ok := service.Spec.Selector[appLabel]; ok {
-			if appEntities, ok := allEntities[app]; ok {
-				appEntities.Services = append(appEntities.Services, service)
-			} else {
-				allEntities[app] = &appDetails{
-					app:      app,
-					Services: []core_v1.Service{service},
+func castAppDetails(appLabel string, allEntities namespaceApps, ss *models.ServiceList, w *models.Workload, cluster string) {
+	if app, ok := w.Labels[appLabel]; ok {
+		if appEntities, ok := allEntities[app]; ok {
+			appEntities.Workloads = append(appEntities.Workloads, w)
+		} else {
+			allEntities[app] = &appDetails{
+				app:       app,
+				cluster:   cluster,
+				Workloads: models.Workloads{w},
+			}
+		}
+		if ss != nil {
+			for _, service := range ss.Services {
+				if appEntities, ok := allEntities[app]; ok {
+					found := false
+					for _, s := range appEntities.Services {
+						if s.Name == service.Name && s.Namespace == service.Namespace {
+							found = true
+						}
+					}
+					if !found {
+						appEntities.Services = append(appEntities.Services, service)
+					}
 				}
 			}
 		}
 	}
-	for _, w := range ws {
-		if app, ok := w.Labels[appLabel]; ok {
-			if appEntities, ok := allEntities[app]; ok {
-				appEntities.Workloads = append(appEntities.Workloads, w)
-			} else {
-				allEntities[app] = &appDetails{
-					app:       app,
-					Workloads: models.Workloads{w},
-				}
-			}
-		}
-	}
-	return allEntities
 }
 
 // Helper method to fetch all applications for a given namespace.
 // Optionally if appName parameter is provided, it filters apps for that name.
 // Return an error on any problem.
-func fetchNamespaceApps(layer *Layer, namespace string, appName string) (namespaceApps, error) {
-	var services []core_v1.Service
-	var ws models.Workloads
-	cfg := config.Get()
-
-	labelSelector := cfg.IstioLabels.AppLabelName
-	if appName != "" {
-		labelSelector = fmt.Sprintf("%s=%s", cfg.IstioLabels.AppLabelName, appName)
-	}
+func (in *AppService) fetchNamespaceApps(ctx context.Context, namespace string, cluster string, appName string) (namespaceApps, error) {
+	var ss *models.ServiceList
+	var err error
+	ws := map[string]*models.Workload{}
 
 	// Check if user has access to the namespace (RBAC) in cache scenarios and/or
 	// if namespace is accessible from Kiali (Deployment.AccessibleNamespaces)
-	if _, err := layer.Namespace.GetNamespace(namespace); err != nil {
+	if _, err := in.businessLayer.Namespace.GetClusterNamespace(ctx, namespace, cluster); err != nil {
 		return nil, err
 	}
 
-	wg := sync.WaitGroup{}
-	wg.Add(2)
-	errChan := make(chan error, 2)
-
-	go func() {
-		defer wg.Done()
-		var err error
-		// Check if namespace is cached
-		if IsNamespaceCached(namespace) {
-			services, err = kialiCache.GetServices(namespace, nil)
+	appNameSelectors := in.conf.GetAppVersionLabelSelectors(appName, "")
+	for _, appNameSelector := range appNameSelectors {
+		selectedWorkloads, err := in.businessLayer.Workload.GetNamespaceWorkloads(ctx, cluster, namespace, appNameSelector.LabelSelector)
+		if err != nil {
+			return nil, err
+		}
+		// remove ambient infra workloads, which are labeled but not really apps
+		filteredWorkloads := sliceutil.Filter(selectedWorkloads, func(w *models.Workload) bool { return !(w.IsInfra()) })
+		for _, selectedWorkload := range filteredWorkloads {
+			ws[selectedWorkload.Name] = selectedWorkload
+		}
+	}
+	// return in sorted order, doesn't hurt, may help client, and helps test consistency
+	keys := make([]string, 0, len(ws))
+	for k := range ws {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+	allEntities := make(namespaceApps)
+	for _, k := range keys {
+		w := ws[k]
+		// WorkloadGroup.Labels can be empty
+		if len(w.Labels) > 0 {
+			// Check if namespace is cached
+			serviceCriteria := ServiceCriteria{
+				Cluster:                cluster,
+				Namespace:              namespace,
+				IncludeHealth:          false,
+				IncludeIstioResources:  false,
+				IncludeOnlyDefinitions: true,
+				ServiceSelector:        labels.Set(w.Labels).String(),
+			}
+			ss, err = in.businessLayer.Svc.GetServiceList(ctx, serviceCriteria)
+			if err != nil {
+				return nil, err
+			}
 		} else {
-			services, err = layer.k8s.GetServices(namespace, nil)
+			ss = nil
 		}
-		if appName != "" {
-			selector := labels.Set(map[string]string{cfg.IstioLabels.AppLabelName: appName}).AsSelector()
-			services = kubernetes.FilterServicesForSelector(selector, services)
-		}
-		if err != nil {
-			log.Errorf("Error fetching Services per namespace %s: %s", namespace, err)
-			errChan <- err
-		}
-	}()
-
-	go func() {
-		defer wg.Done()
-		var err error
-		ws, err = fetchWorkloads(layer, namespace, labelSelector)
-		if err != nil {
-			log.Errorf("Error fetching Workload per namespace %s: %s", namespace, err)
-			errChan <- err
-		}
-	}()
-
-	wg.Wait()
-	if len(errChan) != 0 {
-		err := <-errChan
-		return nil, err
+		appLabelName, _ := in.conf.GetAppLabelName(w.Labels)
+		castAppDetails(appLabelName, allEntities, ss, w, cluster)
 	}
 
-	return castAppDetails(services, ws), nil
+	return allEntities, nil
+}
+
+// GetAppTracingName returns the tracing app name
+// If the app has any Waypoint, the information is included, as it will be the search name used by the tracing backend
+func (in *AppService) GetAppTracingName(ctx context.Context, cluster, namespace, app string) (models.TracingName, error) {
+	criteria := AppCriteria{
+		Namespace: namespace, AppName: app, IncludeIstioResources: false, IncludeHealth: false, Cluster: cluster,
+	}
+
+	tracingName := models.TracingName{App: app, Lookup: app}
+	// Fetch and build app
+	appDetails, err := in.GetAppDetails(ctx, criteria)
+	if err != nil {
+		// NotFound keeps the caller-supplied fallback: GetAppDetails returns
+		// NotFound when no workload carries the app label, which covers apps
+		// scaled to zero, recently deleted apps (traces outlive them) and VM
+		// apps without WorkloadEntries. The namespace is authorized by the
+		// handler gate before this runs, and the traces returned for the
+		// fallback name are authorized per trace against the requested
+		// namespace (see filterTracesByNamespace), so a caller-supplied name
+		// that carries another namespace's identity domain cannot use the
+		// fallback to reach that namespace's traces. Any other error
+		// (including an access denial) must propagate: returning the raw
+		// caller-supplied name here would fail open.
+		if !k8serrors.IsNotFound(err) {
+			return models.TracingName{}, err
+		}
+		return tracingName, nil
+	}
+	for _, wk := range appDetails.Workloads {
+		if len(wk.WaypointWorkloads) > 0 {
+			if in.conf.ExternalServices.Tracing.UseWaypointName {
+				// Assuming that all the workloads from the app have the same waypoint
+				// But, could be wrong
+				tracingName.WaypointName = wk.WaypointWorkloads[0].Name
+				tracingName.WaypointNamespace = wk.WaypointWorkloads[0].Namespace
+				tracingName.Lookup = tracingName.WaypointName
+			} else if len(appDetails.ServiceNames) > 0 {
+				identityDomain := resolveIdentityDomainWithLayer(ctx, in.businessLayer, cluster, in.conf.ExternalServices.Istio.IstioIdentityDomain)
+				lookupName := ""
+				if in.conf.ExternalServices.Tracing.NamespaceSelector {
+					lookupName = fmt.Sprintf("%s.%s.%s", appDetails.ServiceNames[0], namespace, identityDomain)
+				} else {
+					lookupName = fmt.Sprintf("%s.%s", appDetails.ServiceNames[0], identityDomain)
+				}
+				tracingName.Lookup = lookupName
+				tracingName.WaypointName = lookupName
+			}
+			break
+		}
+	}
+	return tracingName, nil
 }

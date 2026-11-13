@@ -1,0 +1,63 @@
+import * as React from 'react';
+import type { ObjectCheck} from '../../types/IstioObjects';
+import { ValidationTypes } from '../../types/IstioObjects';
+import type {
+  ProxyStatus,
+  Status
+} from '../../types/Health';
+import {
+  DEGRADED,
+  hasProxyStatusInfoSeverity,
+  HEALTHY,
+  INFO,
+  isProxyStatusSynced,
+  mergeStatus
+} from '../../types/Health';
+import { Tooltip, TooltipPosition } from '@patternfly/react-core';
+import { ProxyStatusList } from './ProxyStatusList';
+import { highestSeverity, validationToHealth } from '../../types/ServiceInfo';
+import { ValidationStack } from '../../components/Validations/ValidationStack';
+import { createIcon } from 'config/KialiIcon';
+import { useKialiTranslation } from 'utils/I18nUtils';
+
+type PodStatusProps = {
+  checks?: ObjectCheck[];
+  proxyStatus?: ProxyStatus;
+};
+
+export const PodStatus: React.FC<PodStatusProps> = (props: PodStatusProps) => {
+  const { t } = useKialiTranslation();
+  const proxyStatusSeverity: Status =
+    props.proxyStatus && hasProxyStatusInfoSeverity(props.proxyStatus)
+      ? INFO
+      : props.proxyStatus && !isProxyStatusSynced(props.proxyStatus)
+        ? DEGRADED
+        : HEALTHY;
+
+  const showTooltip = (): boolean => {
+    const validationSeverity: ValidationTypes = highestSeverity(props.checks || []);
+    return proxyStatusSeverity.id !== HEALTHY.id || validationSeverity !== ValidationTypes.Correct;
+  };
+
+  if (showTooltip()) {
+    const severityIcon = (): Status => {
+      const validationSeverity: Status = validationToHealth(highestSeverity(props.checks ?? []));
+      return mergeStatus(proxyStatusSeverity, validationSeverity);
+    };
+
+    const tooltipContent: React.ReactNode = (
+      <>
+        <ProxyStatusList status={props.proxyStatus} />
+        <ValidationStack checks={props.checks} />
+      </>
+    );
+
+    return (
+      <Tooltip aria-label={t('Pod Status')} position={TooltipPosition.auto} enableFlip={true} content={tooltipContent}>
+        <span data-test="proxy-status">{createIcon(severityIcon())}</span>
+      </Tooltip>
+    );
+  } else {
+    return createIcon(HEALTHY);
+  }
+};

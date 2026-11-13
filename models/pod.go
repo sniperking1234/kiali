@@ -1,7 +1,9 @@
 package models
 
 import (
+	"context"
 	"encoding/json"
+	"strings"
 
 	core_v1 "k8s.io/api/core/v1"
 
@@ -10,6 +12,10 @@ import (
 
 // Pods alias for list of Pod structs
 type Pods []*Pod
+
+const (
+	IstioProxy = "istio-proxy"
+)
 
 // Pod holds a subset of v1.Pod data that is meaningful in Kiali
 type Pod struct {
@@ -26,7 +32,16 @@ type Pod struct {
 	AppLabel            bool              `json:"appLabel"`
 	VersionLabel        bool              `json:"versionLabel"`
 	Annotations         map[string]string `json:"annotations"`
+	Protocol            string            `json:"protocol"`
 	ProxyStatus         *ProxyStatus      `json:"proxyStatus"`
+	ServiceAccountName  string            `json:"serviceAccountName"`
+}
+
+type Waypoint struct {
+	Cluster   string `json:"cluster"`
+	Name      string `json:"name"`
+	Namespace string `json:"namespace"`
+	Type      string `json:"type"`
 }
 
 // Reference holds some information on the pod creator
@@ -37,19 +52,22 @@ type Reference struct {
 
 // ContainerInfo holds container name and image
 type ContainerInfo struct {
-	Name  string `json:"name"`
-	Image string `json:"image"`
+	Name      string `json:"name"`
+	Image     string `json:"image"`
+	IsProxy   bool   `json:"isProxy"`
+	IsReady   bool   `json:"isReady"`
+	IsAmbient bool   `json:"isAmbient"`
 }
 
 // Parse extracts desired information from k8s []Pod info
-func (pods *Pods) Parse(list []core_v1.Pod) {
+func (pods *Pods) Parse(list []core_v1.Pod, isControlPlane func(ctx context.Context, cluster, namespace string) bool) {
 	if list == nil {
 		return
 	}
 
 	for _, pod := range list {
 		casted := Pod{}
-		casted.Parse(&pod)
+		casted.Parse(&pod, isControlPlane)
 		*pods = append(*pods, &casted)
 	}
 }
@@ -61,7 +79,7 @@ type sideCarStatus struct {
 }
 
 // Parse extracts desired information from k8s Pod info
-func (pod *Pod) Parse(p *core_v1.Pod) {
+func (pod *Pod) Parse(p *core_v1.Pod, isControlPlane func(ctx context.Context, cluster, namespace string) bool) {
 	pod.Name = p.Name
 	pod.Labels = p.Labels
 	pod.Annotations = p.Annotations
@@ -75,21 +93,27 @@ func (pod *Pod) Parse(p *core_v1.Pod) {
 	conf := config.Get()
 	// ParsePod some annotations
 	istioContainerNames := map[string]bool{}
-	if jSon, ok := p.Annotations[conf.ExternalServices.Istio.IstioSidecarAnnotation]; ok {
+	if jSon, ok := p.Annotations[config.IstioSidecarAnnotation]; ok {
 		var scs sideCarStatus
 		err := json.Unmarshal([]byte(jSon), &scs)
 		if err == nil {
 			for _, name := range scs.InitContainers {
 				container := ContainerInfo{
-					Name:  name,
-					Image: lookupImage(name, p.Spec.InitContainers)}
+					Name:    name,
+					Image:   lookupImage(name, p.Spec.InitContainers),
+					IsProxy: true,
+					IsReady: lookupReady(name, p.Status.InitContainerStatuses),
+				}
 				pod.IstioInitContainers = append(pod.IstioInitContainers, &container)
 				istioContainerNames[name] = true
 			}
 			for _, name := range scs.Containers {
 				container := ContainerInfo{
-					Name:  name,
-					Image: lookupImage(name, p.Spec.Containers)}
+					Name:    name,
+					Image:   lookupImage(name, p.Spec.Containers),
+					IsProxy: true,
+					IsReady: lookupReady(name, p.Status.ContainerStatuses),
+				}
 				pod.IstioContainers = append(pod.IstioContainers, &container)
 				istioContainerNames[name] = true
 			}
@@ -100,16 +124,43 @@ func (pod *Pod) Parse(p *core_v1.Pod) {
 			continue
 		}
 		container := ContainerInfo{
-			Name:  c.Name,
-			Image: c.Image,
+			Name:      c.Name,
+			Image:     c.Image,
+			IsProxy:   isIstioProxy(p, &c, *conf, isControlPlane),
+			IsReady:   lookupReady(c.Name, p.Status.ContainerStatuses),
+			IsAmbient: isIstioAmbient(p),
 		}
 		pod.Containers = append(pod.Containers, &container)
 	}
 	pod.Status = string(p.Status.Phase)
 	pod.StatusMessage = string(p.Status.Message)
 	pod.StatusReason = string(p.Status.Reason)
-	_, pod.AppLabel = p.Labels[conf.IstioLabels.AppLabelName]
-	_, pod.VersionLabel = p.Labels[conf.IstioLabels.VersionLabelName]
+	if appLabelName, found := conf.GetAppLabelName(p.Labels); found {
+		_, pod.AppLabel = p.Labels[appLabelName]
+	}
+	if verLabelName, found := conf.GetVersionLabelName(p.Labels); found {
+		_, pod.VersionLabel = p.Labels[verLabelName]
+	}
+	pod.ServiceAccountName = p.Spec.ServiceAccountName
+}
+
+func isIstioProxy(pod *core_v1.Pod, container *core_v1.Container, conf config.Config, isControlPlane func(ctx context.Context, cluster, namespace string) bool) bool {
+	if !isControlPlane(context.TODO(), "", pod.Namespace) {
+		return false
+	}
+	if container.Name == IstioProxy {
+		return true
+	}
+	for _, c := range conf.ExternalServices.Istio.ComponentStatuses.Components {
+		if c.IsProxy && strings.HasPrefix(pod.Name, c.AppLabel) {
+			return true
+		}
+	}
+	return false
+}
+
+func isIstioAmbient(pod *core_v1.Pod) bool {
+	return pod.Annotations[config.AmbientAnnotation] == config.AmbientAnnotationEnabled
 }
 
 func lookupImage(containerName string, containers []core_v1.Container) string {
@@ -119,6 +170,15 @@ func lookupImage(containerName string, containers []core_v1.Container) string {
 		}
 	}
 	return ""
+}
+
+func lookupReady(containerName string, statuses []core_v1.ContainerStatus) bool {
+	for _, s := range statuses {
+		if s.Name == containerName {
+			return s.Ready
+		}
+	}
+	return false
 }
 
 // HasIstioSidecar returns true if there are no pods or all pods have a sidecar
@@ -133,9 +193,48 @@ func (pods Pods) HasIstioSidecar() bool {
 	return true
 }
 
-// HasIstioSidecar returns true if the pod has an Istio proxy sidecar
+// HasAnyIstioSidecar returns true if there are pods and any of pods have a sidecar
+func (pods Pods) HasAnyIstioSidecar() bool {
+	if len(pods) > 0 {
+		for _, p := range pods {
+			if p.HasIstioSidecar() {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// HasIstioSidecar returns true if the pod has an Istio proxy sidecar in containers or in init containers
 func (pod Pod) HasIstioSidecar() bool {
-	return len(pod.IstioContainers) > 0
+	return len(pod.IstioContainers) > 0 || pod.HasNativeSidecar()
+}
+
+// HasAnyAmbient check each pod individually and returns true if any of them is labeled with the Ambient annotation
+func (pods Pods) HasAnyAmbient() bool {
+	if len(pods) > 0 {
+		for _, p := range pods {
+			if p.AmbientEnabled() {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// AmbientEnabled returns true if the pod is labeled as ambient-type
+func (pod *Pod) AmbientEnabled() bool {
+	return pod.Annotations[config.AmbientAnnotation] == config.AmbientAnnotationEnabled
+}
+
+// HasNativeSidecar returns true if the pod has istio-proxy init containers
+func (pod *Pod) HasNativeSidecar() bool {
+	for _, c := range pod.IstioInitContainers {
+		if c.Name == IstioProxy {
+			return true
+		}
+	}
+	return false
 }
 
 // SyncedPodsCount returns the number of Pods with its proxy synced
@@ -158,4 +257,18 @@ func (pods Pods) SyncedPodProxiesCount() int32 {
 	}
 
 	return syncedProxies
+}
+
+// ServiceAccounts returns the names of each service account of the pod list
+func (pods Pods) ServiceAccounts() []string {
+	san := map[string]int{}
+	for _, pod := range pods {
+		san[pod.ServiceAccountName]++
+	}
+
+	sans := make([]string, 0, len(pods))
+	for sa := range san {
+		sans = append(sans, sa)
+	}
+	return sans
 }

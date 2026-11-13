@@ -1,14 +1,14 @@
 package main
 
 import (
-	jaegerModels "github.com/jaegertracing/jaeger/model/json"
-
-	"github.com/kiali/kiali/business"
-	"github.com/kiali/kiali/graph/config/cytoscape"
+	config_common "github.com/kiali/kiali/graph/config/common"
 	"github.com/kiali/kiali/handlers"
-	"github.com/kiali/kiali/jaeger"
+	"github.com/kiali/kiali/handlers/authentication"
+	"github.com/kiali/kiali/kubernetes"
 	"github.com/kiali/kiali/models"
 	"github.com/kiali/kiali/status"
+	"github.com/kiali/kiali/tracing/jaeger/model"
+	jaegerModels "github.com/kiali/kiali/tracing/jaeger/model/json"
 )
 
 /////////////////////
@@ -34,7 +34,7 @@ type AggregateValueParam struct {
 	Name string `json:"aggregateValue"`
 }
 
-// swagger:parameters appMetrics appDetails graphApp graphAppVersion appDashboard appSpans appTraces errorTraces
+// swagger:parameters appMetrics appDetails graphApp graphAppVersion appDashboard appHealthStatusHistory appSpans appTraces errorTraces usageMetrics
 type AppParam struct {
 	// The app name (label value).
 	//
@@ -50,6 +50,33 @@ type AppVersionParam struct {
 	// in: path
 	// required: false
 	Name string `json:"version"`
+}
+
+// swagger:parameters aiChatAI
+type ChatProviderParam struct {
+	// The AI provider name.
+	//
+	// in: path
+	// required: true
+	Name string `json:"provider"`
+}
+
+// swagger:parameters aiChatAI
+type ChatModelParam struct {
+	// The AI model name.
+	//
+	// in: path
+	// required: true
+	Name string `json:"model"`
+}
+
+// swagger:parameters MCPTools
+type ChatToolNameParam struct {
+	// The MCP tool name.
+	//
+	// in: path
+	// required: true
+	Name string `json:"tool_name"`
 }
 
 // swagger:parameters graphAggregate graphAggregateByService graphApp graphAppVersion graphService graphWorkload
@@ -70,8 +97,72 @@ type ContainerParam struct {
 	Name string `json:"container"`
 }
 
-// swagger:parameters istioConfigList workloadList workloadDetails workloadUpdate serviceDetails serviceUpdate appSpans serviceSpans workloadSpans appTraces serviceTraces workloadTraces errorTraces workloadValidations appList serviceMetrics aggregateMetrics appMetrics workloadMetrics istioConfigDetails istioConfigDetailsSubtype istioConfigDelete istioConfigDeleteSubtype istioConfigUpdate istioConfigUpdateSubtype serviceList appDetails graphAggregate graphAggregateByService graphApp graphAppVersion graphNamespace graphService graphWorkload namespaceMetrics customDashboard appDashboard serviceDashboard workloadDashboard istioConfigCreate istioConfigCreateSubtype namespaceUpdate namespaceTls podDetails podLogs namespaceValidations getIter8Experiments postIter8Experiments patchIter8Experiments deleteIter8Experiments podProxyDump podProxyResource
-type NamespaceParam struct {
+// swagger:parameters controlPlaneMetrics
+type ControlPlaneParam struct {
+	// The control plane for metric collection, etc.
+	//
+	// in: path
+	// required: true
+	Name string `json:"controlplane"`
+}
+
+// swagger:parameters customDashboard
+type DashboardParam struct {
+	// The dashboard resource name.
+	//
+	// in: path
+	// required: true
+	Name string `json:"dashboard"`
+}
+
+// swagger:parameters podLogs
+type DurationLogParam struct {
+	// Query time-range duration (Golang string duration). Duration starts on
+	// `sinceTime` if set, or the time for the first log message if not set.
+	//
+	// in: query
+	// required: false
+	Name string `json:"duration"`
+}
+
+// swagger:parameters istioConfigCreate istioConfigDetails istioConfigDelete istioConfigUpdate
+type GVKGroupParam struct {
+	// The GVK group in a group/value/kind specification.
+	//
+	// in: path
+	// required: true
+	Name string `json:"group"`
+}
+
+// swagger:parameters istioConfigCreate istioConfigDetails istioConfigDelete istioConfigUpdate
+type GVKKindParam struct {
+	// The GVK kind in a group/value/kind specification.
+	//
+	// in: path
+	// required: true
+	Name string `json:"kind"`
+}
+
+// swagger:parameters istioConfigCreate istioConfigDetails istioConfigDelete istioConfigUpdate
+type GVKVersionParam struct {
+	// The GVK version in a group/value/kind specification.
+	//
+	// in: path
+	// required: true
+	Name string `json:"version"`
+}
+
+// swagger:parameters podProxyLogging
+type LoggingParam struct {
+	// The log level for the pod's proxy.
+	//
+	// in: query
+	// required: true
+	Level ProxyLogLevel `json:"level"`
+}
+
+// swagger:parameters istioConfigList workloadDetails workloadUpdate serviceDetails serviceUpdate appSpans serviceSpans workloadSpans appTraces serviceTraces workloadTraces errorTraces workloadValidations serviceMetrics aggregateMetrics appMetrics workloadMetrics workloadEnvoyMemory istioConfigDetails istioConfigDetailsSubtype istioConfigDelete istioConfigDeleteSubtype istioConfigUpdate istioConfigUpdateSubtype appDetails graphAggregate graphAggregateByService graphApp graphAppVersion graphNamespace graphService graphWorkload namespaceMetrics customDashboard appDashboard serviceDashboard workloadDashboard istioConfigCreate istioConfigCreateSubtype namespaceUpdate namespaceTls podDetails podLogs namespaceValidations podProxyDump podProxyResource podProxyLogging appHealthStatusHistory namespaceHealthStatusHistory serviceHealthStatusHistory workloadHealthStatusHistory namespaceInfo controlPlaneMetrics ztunnelDashboard ztunnelConfigDump usageMetrics
+type NamespacePathParam struct {
 	// The namespace name.
 	//
 	// in: path
@@ -79,13 +170,13 @@ type NamespaceParam struct {
 	Name string `json:"namespace"`
 }
 
-// swagger:parameters getIter8Experiments patchIter8Experiments deleteIter8Experiments
-type NameParam struct {
-	// The name param
+// swagger:parameters serviceList appList workloadList
+type NamespaceQueryParam struct {
+	// The namespace name.
 	//
-	// in: path
+	// in: query
 	// required: true
-	Name string `json:"name"`
+	Name string `json:"namespace"`
 }
 
 // swagger:parameters istioConfigDetails istioConfigDetailsSubtype istioConfigDelete istioConfigDeleteSubtype istioConfigUpdate istioConfigUpdateSubtype
@@ -97,17 +188,16 @@ type ObjectNameParam struct {
 	Name string `json:"object"`
 }
 
-// swagger:parameters istioConfigDetails istioConfigDetailsSubtype istioConfigDelete istioConfigDeleteSubtype istioConfigUpdate istioConfigUpdateSubtype istioConfigCreate istioConfigCreateSubtype
-type ObjectTypeParam struct {
-	// The Istio object type.
+// swagger:parameters istioConfigList istioConfigDetails serviceDetails serviceUpdate
+type ValidateParam struct {
+	// Enable validation or not
 	//
-	// in: path
-	// required: true
-	// pattern: ^(gateways|virtualservices|destinationrules|serviceentries|rules|quotaspecs|quotaspecbindings)$
-	Name string `json:"object_type"`
+	// in: query
+	// required: false
+	Name string `json:"validate"`
 }
 
-// swagger:parameters podDetails podLogs podProxyDump podProxyResource
+// swagger:parameters podDetails podLogs podProxyDump podProxyResource podProxyLogging ztunnelConfigDump
 type PodParam struct {
 	// The pod name.
 	//
@@ -125,7 +215,7 @@ type ResourceParam struct {
 	Name string `json:"resource"`
 }
 
-// swagger:parameters serviceDetails serviceUpdate serviceMetrics graphService graphAggregateByService serviceDashboard serviceSpans serviceTraces
+// swagger:parameters serviceDetails serviceUpdate serviceMetrics graphService graphAggregateByService serviceDashboard serviceHealthStatusHistory serviceSpans serviceTraces
 type ServiceParam struct {
 	// The service name.
 	//
@@ -143,16 +233,6 @@ type SinceTimeParam struct {
 	Name string `json:"sinceTime"`
 }
 
-// swagger:parameters podLogs
-type DurationLogParam struct {
-	// Query time-range duration (Golang string duration). Duration starts on
-	// `sinceTime` if set, or the time for the first log message if not set.
-	//
-	// in: query
-	// required: false
-	Name string `json:"duration"`
-}
-
 // swagger:parameters traceDetails
 type TraceIDParam struct {
 	// The trace ID.
@@ -162,16 +242,7 @@ type TraceIDParam struct {
 	Name string `json:"traceID"`
 }
 
-// swagger:parameters customDashboard
-type DashboardParam struct {
-	// The dashboard resource name.
-	//
-	// in: path
-	// required: true
-	Name string `json:"dashboard"`
-}
-
-// swagger:parameters workloadDetails workloadUpdate workloadValidations workloadMetrics graphWorkload workloadDashboard workloadSpans workloadTraces
+// swagger:parameters workloadDetails workloadUpdate workloadValidations workloadMetrics workloadEnvoyMemory graphWorkload workloadDashboard workloadHealthStatusHistory workloadSpans workloadTraces ztunnelDashboard
 type WorkloadParam struct {
 	// The workload name.
 	//
@@ -187,12 +258,21 @@ type WorkloadParam struct {
 
 // swagger:parameters graphApp graphAppVersion graphNamespaces graphService graphWorkload
 type AppendersParam struct {
-	// Comma-separated list of Appenders to run. Available appenders: [aggregateNode, deadNode, idleNode, istio, responseTime, securityPolicy, serviceEntry, sidecarsCheck].
+	// Comma-separated list of Appenders to run. Available appenders: [aggregateNode, deadNode, healthConfig, idleNode, istio, responseTime, securityPolicy, serviceEntry, sidecarsCheck, throughput].
 	//
 	// in: query
 	// required: false
-	// default: run all appenders
+	// default: aggregateNode,deadNode,healthConfig,idleNode,istio,responseTime,securityPolicy,serviceEntry,sidecarsCheck,throughput
 	Name string `json:"appenders"`
+}
+
+// swagger:parameters graphApp graphAppVersion graphNamespaces graphService graphWorkload
+type BoxByParam struct {
+	// Comma-separated list of desired node boxing. Available boxings: [app, cluster, namespace].
+	//
+	// in: query
+	// required: false
+	Name string `json:"boxBy"`
 }
 
 // swagger:parameters graphApp graphAppVersion graphNamespaces graphService graphWorkload
@@ -205,7 +285,7 @@ type DurationGraphParam struct {
 	Name string `json:"duration"`
 }
 
-// swagger:parameters graphApp graphAppVersion graphNamespaces graphService graphWorkload
+// swagger:parameters graphNamespaces graphService graphWorkload
 type GraphTypeParam struct {
 	// Graph type. Available graph types: [app, service, versionedApp, workload].
 	//
@@ -213,16 +293,6 @@ type GraphTypeParam struct {
 	// required: false
 	// default: workload
 	Name string `json:"graphType"`
-}
-
-// swagger:parameters graphApp graphAppVersion graphNamespaces graphService graphWorkload
-type BoxByParam struct {
-	// Comma-separated list of desired node boxing. Available boxings: [app, cluster, namespace, none].
-	//
-	// in: query
-	// required: false
-	// default: none
-	Name string `json:"boxBy"`
 }
 
 // swagger:parameters graphApp graphAppVersion graphNamespaces graphWorkload
@@ -264,6 +334,56 @@ type QueryTimeParam struct {
 	Name string `json:"queryTime"`
 }
 
+// swagger:parameters graphApp graphAppVersion graphNamespaces graphService graphWorkload
+type RateGrpcParam struct {
+	// How to calculate gRPC traffic rate. One of: none | received (i.e. response_messages) | requests | sent (i.e. request_messages) | total (i.e. sent+received).
+	//
+	// in: query
+	// required: false
+	// default: requests
+	Name string `json:"rateGrpc"`
+}
+
+// swagger:parameters graphApp graphAppVersion graphNamespaces graphService graphWorkload
+type RateHttpParam struct {
+	// How to calculate HTTP traffic rate. One of: none | requests.
+	//
+	// in: query
+	// required: false
+	// default: requests
+	Name string `json:"rateHttp"`
+}
+
+// swagger:parameters graphApp graphAppVersion graphNamespaces graphService graphWorkload
+type RateTcpParam struct {
+	// How to calculate TCP traffic rate. One of: none | received (i.e. received_bytes) | sent (i.e. sent_bytes) | total (i.e. sent+received).
+	//
+	// in: query
+	// required: false
+	// default: sent
+	Name string `json:"rateTcp"`
+}
+
+// swagger:parameters graphApp graphAppVersion graphNamespaces graphService graphWorkload
+type ResponseTimeParam struct {
+	// Used only with responseTime appender. One of: avg | 50 | 95 | 99.
+	//
+	// in: query
+	// required: false
+	// default: 95
+	Name string `json:"responseTime"`
+}
+
+// swagger:parameters graphApp graphAppVersion graphNamespaces graphService graphWorkload
+type ThroughputParam struct {
+	// Used only with throughput appender. One of: request | response.
+	//
+	// in: query
+	// required: false
+	// default: request
+	Name string `json:"throughput"`
+}
+
 /////////////////////
 // SWAGGER PARAMETERS - METRICS
 // - keep this alphabetized
@@ -278,7 +398,7 @@ type AdditionalLabelsParam struct {
 	Name string `json:"additionalLabels"`
 }
 
-// swagger:parameters serviceMetrics aggregateMetrics appMetrics workloadMetrics customDashboard appDashboard serviceDashboard workloadDashboard
+// swagger:parameters serviceMetrics aggregateMetrics appMetrics workloadMetrics workloadEnvoyMemory customDashboard appDashboard serviceDashboard workloadDashboard
 type AvgParam struct {
 	// Flag for fetching histogram average. Default is true.
 	//
@@ -288,17 +408,16 @@ type AvgParam struct {
 	Name bool `json:"avg"`
 }
 
-// swagger:parameters serviceMetrics aggregateMetrics appMetrics workloadMetrics customDashboard appDashboard serviceDashboard workloadDashboard
+// swagger:parameters serviceMetrics aggregateMetrics appMetrics workloadMetrics workloadEnvoyMemory customDashboard appDashboard serviceDashboard workloadDashboard
 type ByLabelsParam struct {
 	// List of labels to use for grouping metrics (via Prometheus 'by' clause).
 	//
 	// in: query
 	// required: false
-	// default: []
 	Name []string `json:"byLabels[]"`
 }
 
-// swagger:parameters serviceMetrics aggregateMetrics appMetrics workloadMetrics appDashboard serviceDashboard workloadDashboard
+// swagger:parameters serviceMetrics aggregateMetrics appMetrics workloadMetrics workloadEnvoyMemory appDashboard serviceDashboard workloadDashboard
 type DirectionParam struct {
 	// Traffic direction: 'inbound' or 'outbound'.
 	//
@@ -308,7 +427,7 @@ type DirectionParam struct {
 	Name string `json:"direction"`
 }
 
-// swagger:parameters serviceMetrics aggregateMetrics appMetrics workloadMetrics customDashboard appDashboard serviceDashboard workloadDashboard
+// swagger:parameters serviceMetrics aggregateMetrics appMetrics workloadMetrics workloadEnvoyMemory customDashboard appDashboard serviceDashboard workloadDashboard
 type DurationParam struct {
 	// Duration of the query period, in seconds.
 	//
@@ -318,14 +437,40 @@ type DurationParam struct {
 	Name int `json:"duration"`
 }
 
-// swagger:parameters serviceMetrics aggregateMetrics appMetrics workloadMetrics
+// swagger:parameters serviceMetrics aggregateMetrics appMetrics workloadMetrics workloadEnvoyMemory
 type FiltersParam struct {
 	// List of metrics to fetch. Fetch all metrics when empty. List entries are Kiali internal metric names.
 	//
 	// in: query
 	// required: false
-	// default: []
 	Name []string `json:"filters[]"`
+}
+
+// swagger:parameters workloadHealthStatusHistory appHealthStatusHistory serviceHealthStatusHistory namespaceHealthStatusHistory
+type HealthStatusHistoryParams struct {
+	// Cluster name
+	//
+	// in: query
+	// required: false
+	ClusterName string `json:"clusterName"`
+	// Duration of the query period, in seconds.
+	//
+	// in: query
+	// required: false
+	// default: 1800
+	Duration int `json:"duration"`
+	// Unix time (seconds) for query such that time range is [queryTime-duration..queryTime]. Default is now.
+	//
+	// in: query
+	// required: false
+	// default: now
+	QueryTime string `json:"queryTime"`
+	// Step between datapoints, in seconds.
+	//
+	// in: query
+	// required: false
+	// default: 15
+	Step int `json:"step"`
 }
 
 // swagger:parameters customDashboard
@@ -338,17 +483,16 @@ type LabelsFiltersParam struct {
 	Name string `json:"labelsFilters"`
 }
 
-// swagger:parameters serviceMetrics aggregateMetrics appMetrics workloadMetrics customDashboard appDashboard serviceDashboard workloadDashboard
+// swagger:parameters serviceMetrics aggregateMetrics appMetrics workloadMetrics workloadEnvoyMemory customDashboard appDashboard serviceDashboard workloadDashboard
 type QuantilesParam struct {
 	// List of quantiles to fetch. Fetch no quantiles when empty. Ex: [0.5, 0.95, 0.99].
 	//
 	// in: query
 	// required: false
-	// default: []
 	Name []string `json:"quantiles[]"`
 }
 
-// swagger:parameters serviceMetrics aggregateMetrics appMetrics workloadMetrics customDashboard appDashboard serviceDashboard workloadDashboard
+// swagger:parameters serviceMetrics aggregateMetrics appMetrics workloadMetrics workloadEnvoyMemory customDashboard appDashboard serviceDashboard workloadDashboard
 type RateFuncParam struct {
 	// Prometheus function used to calculate rate: 'rate' or 'irate'.
 	//
@@ -358,7 +502,7 @@ type RateFuncParam struct {
 	Name string `json:"rateFunc"`
 }
 
-// swagger:parameters serviceMetrics aggregateMetrics appMetrics workloadMetrics customDashboard appDashboard serviceDashboard workloadDashboard
+// swagger:parameters serviceMetrics aggregateMetrics appMetrics workloadMetrics workloadEnvoyMemory customDashboard appDashboard serviceDashboard workloadDashboard
 type RateIntervalParam struct {
 	// Interval used for rate and histogram calculation.
 	//
@@ -368,7 +512,7 @@ type RateIntervalParam struct {
 	Name string `json:"rateInterval"`
 }
 
-// swagger:parameters serviceMetrics aggregateMetrics appMetrics workloadMetrics appDashboard serviceDashboard workloadDashboard
+// swagger:parameters serviceMetrics aggregateMetrics appMetrics workloadMetrics workloadEnvoyMemory appDashboard serviceDashboard workloadDashboard
 type RequestProtocolParam struct {
 	// Desired request protocol for the telemetry: For example, 'http' or 'grpc'.
 	//
@@ -378,7 +522,7 @@ type RequestProtocolParam struct {
 	Name string `json:"requestProtocol"`
 }
 
-// swagger:parameters serviceMetrics aggregateMetrics appMetrics workloadMetrics appDashboard serviceDashboard workloadDashboard
+// swagger:parameters serviceMetrics aggregateMetrics appMetrics workloadMetrics workloadEnvoyMemory appDashboard serviceDashboard workloadDashboard
 type ReporterParam struct {
 	// Istio telemetry reporter: 'source' or 'destination'.
 	//
@@ -388,7 +532,7 @@ type ReporterParam struct {
 	Name string `json:"reporter"`
 }
 
-// swagger:parameters serviceMetrics aggregateMetrics appMetrics workloadMetrics customDashboard appDashboard serviceDashboard workloadDashboard
+// swagger:parameters serviceMetrics aggregateMetrics appMetrics workloadMetrics workloadEnvoyMemory customDashboard appDashboard serviceDashboard workloadDashboard
 type StepParam struct {
 	// Step between [graph] datapoints, in seconds.
 	//
@@ -398,9 +542,9 @@ type StepParam struct {
 	Name int `json:"step"`
 }
 
-// swagger:parameters serviceMetrics aggregateMetrics appMetrics workloadMetrics
+// swagger:parameters serviceMetrics aggregateMetrics appMetrics workloadMetrics workloadEnvoyMemory
 type VersionParam struct {
-	// Filters metrics by the specified version.
+	// Filters metrics by the specified version
 	//
 	// in: query
 	// required: false
@@ -433,6 +577,20 @@ type BadRequestError struct {
 		// HTTP status code
 		// example: 400
 		// default: 400
+		Code    int32 `json:"code"`
+		Message error `json:"message"`
+	} `json:"body"`
+}
+
+// ForbiddenError: the client is not allowed to access the requested namespace
+//
+// swagger:response forbiddenError
+type ForbiddenError struct {
+	// in: body
+	Body struct {
+		// HTTP status code
+		// example: 403
+		// default: 403
 		Code    int32 `json:"code"`
 		Message error `json:"message"`
 	} `json:"body"`
@@ -483,7 +641,7 @@ type InternalError struct {
 // A Internal is the error message that means something has gone wrong
 //
 // swagger:response serviceUnavailableError
-type serviceUnavailableError struct {
+type ServiceUnavailableError struct {
 	// in: body
 	Body struct {
 		// HTTP status code
@@ -496,23 +654,23 @@ type serviceUnavailableError struct {
 
 // HTTP status code 200 and statusInfo model in data
 // swagger:response statusInfo
-type swaggStatusInfoResp struct {
+type SwaggStatusInfoResp struct {
 	// in:body
 	Body status.StatusInfo
 }
 
-// HTTP status code 200 and tokenGenerated model in data
-// swagger:response tokenResponse
-type swaggTokenGeneratedResp struct {
+// HTTP status code 200 and userGenerated model in data
+// swagger:response userSessionData
+type SwaggTokenGeneratedResp struct {
 	// in:body
-	Body handlers.TokenResponse
+	Body authentication.UserSessionData
 }
 
-// HTTP status code 200 and cytoscapejs Config in data
+// HTTP status code 200 and graph Config in data
 // swagger:response graphResponse
 type GraphResponse struct {
 	// in:body
-	Body cytoscape.Config
+	Body config_common.Config
 }
 
 // HTTP status code 200 and IstioConfigList model in data
@@ -543,37 +701,16 @@ type AppListResponse struct {
 	Body models.AppList
 }
 
-// serviceHealthResponse contains aggregated health from various sources, for a given service
-// swagger:response serviceHealthResponse
-type serviceHealthResponse struct {
-	// in:body
-	Body models.ServiceHealth
-}
-
-// appHealthResponse contains aggregated health from various sources, for a given app
-// swagger:response appHealthResponse
-type appHealthResponse struct {
-	// in:body
-	Body models.AppHealth
-}
-
-// workloadHealthResponse contains aggregated health from various sources, for a given workload
-// swagger:response workloadHealthResponse
-type workloadHealthResponse struct {
-	// in:body
-	Body models.WorkloadHealth
-}
-
 // namespaceAppHealthResponse is a map of app name x health
 // swagger:response namespaceAppHealthResponse
-type namespaceAppHealthResponse struct {
+type NamespaceAppHealthResponse struct {
 	// in:body
 	Body models.NamespaceAppHealth
 }
 
 // namespaceResponse is a basic namespace
 // swagger:response namespaceResponse
-type namespaceResponse struct {
+type NamespaceResponse struct {
 	// in:body
 	Body models.Namespace
 }
@@ -603,7 +740,7 @@ type ErrorTracesResponse struct {
 // swagger:response spansResponse
 type SpansResponse struct {
 	// in:body
-	Body []jaeger.JaegerSpan
+	Body []model.TracingSpan
 }
 
 // Listing all the information related to a workload
@@ -618,6 +755,13 @@ type WorkloadDetailsResponse struct {
 type MetricsResponse struct {
 	// in:body
 	Body models.MetricsMap
+}
+
+// Envoy memory diagnostics for a workload
+// swagger:response workloadEnvoyMemoryResponse
+type WorkloadEnvoyMemoryResponse struct {
+	// in:body
+	Body models.EnvoyMemorySummary
 }
 
 // Dashboard response model
@@ -655,11 +799,11 @@ type GrafanaInfoResponse struct {
 	Body models.GrafanaInfo
 }
 
-// Return all the descriptor data related to Jaeger
+// Return all the descriptor data related to Tracing
 // swagger:response jaegerInfoResponse
 type JaegerInfoResponse struct {
 	// in: body
-	Body models.JaegerInfo
+	Body models.TracingInfo
 }
 
 // Return the information necessary to handle login
@@ -718,37 +862,16 @@ type NameIstioValidation map[string]models.IstioValidation
 
 // Return caller permissions per namespace and Istio Config type
 // swagger:response istioConfigPermissions
-type swaggIstioConfigPermissions struct {
+type SwaggIstioConfigPermissions struct {
 	// in:body
 	Body models.IstioConfigPermissions
-}
-
-// Return Iter8 Info
-// swagger:response iter8StatusResponse
-type Iter8StatusResponse struct {
-	// in: body
-	Body models.Iter8Info
-}
-
-// Return a Iter8 Experiment detail
-// swagger:response iter8ExperimentGetDetailResponse
-type Iter8ExperimentsGetDetailResponse struct {
-	// in: body
-	Body models.Iter8ExperimentDetail
-}
-
-// Return a list of Iter8 Experiment Items
-// swagger:response iter8ExperimentsResponse
-type Iter8ExperimentsResponnse struct {
-	// in: body
-	Body []models.Iter8ExperimentItem
 }
 
 // Return a list of Istio components along its status
 // swagger:response istioStatusResponse
 type IstioStatusResponse struct {
 	// in: body
-	Body business.IstioComponentStatus
+	Body kubernetes.IstioComponentStatus
 }
 
 // Posted parameters for a metrics stats query
@@ -765,9 +888,92 @@ type MetricsStatsResponse struct {
 	Body models.MetricsStats
 }
 
-// Return a list of Cluster items
-// swagger:response clustersResponse
-type ClustersResponse struct {
+// Response of the tracing info query
+// swagger:response tracingInfoResponse
+type TracingInfoResponse struct {
 	// in: body
-	Body []business.Cluster
+	Body models.TracingInfo
 }
+
+// Response of the cluster namespace health query
+// swagger:response clustersNamespaceHealthResponse
+type ClustersNamespaceHealthResponse struct {
+	// in: body
+	Body models.ClustersNamespaceHealth
+}
+
+// Response of the mesh query
+// swagger:response meshResponse
+type MeshResponse struct {
+	// in: body
+	Body models.Mesh
+}
+
+// Response of the cluster TLS query
+// swagger:response clusterTlsResponse
+type ClusterTlsResponse struct {
+	// in: body
+	Body models.MTLSStatus
+}
+
+// Response of the configuration validation query
+// swagger:response configurationValidation
+type ConfigurationValidationResponse struct {
+	// in: body
+	Body model.ConfigurationValidation
+}
+
+// Response of the graph cache metrics test endpoint
+// swagger:response graphCacheMetricsResponse
+type GraphCacheMetricsResponse struct {
+	// in: body
+	Body handlers.GraphCacheMetrics
+}
+
+// Response of the health cache metrics test endpoint
+// swagger:response healthCacheMetricsResponse
+type HealthCacheMetricsResponse struct {
+	// in: body
+	Body handlers.HealthCacheMetrics
+}
+
+// Response of the health status metrics test endpoint
+// swagger:response healthStatusMetricsResponse
+type HealthStatusMetricsResponse struct {
+	// in: body
+	Body handlers.HealthStatusMetrics
+}
+
+// Response of the tracing diagnose query
+// swagger:response tracingDiagnose
+type TracingDiagnoseResponse struct {
+	// in: body
+	Body model.TracingDiagnose
+}
+
+// Response of the perses info query
+// swagger:response persesInfoResponse
+type PersesInfoResponse struct {
+	// in: body
+	Body models.PersesInfo
+}
+
+// Response of the ztunnel config dump query
+// swagger:response ztunnelConfigDump
+type ZtunnelConfigDumpResponse struct {
+	// in: body
+	Body kubernetes.ZtunnelConfigDump
+}
+
+// swagger:enum ProxyLogLevel
+type ProxyLogLevel string
+
+const (
+	ProxyLogLevelOff      ProxyLogLevel = "off"
+	ProxyLogLevelTrace    ProxyLogLevel = "trace"
+	ProxyLogLevelDebug    ProxyLogLevel = "debug"
+	ProxyLogLevelInfo     ProxyLogLevel = "info"
+	ProxyLogLevelWarning  ProxyLogLevel = "warning"
+	ProxyLogLevelError    ProxyLogLevel = "error"
+	ProxyLogLevelCritical ProxyLogLevel = "critical"
+)

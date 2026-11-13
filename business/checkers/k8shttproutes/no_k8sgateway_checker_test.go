@@ -1,0 +1,328 @@
+package k8shttproutes
+
+import (
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	k8s_networking_v1 "sigs.k8s.io/gateway-api/apis/v1"
+
+	"github.com/kiali/kiali/config"
+	"github.com/kiali/kiali/kubernetes"
+	"github.com/kiali/kiali/models"
+	"github.com/kiali/kiali/tests/data"
+	"github.com/kiali/kiali/tests/testutils/validations"
+)
+
+func TestMissingK8sGateway(t *testing.T) {
+	assert := assert.New(t)
+	conf := config.NewConfig()
+	config.Set(conf)
+
+	checker := NoK8sGatewayChecker{
+		IdentityDomain: "svc.cluster.local",
+		K8sHTTPRoute:   data.CreateHTTPRoute("route", "bookinfo", "gatewayapi", []string{"bookinfo"}),
+		GatewayNames:   make(map[string]k8s_networking_v1.Gateway),
+	}
+
+	vals, valid := checker.Check()
+	assert.False(valid)
+	assert.NotEmpty(vals)
+	assert.Equal(models.ErrorSeverity, vals[0].Severity)
+	assert.NoError(validations.ConfirmIstioCheckMessage("k8sroutes.nok8sgateway", vals[0]))
+}
+
+func TestMissingK8sGateways(t *testing.T) {
+	assert := assert.New(t)
+	conf := config.NewConfig()
+	config.Set(conf)
+
+	checker := NoK8sGatewayChecker{
+		IdentityDomain: "svc.cluster.local",
+		K8sHTTPRoute: data.AddGatewayParentRefToHTTPRoute("gateway2", "bookinfo2",
+			data.CreateHTTPRoute("route", "bookinfo", "gatewayapi", []string{"bookinfo"})),
+		GatewayNames: make(map[string]k8s_networking_v1.Gateway),
+	}
+
+	vals, valid := checker.Check()
+	assert.False(valid)
+	assert.NotEmpty(vals)
+	assert.Len(vals, 2)
+	assert.Equal(models.ErrorSeverity, vals[0].Severity)
+	assert.NoError(validations.ConfirmIstioCheckMessage("k8sroutes.nok8sgateway", vals[0]))
+	assert.Equal(models.ErrorSeverity, vals[1].Severity)
+	assert.NoError(validations.ConfirmIstioCheckMessage("k8sroutes.nok8sgateway", vals[1]))
+}
+
+func TestValidAndMissingK8sGateway(t *testing.T) {
+	assert := assert.New(t)
+	conf := config.NewConfig()
+	config.Set(conf)
+
+	checker := NoK8sGatewayChecker{
+		IdentityDomain: "svc.cluster.local",
+		K8sHTTPRoute: data.AddGatewayParentRefToHTTPRoute("correctgw", "bookinfo2",
+			data.CreateHTTPRoute("route", "bookinfo", "gatewayapi", []string{"bookinfo"})),
+		GatewayNames: kubernetes.K8sGatewayNames([]*k8s_networking_v1.Gateway{
+			data.CreateEmptyK8sGateway("correctgw", "bookinfo"),
+		}, "svc.cluster.local"),
+	}
+
+	vals, valid := checker.Check()
+	assert.False(valid)
+	assert.NotEmpty(vals)
+	assert.Equal(models.ErrorSeverity, vals[0].Severity)
+	assert.NoError(validations.ConfirmIstioCheckMessage("k8sroutes.nok8sgateway", vals[0]))
+}
+
+func TestFoundK8sGateway(t *testing.T) {
+	assert := assert.New(t)
+	conf := config.NewConfig()
+	config.Set(conf)
+
+	checker := NoK8sGatewayChecker{
+		IdentityDomain: "svc.cluster.local",
+		K8sHTTPRoute:   data.CreateHTTPRoute("route", "bookinfo", "my-gateway", []string{"bookinfo"}),
+		GatewayNames: kubernetes.K8sGatewayNames([]*k8s_networking_v1.Gateway{
+			data.CreateEmptyK8sGateway("my-gateway", "bookinfo"),
+		}, "svc.cluster.local"),
+	}
+
+	vals, valid := checker.Check()
+	assert.True(valid)
+	assert.Empty(vals)
+}
+
+func TestFoundSharedK8sGateway(t *testing.T) {
+	assert := assert.New(t)
+	conf := config.NewConfig()
+	config.Set(conf)
+
+	checker := NoK8sGatewayChecker{
+		IdentityDomain: "svc.cluster.local",
+		K8sHTTPRoute: data.AddGatewayParentRefToHTTPRoute("sharedgw", "gwns",
+			data.CreateEmptyHTTPRoute("route", "bookinfo", []string{"bookinfo"})),
+		GatewayNames: kubernetes.K8sGatewayNames([]*k8s_networking_v1.Gateway{
+			data.AddListenerToK8sGateway(data.CreateSharedListener("test", "host.com", 80, "http"),
+				data.CreateEmptyK8sGateway("sharedgw", "gwns")),
+		}, "svc.cluster.local"),
+		Namespaces: models.Namespaces{data.CreateSharedNamespace("bookinfo")},
+	}
+
+	vals, valid := checker.Check()
+	assert.True(valid)
+	assert.Empty(vals)
+}
+
+func TestFoundSharedK8sGatewayWithMatchExpressions(t *testing.T) {
+	assert := assert.New(t)
+	conf := config.NewConfig()
+	config.Set(conf)
+
+	checker := NoK8sGatewayChecker{
+		IdentityDomain: "svc.cluster.local",
+		K8sHTTPRoute: data.AddGatewayParentRefToHTTPRoute("sharedgw", "gwns",
+			data.CreateEmptyHTTPRoute("route", "bookinfo", []string{"bookinfo"})),
+		GatewayNames: kubernetes.K8sGatewayNames([]*k8s_networking_v1.Gateway{
+			data.AddListenerToK8sGateway(
+				data.CreateSharedListenerWithMatchExpressions("test", "host.com", 80, "http", "kubernetes.io/metadata.name", []string{"bookinfo"}),
+				data.CreateEmptyK8sGateway("sharedgw", "gwns")),
+		}, "svc.cluster.local"),
+		Namespaces: models.Namespaces{data.CreateNamespaceWithLabels("bookinfo", map[string]string{"kubernetes.io/metadata.name": "bookinfo"})},
+	}
+
+	vals, valid := checker.Check()
+	assert.True(valid)
+	assert.Empty(vals)
+}
+
+func TestNotSharedNSK8sGatewayWithMatchExpressionsError(t *testing.T) {
+	assert := assert.New(t)
+	conf := config.NewConfig()
+	config.Set(conf)
+
+	checker := NoK8sGatewayChecker{
+		IdentityDomain: "svc.cluster.local",
+		K8sHTTPRoute: data.AddGatewayParentRefToHTTPRoute("sharedgw", "gwns",
+			data.CreateEmptyHTTPRoute("route", "bookinfo", []string{"bookinfo"})),
+		GatewayNames: kubernetes.K8sGatewayNames([]*k8s_networking_v1.Gateway{
+			data.AddListenerToK8sGateway(
+				data.CreateSharedListenerWithMatchExpressions("test", "host.com", 80, "http", "kubernetes.io/metadata.name", []string{"other-ns"}),
+				data.CreateEmptyK8sGateway("sharedgw", "gwns")),
+		}, "svc.cluster.local"),
+		Namespaces: models.Namespaces{data.CreateNamespaceWithLabels("bookinfo", map[string]string{"kubernetes.io/metadata.name": "bookinfo"})},
+	}
+
+	vals, valid := checker.Check()
+	assert.False(valid)
+	assert.NotEmpty(vals)
+	assert.Equal(models.ErrorSeverity, vals[0].Severity)
+	assert.NoError(validations.ConfirmIstioCheckMessage("k8sroutes.nok8sgateway", vals[0]))
+}
+
+func TestFoundSharedToAllK8sGateway(t *testing.T) {
+	assert := assert.New(t)
+	conf := config.NewConfig()
+	config.Set(conf)
+
+	checker := NoK8sGatewayChecker{
+		IdentityDomain: "svc.cluster.local",
+		K8sHTTPRoute: data.AddGatewayParentRefToHTTPRoute("sharedgw", "gwns",
+			data.CreateEmptyHTTPRoute("route", "bookinfo", []string{"bookinfo"})),
+		GatewayNames: kubernetes.K8sGatewayNames([]*k8s_networking_v1.Gateway{
+			data.AddListenerToK8sGateway(data.CreateSharedToAllListener("test", "host.com", 80, "http"),
+				data.CreateEmptyK8sGateway("sharedgw", "gwns")),
+		}, "svc.cluster.local"),
+		Namespaces: models.Namespaces{models.Namespace{Name: "bookinfo"}},
+	}
+
+	vals, valid := checker.Check()
+	assert.True(valid)
+	assert.Empty(vals)
+}
+
+func TestWrongNSSharedK8sGatewayError(t *testing.T) {
+	assert := assert.New(t)
+	conf := config.NewConfig()
+	config.Set(conf)
+
+	checker := NoK8sGatewayChecker{
+		IdentityDomain: "svc.cluster.local",
+		K8sHTTPRoute: data.AddGatewayParentRefToHTTPRoute("sharedgw", "gwnswrong",
+			data.CreateEmptyHTTPRoute("route", "bookinfo", []string{"bookinfo"})),
+		GatewayNames: kubernetes.K8sGatewayNames([]*k8s_networking_v1.Gateway{
+			data.AddListenerToK8sGateway(data.CreateSharedListener("test", "host.com", 80, "http"),
+				data.CreateEmptyK8sGateway("sharedgw", "gwns")),
+		}, "svc.cluster.local"),
+		Namespaces: models.Namespaces{data.CreateSharedNamespace("bookinfo")},
+	}
+
+	vals, valid := checker.Check()
+	assert.False(valid)
+	assert.NotEmpty(vals)
+	assert.Equal(models.ErrorSeverity, vals[0].Severity)
+	assert.NoError(validations.ConfirmIstioCheckMessage("k8sroutes.nok8sgateway", vals[0]))
+}
+
+func TestSharedK8sGatewayWrongNSError(t *testing.T) {
+	assert := assert.New(t)
+	conf := config.NewConfig()
+	config.Set(conf)
+
+	checker := NoK8sGatewayChecker{
+		IdentityDomain: "svc.cluster.local",
+		K8sHTTPRoute: data.AddGatewayParentRefToHTTPRoute("sharedgw", "gwns",
+			data.CreateEmptyHTTPRoute("route", "bookinfo", []string{"bookinfo"})),
+		GatewayNames: kubernetes.K8sGatewayNames([]*k8s_networking_v1.Gateway{
+			data.AddListenerToK8sGateway(data.CreateSharedListener("test", "host.com", 80, "http"),
+				data.CreateEmptyK8sGateway("sharedgw", "gwnswrong")),
+		}, "svc.cluster.local"),
+		Namespaces: models.Namespaces{data.CreateSharedNamespace("bookinfo")},
+	}
+
+	vals, valid := checker.Check()
+	assert.False(valid)
+	assert.NotEmpty(vals)
+	assert.Equal(models.ErrorSeverity, vals[0].Severity)
+	assert.NoError(validations.ConfirmIstioCheckMessage("k8sroutes.nok8sgateway", vals[0]))
+}
+
+func TestNotSharedNSK8sGatewayError(t *testing.T) {
+	assert := assert.New(t)
+	conf := config.NewConfig()
+	config.Set(conf)
+
+	checker := NoK8sGatewayChecker{
+		IdentityDomain: "svc.cluster.local",
+		K8sHTTPRoute: data.AddGatewayParentRefToHTTPRoute("sharedgw", "gwns",
+			data.CreateEmptyHTTPRoute("route", "bookinfo", []string{"bookinfo"})),
+		GatewayNames: kubernetes.K8sGatewayNames([]*k8s_networking_v1.Gateway{
+			data.AddListenerToK8sGateway(data.CreateSharedListener("test", "host.com", 80, "http"),
+				data.CreateEmptyK8sGateway("sharedgw", "gwns")),
+		}, "svc.cluster.local"),
+		Namespaces: models.Namespaces{models.Namespace{Name: "bookinfo"}},
+	}
+
+	vals, valid := checker.Check()
+	assert.False(valid)
+	assert.NotEmpty(vals)
+	assert.Equal(models.ErrorSeverity, vals[0].Severity)
+	assert.NoError(validations.ConfirmIstioCheckMessage("k8sroutes.nok8sgateway", vals[0]))
+}
+
+// Regression test for https://github.com/kiali/kiali/issues/9937
+// HTTPRoute in an Ambient namespace referencing a Gateway in an unmanaged namespace
+// (istio-ingress) with allowedRoutes.namespaces.from: All should NOT trigger KIA1401.
+func TestAmbientHTTPRouteWithSharedToAllGatewayInUnmanagedNS(t *testing.T) {
+	assert := assert.New(t)
+	conf := config.NewConfig()
+	config.Set(conf)
+
+	checker := NoK8sGatewayChecker{
+		IdentityDomain: "svc.cluster.local",
+		K8sHTTPRoute: data.AddGatewayParentRefToHTTPRoute("gateway-internal", "istio-ingress",
+			data.CreateEmptyHTTPRoute("app", "app-ambient", []string{"app.example.com"})),
+		GatewayNames: kubernetes.K8sGatewayNames([]*k8s_networking_v1.Gateway{
+			data.AddListenerToK8sGateway(
+				data.CreateSharedToAllListener("default", "*.example.com", 80, "HTTP"),
+				data.CreateEmptyK8sGateway("gateway-internal", "istio-ingress")),
+		}, "svc.cluster.local"),
+		Namespaces: models.Namespaces{
+			{Name: "app-ambient", IsAmbient: true, Labels: map[string]string{config.IstioAmbientNamespaceLabel: config.IstioAmbientNamespaceLabelValue}},
+			{Name: "istio-ingress"},
+		},
+	}
+
+	vals, valid := checker.Check()
+	assert.True(valid, "HTTPRoute in Ambient namespace should be valid when Gateway allows routes from all namespaces")
+	assert.Empty(vals, "no KIA1401 should be reported")
+}
+
+// Non-Ambient namespace with the same cross-namespace Gateway (from: All) should also pass.
+func TestNonAmbientHTTPRouteWithSharedToAllGatewayInUnmanagedNS(t *testing.T) {
+	assert := assert.New(t)
+	conf := config.NewConfig()
+	config.Set(conf)
+
+	checker := NoK8sGatewayChecker{
+		IdentityDomain: "svc.cluster.local",
+		K8sHTTPRoute: data.AddGatewayParentRefToHTTPRoute("gateway-internal", "istio-ingress",
+			data.CreateEmptyHTTPRoute("app", "app-non-ambient", []string{"app.example.com"})),
+		GatewayNames: kubernetes.K8sGatewayNames([]*k8s_networking_v1.Gateway{
+			data.AddListenerToK8sGateway(
+				data.CreateSharedToAllListener("default", "*.example.com", 80, "HTTP"),
+				data.CreateEmptyK8sGateway("gateway-internal", "istio-ingress")),
+		}, "svc.cluster.local"),
+		Namespaces: models.Namespaces{
+			{Name: "app-non-ambient"},
+			{Name: "istio-ingress"},
+		},
+	}
+
+	vals, valid := checker.Check()
+	assert.True(valid, "HTTPRoute in non-Ambient namespace should be valid when Gateway allows routes from all namespaces")
+	assert.Empty(vals, "no KIA1401 should be reported")
+}
+
+// When the Gateway truly does not exist, KIA1401 must be reported regardless
+// of whether the namespace is Ambient or not.
+func TestAmbientHTTPRouteWithNonExistentGateway(t *testing.T) {
+	assert := assert.New(t)
+	conf := config.NewConfig()
+	config.Set(conf)
+
+	checker := NoK8sGatewayChecker{
+		IdentityDomain: "svc.cluster.local",
+		K8sHTTPRoute: data.AddGatewayParentRefToHTTPRoute("does-not-exist", "istio-ingress",
+			data.CreateEmptyHTTPRoute("app", "app-ambient", []string{"app.example.com"})),
+		GatewayNames: make(map[string]k8s_networking_v1.Gateway),
+		Namespaces: models.Namespaces{
+			{Name: "app-ambient", IsAmbient: true, Labels: map[string]string{config.IstioAmbientNamespaceLabel: config.IstioAmbientNamespaceLabelValue}},
+			{Name: "istio-ingress"},
+		},
+	}
+
+	vals, valid := checker.Check()
+	assert.False(valid, "HTTPRoute referencing a non-existent Gateway should be invalid")
+	assert.NotEmpty(vals)
+	assert.NoError(validations.ConfirmIstioCheckMessage("k8sroutes.nok8sgateway", vals[0]))
+}

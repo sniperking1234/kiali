@@ -7,15 +7,8 @@ assignees: ''
 
 ---
 
-**Is your feature request related to a problem? Please describe.**
-A clear and concise description of what the problem is. Ex. I'm always frustrated when [...]
+### What do you want to improve?
 
-**Describe the solution you'd like**
-A clear and concise description of what you want to happen.
+### What is the current behavior?
 
-**Describe alternatives you've considered**
-A clear and concise description of any alternative solutions or features you've considered.
-
-**Additional context**
-Add any other context or screenshots about the feature request here. If it is about a new design, please attach a drawing of a potential solution.
-For backend changes also describe how one could test the new feature and how it impacts display on the UI.
+### What is the new behavior?

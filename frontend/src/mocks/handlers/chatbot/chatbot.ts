@@ -1,0 +1,60 @@
+import { http, HttpResponse } from 'msw';
+import { ChatRequest, ChatResponse } from '../../../types/Chatbot';
+import { conversationEntries } from './conversations';
+
+const buildDefaultResponse = (chatRequest: ChatRequest, provider: string, model: string): ChatResponse => {
+  const query = chatRequest.query.trim();
+
+  return {
+    conversation_id: '1234567890',
+    answer: query
+      ? `Mock response for "${query}". Ask me about namespaces, workloads, or traffic.`
+      : 'Mock response ready. Ask me about namespaces, workloads, or traffic.',
+    actions: [
+      {
+        title: 'Open Overview',
+        kind: 'navigation',
+        payload: '/overview'
+      }
+    ],
+    referenced_docs: [
+      {
+        doc_url: 'https://kiali.io',
+        doc_title: 'Kiali Documentation'
+      }
+    ],
+    used_models: {
+      completion_model: model,
+      embedding_model: `${provider}-embeddings`
+    }
+  };
+};
+
+const buildChatResponse = (chatRequest: ChatRequest, provider: string, model: string): ChatResponse => {
+  const requestedConversation = conversationEntries.get(chatRequest.query.trim());
+  if (!requestedConversation) {
+    return buildDefaultResponse(chatRequest, provider, model);
+  }
+
+  return {
+    conversation_id: '1234567890',
+    ...requestedConversation,
+    answer: typeof requestedConversation.answer === 'string' ? requestedConversation.answer : '',
+    actions: requestedConversation.actions ?? [],
+    referenced_docs: requestedConversation.referenced_docs ?? [],
+    used_models: {
+      completion_model: requestedConversation.used_models?.completion_model ?? model,
+      embedding_model: requestedConversation.used_models?.embedding_model ?? `${provider}-embeddings`
+    }
+  };
+};
+
+export const chatbotHandlers = [
+  http.post('*/api/chat/:provider/:model/ai', async ({ params, request }) => {
+    const body = (await request.json()) as ChatRequest;
+    const provider = String(params.provider ?? 'mock');
+    const model = String(params.model ?? 'mock-model');
+
+    return HttpResponse.json(buildChatResponse(body, provider, model));
+  })
+];

@@ -1,0 +1,12 @@
+[allowlist]
+  description = "Allowlist"
+  paths = [
+    '''business/authentication/openid_auth_controller_test\.go''',
+    '''business/testdata/ca\.crt''',
+    '''business/testdata/ca\.key''',
+    '''business/testdata/ca2\.crt''',
+    '''business/testdata/ca2\.key''',
+    '''config/testdata/test-ca\.pem''',
+    '''hack/istio/multicluster/env\.sh''',
+    '''hack/istio/multicluster/setup-keycloak\.sh''',
+  ]

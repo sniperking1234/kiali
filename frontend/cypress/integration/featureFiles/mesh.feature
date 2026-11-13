@@ -1,0 +1,308 @@
+@mesh-page
+# don't change first line of this file - the tag is used for the test scripts to identify the test suite
+
+Feature: Kiali Mesh page
+
+  User opens the Mesh page with bookinfo deployed
+
+  Background:
+    Given user is at administrator perspective
+    And user is at the "mesh" page
+
+# NOTE: Mesh Find/Hide has its own feature file
+
+  @core-caching
+  @offline
+  Scenario: Open mesh Tour
+    When user opens mesh tour
+    Then user "sees" mesh tour
+
+  @core-caching
+  @offline
+  Scenario: Close mesh Tour
+    When user opens mesh tour
+    And user closes mesh tour
+    Then user "does not see" mesh tour
+
+  @core-caching
+  @multi-mesh
+  @lpinterop
+  # TODO: offline - number of infra nodes don't match up because no grafana/tracing.
+  Scenario: See mesh
+    When user "opens" display menu
+    And user "enables" mesh display option "kiali"
+    And user "closes" display menu
+    And user sees mesh side panel
+    Then user sees expected mesh infra
+
+  @core-caching
+  @lpinterop
+  # TODO: offline - no metrics for side panel yet.
+  Scenario: Test istiod
+    When user selects mesh node with label "istiod"
+    Then user sees control plane side panel
+
+  @core-caching
+  @lpinterop
+  # TODO: offline - no grafana.
+  Scenario: Grafana Infra
+    When user "opens" display menu
+    And user "enables" mesh display option "kiali"
+    And user "closes" display menu
+    And user selects mesh node with label "Grafana"
+    Then user sees "Grafana" node side panel
+
+  @perses
+  Scenario: Perses Infra
+    When user "opens" display menu
+    And user "enables" mesh display option "kiali"
+    And user "closes" display menu
+    And user selects mesh node with label "Perses"
+    Then user sees "Perses" node side panel
+
+  @core-caching
+  # TODO: offline - no tracing.
+  Scenario: Tracing Infra
+    When user "opens" display menu
+    And user "enables" mesh display option "kiali"
+    And user "closes" display menu
+    And user selects tracing mesh node
+    Then user sees tracing node side panel
+
+  @core-caching
+  @lpinterop
+  Scenario: Prometheus Infra
+    When user "opens" display menu
+    And user "enables" mesh display option "kiali"
+    And user "closes" display menu
+    And user selects mesh node with label "Prometheus"
+    Then user sees "Prometheus" node side panel
+
+  @core-caching
+  @offline
+  @lpinterop
+  Scenario: Test DataPlane
+    When user selects mesh node with label "Data Plane"
+    Then user sees data plane side panel
+    When user expands namespace
+    Then user sees config validation info
+
+  @core-caching
+  @offline
+  Scenario: Test Cluster
+    When user selects cluster mesh node
+    Then user sees cluster side panel
+
+  @core-caching
+  @offline
+  Scenario: Test istio-system
+    When user selects mesh node with label "istio-system"
+    Then user sees "istio-system" namespace side panel
+    Then user does not see "dataplane namespaces: 0" in mesh body
+
+  @core-2
+  Scenario: User enables kiali
+    When user "opens" display menu
+    And user "enables" mesh display option "kiali"
+    And user "closes" display menu
+    And user selects mesh node with label "kiali"
+    Then user sees "kiali" node side panel
+
+  @core-2
+  Scenario: Kiali and observability are hidden by default
+    Then user does not see a "kiali" mesh node
+    And user does not see a "grafana" mesh node
+    And user does not see a "metricStore" mesh node
+    And user does not see a "traceStore" mesh node
+    And user does not see a "perses" mesh node
+
+  # TODO: offline - must gather does not collect gateway-api resources which are what the integration tests use to create gateways.
+  @bookinfo-app
+  @core-caching
+  Scenario: User enables gateways
+    When user "opens" display menu
+    And user "enables" mesh display option "gateways"
+    And user "closes" display menu
+    And user selects mesh node with label "bookinfo-gateway"
+    Then user sees "bookinfo-gateway" node side panel
+
+  @waypoint-tracing
+  @bookinfo-app
+  Scenario: User enables waypoints
+    When user "opens" display menu
+    And user "enables" mesh display option "waypoints"
+    And user "closes" display menu
+    And user selects mesh node with label "waypoint"
+    Then user sees "waypoint" node side panel
+
+  @waypoint-tracing
+  Scenario: Test ztunnel
+    When user selects mesh node with label "ztunnel" and nodeType "infra"
+    Then user sees "ztunnel" node side panel
+
+  @skip-ossmc
+  @core-caching
+  @offline
+  Scenario: See the Mesh menu link
+    Then user see the "mesh" menu
+
+  @skip-ossmc
+  @core-caching
+  @offline
+  Scenario: See the Mesh link in the about
+    And user clicks on Help Button
+    And user clicks on About Button
+    Then user see the "mesh" link
+
+  @multi-cluster
+  Scenario: Primary-remote: see one dataplane for each cluster and one controlplane on primary attached to both.
+    Then user sees 1 "dataplane" nodes on the "east" cluster
+    And user sees 1 "dataplane" nodes on the "west" cluster
+    And user sees 1 "istiod" nodes on the "east" cluster
+    And user sees the "istiod" node connected to the 2 "dataplane" nodes
+
+  @multi-cluster
+  @multi-primary
+  Scenario: Multi-primary: see one dataplane and one controlplane for each cluster and an edge between each.
+    Then user sees 1 "dataplane" nodes on the "east" cluster
+    And user sees 1 "dataplane" nodes on the "west" cluster
+    And user sees 1 "istiod" nodes on the "east" cluster
+    And user sees 1 "istiod" nodes on the "west" cluster
+
+  @component-health-upscale
+  @core-2
+  Scenario: Grafana Infra unreachable
+    When user "opens" display menu
+    And user "enables" mesh display option "kiali"
+    And user "closes" display menu
+    And user scales to "0" the "grafana" in namespace "istio-system"
+    Then the user refreshes the page
+    When user selects mesh node with label "Grafana"
+    Then user sees "Grafana" node side panel
+    Then user sees "Version: unknown" node side panel
+    Then user sees "error" icon side panel
+    When user scales to "1" the "grafana" in namespace "istio-system"
+    Then the user refreshes the page
+    When user selects mesh node with label "Grafana"
+    Then user sees "Grafana" node side panel
+    Then user sees "correct" icon side panel
+    Then user does not see "error" icon side panel
+    Then user does not see "warning" icon side panel
+
+  # TODO: offline - unable to apply config
+  @shared-mesh-config
+  @core-2
+  Scenario: Shared mesh config is seen on istiod panel
+    When user selects mesh node with label "istiod"
+    Then user sees control plane side panel
+    And user sees "effective,standard,shared" configuration tabs
+    And user sees "mode: REGISTRY_ONLY" in the "effective" configuration tab
+    And user sees "mode: REGISTRY_ONLY" in the "shared" configuration tab
+    And user does not see "mode: REGISTRY_ONLY" in the "standard" configuration tab
+
+  @core-caching
+  # TODO: offline - no tracing
+  Scenario: User opens and interacts with the Trace Configuration modal
+    When user "opens" display menu
+    And user "enables" mesh display option "kiali"
+    And user "closes" display menu
+    And user selects tracing mesh node
+    And user opens the Trace Configuration modal
+    Then user sees the Trace Configuration modal
+    And user sees the Discovery and Tester tabs
+    And user sees the action buttons fixed at the bottom
+    And user verifies the Discovery information is correct
+    When user clicks the Rediscover button in the Discovery tab
+    And user verifies the Discovery information is correct
+    When user switches to the Tester tab
+    And user changes the provider in the Tester tab
+    And user changes the useGRPC in the Tester tab
+    And user clicks the Test Configuration button
+    Then user sees the Tester result "incorrect"
+    And user changes the provider in the Tester tab
+    And user changes the useGRPC in the Tester tab
+    And user clicks the Test Configuration button
+    Then user sees the Tester result "correct"
+
+  @external-kiali
+  Scenario: External-kiali: see one dataplane and one controlplane for mesh cluster
+    Then user sees 1 "dataplane" nodes on the "mesh" cluster
+    And user sees 1 "istiod" nodes on the "mesh" cluster
+    And user sees the "istiod" node connected to the 1 "dataplane" nodes
+
+  @external-kiali
+  Scenario: External-kiali: see only kiali for mgmt cluster
+    When user "opens" display menu
+    And user "enables" mesh display option "kiali"
+    And user "closes" display menu
+    Then user sees 1 "kiali" nodes on the "mgmt" cluster
+    And user sees 0 "dataplane" nodes on the "mgmt" cluster
+    And user sees 0 "istiod" nodes on the "mgmt" cluster
+    And user sees the "kiali" node connected to the 1 "istiod" nodes
+
+  @smoke
+  Scenario: Local-kiali: see kiali node in local mode
+    When user "opens" display menu
+    And user "enables" mesh display option "kiali"
+    And user "closes" display menu
+    And user sees the "kiali" node connected to the 1 "istiod" nodes
+
+  @multi-cluster
+  Scenario: Primary-remote: namespace panel shows control plane donut for local istio-system
+    When user selects mesh node with label "istio-system" on cluster "east"
+    Then user sees "istio-system" namespace side panel
+    And user sees control plane donut in namespace panel
+
+  @multi-cluster
+  Scenario: Primary-remote: remote cluster shows managed by remote control plane
+    When user selects cluster mesh node on cluster "west"
+    Then user sees "Managed by remote ControlPlane" in cluster panel
+    And user sees the primary cluster name "east" in managed control plane info
+
+  @multi-cluster
+  @multi-primary
+  Scenario: Multi-primary: each namespace panel shows only its own control plane donut
+    When user selects mesh node with label "istio-system" on cluster "east"
+    Then user sees "istio-system" namespace side panel
+    And user sees control plane donut in namespace panel
+    And the namespace panel shows only control planes from the "east" cluster
+
+  @multi-cluster
+  @multi-primary
+  Scenario: Multi-primary: namespace panel shows correct cluster badge
+    When user selects mesh node with label "istio-system" on cluster "west"
+    Then user sees "istio-system" namespace side panel
+    And user sees "west" cluster badge in namespace panel
+
+  @multi-mesh
+  Scenario: Multi-mesh: mesh panel shows correct mesh count in tabs
+    When user sees mesh side panel
+    Then the mesh tab count matches the number of meshes with control planes
+
+  @multi-mesh
+  Scenario: Multi-mesh: single mesh infra summary shows control planes
+    When user sees mesh side panel
+    Then user does not see "dataplane namespaces: 0" in mesh body
+
+  @multi-mesh
+  Scenario: Multi-mesh: control plane summary shows cluster name
+    When user sees mesh side panel
+    Then user sees cluster badge with cluster name in control plane summary
+
+  @ambient-multi-primary
+  Scenario: Ambient Multi-Primary: ambient badge shown on ambient control planes
+    When user selects ambient istiod mesh node
+    Then user sees ambient badge on the control plane panel
+
+  @multi-cluster
+  @multi-primary
+  Scenario: Multi-primary: no ambient badge on sidecar control planes
+    When user selects non-ambient istiod mesh node
+    Then user does not see ambient badge on the control plane panel
+
+  @ambient-multi-primary
+  Scenario: Ambient Multi-Primary: Mesh page shows ambient control planes in both clusters
+    Then user sees the mesh
+    And user sees "2" clusters in the mesh
+    And user sees ztunnel nodes in both clusters
+    And user sees ambient data planes in both clusters

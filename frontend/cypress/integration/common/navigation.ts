@@ -1,0 +1,190 @@
+import { Given, Then } from '@badeball/cypress-cucumber-preprocessor';
+import { DEFAULT_GRAPH_DURATION_SECONDS, detailPageQueryParams, ensureGraphDuration } from './graph';
+import { ensureKialiFinishedLoading } from './transition';
+
+enum DetailType {
+  APP = 'app',
+  ISTIO = 'istio',
+  SERVICE = 'service',
+  WORKLOAD = 'workload'
+}
+
+Given('user is at the {string} list page', (page: string) => {
+  // enable toggles on the list pages so that they can be tested
+  cy.intercept(`**/api/config`, request => {
+    request.reply(response => {
+      response.body['kialiFeatureFlags']['uiDefaults']['list']['showIncludeToggles'] = true;
+      return response;
+    });
+  }).as('config');
+
+  // Forcing "Pause" to not cause unhandled promises from the browser when cypress is testing
+  cy.visit({ url: `${Cypress.config('baseUrl')}/console/${page}?refresh=0` });
+  cy.wait('@config');
+});
+
+Given('user is at the {string} page', (page: string) => {
+  // Forcing "Pause" to not cause unhandled promises from the browser when cypress is testing
+  cy.visit({ url: `${Cypress.config('baseUrl')}/console/${page}?refresh=0` });
+});
+
+Given('user is at the {string} page for the {string} namespace', (page: string, namespace: string) => {
+  // Forcing "Pause" to not cause unhandled promises from the browser when cypress is testing
+  cy.visit({ url: `${Cypress.config('baseUrl')}/console/${page}?refresh=0&namespaces=${namespace}` });
+});
+
+Given('user is at the {string} page with manual refresh', (page: string) => {
+  // Forcing "Manual" to prevent any page load
+  if (page === 'graph') {
+    cy.visit({
+      url: `${Cypress.config('baseUrl')}/console/graph/namespaces?duration=${DEFAULT_GRAPH_DURATION_SECONDS}&namespaces=bookinfo&refresh=1`
+    });
+  } else {
+    cy.visit({ url: `${Cypress.config('baseUrl')}/console/${page}?refresh=1` });
+  }
+});
+
+Given(
+  'user is at the details page for the {string} {string} located in the {string} cluster',
+  (detail: DetailType, namespacedNamed: string, cluster: string) => {
+    cy.url().then(() => {
+      const detailPage = getPageDetail(detail);
+      const qs = detailPageQueryParams(cluster !== '' ? { clusterName: cluster } : {});
+
+      const namespaceAndName = namespacedNamed.split('/');
+      const namespace = namespaceAndName[0];
+      const pageDetail = detailPage;
+      const name =
+        pageDetail === 'istio'
+          ? `${namespaceAndName[1]}/${namespaceAndName[2]}/${namespaceAndName[3]}/${namespaceAndName[4]}`
+          : namespaceAndName[1];
+
+      if (pageDetail === 'services') {
+        cy.intercept({
+          pathname: `**/api/namespaces/${namespace}/services/${name}`,
+          query: {
+            objects: ''
+          }
+        }).as('waitForCall');
+      }
+
+      cy.visit({ url: `${Cypress.config('baseUrl')}/console/namespaces/${namespace}/${pageDetail}/${name}`, qs });
+      ensureKialiFinishedLoading();
+      ensureGraphDuration();
+    });
+  }
+);
+
+const getPageDetail = (detail: DetailType): string => {
+  switch (detail) {
+    case DetailType.APP:
+      return 'applications';
+    case DetailType.SERVICE:
+      return 'services';
+    case DetailType.WORKLOAD:
+      return 'workloads';
+    case DetailType.ISTIO:
+      return 'istio';
+  }
+};
+
+Given(
+  'user is at the details page for the daemonset {string} located in the {string} cluster',
+  (namespacedNamed: string, cluster: string) => {
+    // Check if we're in OSSMC environment
+    const isOSSMC = Cypress.env('OSSMC');
+    if (isOSSMC) {
+      // In OSSMC, we need to get the pod name from the DaemonSet
+      const namespaceAndName = namespacedNamed.split('/');
+      const namespace = namespaceAndName[0];
+      const daemonsetName = namespaceAndName[1];
+
+      // Get the pod name from the DaemonSet
+      cy.exec(`kubectl get pods -n ${namespace} -l app=${daemonsetName} -o jsonpath='{.items[0].metadata.name}'`, {
+        failOnNonZeroExit: false
+      }).then(result => {
+        if (result.exitCode === 0 && result.stdout) {
+          const podName = result.stdout.trim();
+
+          // Use the existing function for workload details
+          cy.visit({
+            url: `${Cypress.config('baseUrl')}/console/namespaces/${namespace}/pods/${podName}`,
+            qs: detailPageQueryParams(cluster !== '' ? { clusterName: cluster } : {})
+          });
+          ensureKialiFinishedLoading();
+        } else {
+          throw new Error(`Failed to get pod name for DaemonSet ${daemonsetName} in namespace ${namespace}`);
+        }
+      });
+    } else {
+      // For non-OSSMC environments, treat DaemonSet as a regular workload
+      const namespaceAndName = namespacedNamed.split('/');
+      const namespace = namespaceAndName[0];
+      const name = namespaceAndName[1];
+
+      cy.visit({
+        url: `${Cypress.config('baseUrl')}/console/namespaces/${namespace}/workloads/${name}`,
+        qs: detailPageQueryParams(cluster !== '' ? { clusterName: cluster } : {})
+      });
+      ensureKialiFinishedLoading();
+    }
+  }
+);
+
+// Then the browser is at the details page for the "<type>" "bookinfo/<name>" located in the "west" cluster
+Given(
+  'the browser is at the details page for the {string} {string} located in the {string} cluster',
+  (detail: DetailType, namespacedName: string, cluster: string) => {
+    const namespaceAndName = namespacedName.split('/');
+    const namespace = namespaceAndName[0];
+    const pageDetail = getPageDetail(detail);
+    const name = pageDetail === 'istio' ? `${namespaceAndName[1]}/${namespaceAndName[2]}` : namespaceAndName[1];
+
+    cy.url().should('include', `/namespaces/${namespace}/${pageDetail}/${name}`);
+    cy.url().should('include', `clusterName=${cluster}`);
+  }
+);
+
+Then('the browser URL should include {string}', (pathFragment: string) => {
+  cy.url({ timeout: 60000 }).should('include', pathFragment);
+});
+
+Then('the browser URL should not include {string}', (pathFragment: string) => {
+  cy.url().should('not.include', pathFragment);
+});
+
+// A simple function to check whether the DOM (or a subset of DOM has the cluster parameter in its links). This is related to multi-cluster testing.
+// In kiosk mode, KialiLink renders buttons with data-href instead of anchors with href.
+export const clusterParameterExists = (present: boolean): void => {
+  const assertion = present ? 'include' : 'not.include';
+
+  // Check anchor elements (Kiali standalone) and button elements with data-href (kiosk mode)
+  cy.get('a[href], button[data-href]').each($el => {
+    const attr = $el.is('a') ? 'href' : 'data-href';
+    cy.wrap($el).should('have.attr', attr).and(assertion, 'clusterName=');
+  });
+};
+
+export const clickSpanFilterOptionWithFallback = (expectedOption: string, fallbackOption = 'waypoint'): void => {
+  cy.get('ul[role="listbox"]')
+    .should('be.visible')
+    .then($list => {
+      if ($list.find(`li[label="${expectedOption}"]`).length > 0) {
+        cy.get(`li[label="${expectedOption}"]`).find('button').click();
+      } else {
+        cy.get(`li[label="${fallbackOption}"]`).find('button').click();
+      }
+    });
+};
+
+Then(`user doesn't see the {string} menu`, menu => {
+  cy.get('#page-sidebar').find(`#${menu}`).should('not.exist');
+});
+
+Then(`user see the {string} menu`, menu => {
+  cy.get('#page-sidebar').find(`#${menu}`).should('exist');
+});
+
+Given('wait for {string} does not exist', (element: string) => {
+  cy.get(`div[data-test="${element}"]`).should('not.exist');
+});

@@ -2,65 +2,161 @@ package handlers
 
 import (
 	"net/http"
+	"strings"
 
 	"github.com/gorilla/mux"
 
+	"github.com/kiali/kiali/business"
+	"github.com/kiali/kiali/cache"
+	"github.com/kiali/kiali/config"
+	"github.com/kiali/kiali/grafana"
+	"github.com/kiali/kiali/handlers/queryparams"
+	"github.com/kiali/kiali/istio"
+	"github.com/kiali/kiali/kubernetes"
 	"github.com/kiali/kiali/log"
+	"github.com/kiali/kiali/models"
+	"github.com/kiali/kiali/prometheus"
+	"github.com/kiali/kiali/tracing"
+	"github.com/kiali/kiali/util/sliceutil"
 )
 
 // NamespaceTls is the API to get namespace-wide mTLS status
-func NamespaceTls(w http.ResponseWriter, r *http.Request) {
-	params := mux.Vars(r)
+func NamespaceTls(
+	conf *config.Config,
+	kialiCache cache.KialiCache,
+	clientFactory kubernetes.ClientFactory,
+	prom prometheus.ClientInterface,
+	cpm business.ControlPlaneMonitor,
+	traceClientLoader func() tracing.ClientInterface,
+	grafana *grafana.Service,
+	discovery *istio.Discovery,
+) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		params := mux.Vars(r)
 
-	// Get business layer
-	business, err := getBusiness(r)
-	if err != nil {
-		RespondWithError(w, http.StatusInternalServerError, "Services initialization error: "+err.Error())
-		return
+		business, err := getLayer(r, conf, kialiCache, clientFactory, cpm, prom, traceClientLoader, grafana, discovery)
+		if err != nil {
+			RespondWithError(w, http.StatusInternalServerError, "Services initialization error: "+err.Error())
+			return
+		}
+
+		namespace := params["namespace"]
+		query := r.URL.Query()
+		if err := queryparams.RejectUnknown(query, "clusterName"); err != nil {
+			RespondWithQueryParamError(w, err.Error())
+			return
+		}
+
+		status, err := business.TLS.NamespaceWidemTLSStatus(r.Context(), namespace, queryparams.ClusterName(conf, query))
+		if err != nil {
+			log.Error(err)
+			// An inaccessible namespace is an authorization failure (403),
+			// not a server error.
+			handleErrorResponse(w, err)
+			return
+		}
+
+		RespondWithJSON(w, http.StatusOK, status)
 	}
+}
 
-	namespace := params["namespace"]
+// ClustersTls is the API to get mTLS status for given namespaces within a single cluster
+func ClustersTls(
+	conf *config.Config,
+	kialiCache cache.KialiCache,
+	clientFactory kubernetes.ClientFactory,
+	prom prometheus.ClientInterface,
+	cpm business.ControlPlaneMonitor,
+	traceClientLoader func() tracing.ClientInterface,
+	grafana *grafana.Service,
+	discovery *istio.Discovery,
+) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		params := r.URL.Query()
+		if err := queryparams.RejectUnknown(params, "clusterName", "namespaces"); err != nil {
+			RespondWithQueryParamError(w, err.Error())
+			return
+		}
+		namespaces := params.Get("namespaces") // csl of namespaces
+		namespaceNamesFromQuery := map[string]struct{}{}
+		if len(namespaces) > 0 {
+			for _, name := range strings.Split(namespaces, ",") {
+				namespaceNamesFromQuery[name] = struct{}{}
+			}
+		}
+		cluster := queryparams.ClusterName(conf, params)
 
-	status, err := business.TLS.NamespaceWidemTLSStatus(namespace)
-	if err != nil {
-		log.Error(err)
-		RespondWithError(w, http.StatusInternalServerError, err.Error())
-		return
+		business, err := getLayer(r, conf, kialiCache, clientFactory, cpm, prom, traceClientLoader, grafana, discovery)
+		if err != nil {
+			RespondWithError(w, http.StatusInternalServerError, "Services initialization error: "+err.Error())
+			return
+		}
+
+		namespaceModels, err := business.Namespace.GetClusterNamespaces(r.Context(), cluster)
+		if err != nil {
+			log.Error(err)
+			RespondWithError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+
+		if len(namespaceNamesFromQuery) != 0 {
+			// Filter out the namespaces included in the query param that don't exist in the cluster.
+			namespaceModels = sliceutil.Filter(namespaceModels, func(ns models.Namespace) bool {
+				_, found := namespaceNamesFromQuery[ns.Name]
+				return found
+			})
+		}
+		status, err := business.TLS.ClusterWideNSmTLSStatus(r.Context(), namespaceModels, cluster)
+		if err != nil {
+			log.Error(err)
+			RespondWithError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+
+		RespondWithJSON(w, http.StatusOK, status)
 	}
-
-	RespondWithJSON(w, http.StatusOK, status)
 }
 
 // MeshTls is the API to get mesh-wide mTLS status
-func MeshTls(w http.ResponseWriter, r *http.Request) {
-	// Get business layer
-	business, err := getBusiness(r)
-	if err != nil {
-		RespondWithError(w, http.StatusInternalServerError, "Services initialization error: "+err.Error())
-		return
-	}
+func MeshTls(
+	conf *config.Config,
+	kialiCache cache.KialiCache,
+	clientFactory kubernetes.ClientFactory,
+	prom prometheus.ClientInterface,
+	cpm business.ControlPlaneMonitor,
+	traceClientLoader func() tracing.ClientInterface,
+	grafana *grafana.Service,
+	discovery *istio.Discovery,
+) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		ctx := r.Context()
 
-	// Get all the namespaces
-	namespaces, err := business.Namespace.GetNamespaces()
-	if err != nil {
-		log.Error(err)
-		RespondWithError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
+		business, err := getLayer(r, conf, kialiCache, clientFactory, cpm, prom, traceClientLoader, grafana, discovery)
+		if err != nil {
+			RespondWithError(w, http.StatusInternalServerError, "Services initialization error: "+err.Error())
+			return
+		}
 
-	// Get all namespace names
-	nsNames := make([]string, 0, len(namespaces))
-	for _, ns := range namespaces {
-		nsNames = append(nsNames, ns.Name)
-	}
+		query := r.URL.Query()
+		if err := queryparams.RejectUnknown(query, "clusterName", "revision"); err != nil {
+			RespondWithQueryParamError(w, err.Error())
+			return
+		}
 
-	// Get mtls status given the whole namespaces
-	globalmTLSStatus, err := business.TLS.MeshWidemTLSStatus(nsNames)
-	if err != nil {
-		log.Error(err)
-		RespondWithError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
+		cluster := queryparams.ClusterName(conf, query)
+		revision := query.Get("revision")
+		if revision == "" {
+			revision = "default"
+		}
 
-	RespondWithJSON(w, http.StatusOK, globalmTLSStatus)
+		// Get mtls status given the whole namespaces
+		globalmTLSStatus, err := business.TLS.MeshWidemTLSStatus(ctx, cluster, revision)
+		if err != nil {
+			log.Error(err)
+			RespondWithError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+
+		RespondWithJSON(w, http.StatusOK, globalmTLSStatus)
+	}
 }

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	pmod "github.com/prometheus/common/model"
@@ -18,23 +19,44 @@ import (
 // IstioMetricsQuery holds query parameters for a typical metrics query
 type IstioMetricsQuery struct {
 	prometheus.RangeQuery
-	Filters         []string
-	Namespace       string
-	App             string
-	Workload        string
-	Service         string
-	Direction       string // outbound | inbound
-	RequestProtocol string // e.g. http | grpc
-	Reporter        string // source | destination, defaults to source if not provided
 	Aggregate       string
 	AggregateValue  string
+	App             string
+	Cluster         string
+	Direction       string // outbound | inbound
+	Filters         []string
+	Namespace       string
+	RequestProtocol string // e.g. http | grpc
+	Reporter        string // source | destination | both, defaults to source if not provided
+	Service         string
+	Workload        string
 }
 
 // FillDefaults fills the struct with default parameters
 func (q *IstioMetricsQuery) FillDefaults() {
+	q.Direction = "outbound"
 	q.RangeQuery.FillDefaults()
 	q.Reporter = "source"
-	q.Direction = "outbound"
+}
+
+var validReporterValues = map[string]bool{
+	"destination": true,
+	"source":      true,
+	"waypoint":    true,
+}
+
+// ValidateReporter checks that a reporter string is valid.
+// Accepts "both" or a comma-separated list of "source", "destination", "waypoint".
+func ValidateReporter(reporter string) error {
+	if reporter == "both" {
+		return nil
+	}
+	for _, r := range strings.Split(reporter, ",") {
+		if !validReporterValues[r] {
+			return fmt.Errorf("bad request, query parameter 'reporter' contains invalid value %q; valid values are 'source', 'destination', 'waypoint', or 'both'", r)
+		}
+	}
+	return nil
 }
 
 // CustomMetricsQuery holds query parameters for a custom metrics query
@@ -60,11 +82,13 @@ type Target struct {
 	Namespace string
 	Name      string
 	Kind      string // app | workload | service
+	Cluster   string
 }
 
 type MetricsStatsQuery struct {
 	Target       Target
 	PeerTarget   *Target
+	Reporters    []string  `json:"reporters,omitempty"`
 	RawQueryTime int64     `json:"queryTime"`
 	QueryTime    time.Time `json:"-"`
 	RawInterval  string    `json:"interval"`
@@ -88,6 +112,9 @@ func (q *MetricsStatsQuery) Validate() *util.Errors {
 	if q.Direction != "inbound" && q.Direction != "outbound" {
 		errs.AddString("bad request: 'direction' must be either 'inbound' or 'outbound'")
 	}
+	if err := q.validateReporters(); err != nil {
+		errs.Merge(err)
+	}
 	if q.RawQueryTime == 0 {
 		errs.AddString("bad request: 'queryTime' must be defined")
 	}
@@ -98,16 +125,90 @@ func (q *MetricsStatsQuery) Validate() *util.Errors {
 	return errs.OrNil()
 }
 
-// GenKey !! HAS to mirror frontend's genStatsKey in SpanTable.tsx
+// GenKey !! HAS to mirror frontend's genStatsKey in frontend/src/types/MetricsOptions.ts
 func (q *MetricsStatsQuery) GenKey() string {
 	peer := ""
 	if q.PeerTarget != nil {
 		peer = q.PeerTarget.GenKey()
 	}
-	return fmt.Sprintf("%s:%s:%s:%s", q.Target.GenKey(), peer, q.Direction, q.RawInterval)
+	return strings.Join([]string{
+		q.Target.GenKey(),
+		peer,
+		q.Direction,
+		q.RawInterval,
+		strings.Join(q.normalizedReporters(), ","),
+	}, ":")
 }
+
+func (q *MetricsStatsQuery) validateReporters() *util.Errors {
+	var errs util.Errors
+	if q.Direction != "inbound" && q.Direction != "outbound" {
+		return nil
+	}
+
+	sideReporter := q.sideReporter()
+	if len(q.Reporters) == 0 {
+		return nil
+	}
+
+	hasSideReporter := false
+	for _, reporter := range q.Reporters {
+		if reporter == sideReporter {
+			hasSideReporter = true
+			continue
+		}
+		if reporter != "waypoint" {
+			errs.AddString(fmt.Sprintf("bad request: 'reporters' can only include '%s' or 'waypoint' for direction '%s'", sideReporter, q.Direction))
+			return errs.OrNil()
+		}
+	}
+
+	if !hasSideReporter {
+		errs.AddString(fmt.Sprintf("bad request: 'reporters' must include '%s' for direction '%s'", sideReporter, q.Direction))
+	}
+	return errs.OrNil()
+}
+
+func (q *MetricsStatsQuery) normalizedReporters() []string {
+	reporters := q.Reporters
+	if len(reporters) == 0 {
+		reporters = []string{q.sideReporter()}
+	}
+
+	normalized := make([]string, 0, len(reporters))
+	seen := make(map[string]struct{}, len(reporters))
+	for _, reporter := range reporters {
+		if _, found := seen[reporter]; found {
+			continue
+		}
+		seen[reporter] = struct{}{}
+		normalized = append(normalized, reporter)
+	}
+
+	sort.Strings(normalized)
+	return normalized
+}
+
+func (q *MetricsStatsQuery) sideReporter() string {
+	if q.Direction == "outbound" {
+		return "source"
+	}
+	return "destination"
+}
+
 func (t *Target) GenKey() string {
-	return fmt.Sprintf("%s:%s:%s", t.Namespace, t.Kind, t.Name)
+	return strings.Join([]string{t.Namespace, t.Kind, t.Name}, ":")
+}
+
+// ControlPlaneMetricsQuery holds query parameters for a control plane metrics query
+type ControlPlaneMetricsQuery struct {
+	prometheus.RangeQuery
+}
+
+// FillDefaults fills the struct with default parameters
+func (q *ControlPlaneMetricsQuery) FillDefaults() {
+	q.RangeQuery.FillDefaults()
+	q.Quantiles = []string{"0.99"}
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -124,6 +225,9 @@ type Datapoint struct {
 	Timestamp int64
 	Value     float64
 }
+
+// MetricsPerNamespace map for MetricsMap per namespace
+type MetricsPerNamespace = map[string]MetricsMap
 
 // MetricsMap contains all simple metrics and histograms data for standard timeseries queries
 type MetricsMap = map[string][]Metric
@@ -149,6 +253,7 @@ type MetricsStatsResult struct {
 // MODEL CONVERSION
 
 type ConversionParams struct {
+	LabelPrefix      string
 	Scale            float64
 	SortLabel        string
 	SortLabelParseAs string
@@ -181,6 +286,46 @@ func ConvertMetric(name string, from prometheus.Metric, conversionParams Convers
 	return convertMatrix(from.Matrix, name, "", conversionParams), nil
 }
 
+// EnsureDisplayNameMetrics adds zero-filled series for configured display names that
+// are missing from Prometheus results so multi-metric charts always show every series.
+func EnsureDisplayNameMetrics(series []Metric, displayNames []string) []Metric {
+	if len(displayNames) <= 1 {
+		return series
+	}
+
+	present := make(map[string]bool, len(series))
+	for _, s := range series {
+		if s.Name != "" {
+			present[s.Name] = true
+		}
+	}
+
+	var refDatapoints []Datapoint
+	for _, s := range series {
+		if len(s.Datapoints) > 0 {
+			refDatapoints = s.Datapoints
+			break
+		}
+	}
+
+	for _, displayName := range displayNames {
+		if displayName == "" || present[displayName] {
+			continue
+		}
+		datapoints := make([]Datapoint, len(refDatapoints))
+		for i, dp := range refDatapoints {
+			datapoints[i] = Datapoint{Timestamp: dp.Timestamp, Value: 0}
+		}
+		series = append(series, Metric{
+			Datapoints: datapoints,
+			Labels:     map[string]string{},
+			Name:       displayName,
+		})
+	}
+
+	return series
+}
+
 func convertMatrix(from pmod.Matrix, name, stat string, conversionParams ConversionParams) []Metric {
 	series := make([]Metric, len(from))
 	if len(conversionParams.SortLabel) > 0 {
@@ -210,6 +355,11 @@ func convertSampleStream(from *pmod.SampleStream, name, stat string, conversionP
 			continue
 		}
 		labelSet[string(k)] = string(v)
+		if conversionParams.LabelPrefix != "" {
+			for i := range labelSet {
+				labelSet[i] = fmt.Sprintf("%s (%s)", conversionParams.LabelPrefix, v)
+			}
+		}
 	}
 	values := make([]Datapoint, len(from.Values))
 	for i, v := range from.Values {

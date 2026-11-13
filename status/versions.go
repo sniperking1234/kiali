@@ -1,323 +1,267 @@
 package status
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
-	"regexp"
+	"net/url"
 	"strings"
 	"time"
 
-	"github.com/hashicorp/go-version"
-	kversion "k8s.io/apimachinery/pkg/version"
-	kube "k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
-
 	"github.com/kiali/kiali/config"
+	"github.com/kiali/kiali/grafana"
 	"github.com/kiali/kiali/kubernetes"
 	"github.com/kiali/kiali/log"
+	"github.com/kiali/kiali/models"
+	"github.com/kiali/kiali/perses"
+	"github.com/kiali/kiali/prometheus"
+	"github.com/kiali/kiali/tracing/tempo"
 	"github.com/kiali/kiali/util/httputil"
 )
 
-type externalService func() (*ExternalServiceInfo, error)
+func getVersions(ctx context.Context, conf *config.Config, clientFactory kubernetes.ClientFactory, grafana *grafana.Service, perses *perses.Service, prom prometheus.ClientInterface) []models.ExternalServiceInfo {
+	components := getKubernetesVersions(clientFactory)
 
-var (
-	// Example Maistra product version is:
-	//   redhat@redhat-docker.io/maistra-0.1.0-1-3a136c90ec5e308f236e0d7ebb5c4c5e405217f4-unknown
-	// Example Maistra upstream project version is:
-	//   redhat@redhat-pulp.abc.xyz.redhat.com:8888/openshift-istio-tech-preview-0.1.0-1-3a136c90ec5e308f236e0d7ebb5c4c5e405217f4-Custom
-	//   Maistra_1.1.0-291c5419cf19d2b015e7e5dee970c458fb8f1982-Clean
-	// Example OpenShift Service Mesh 1.1 product version is:
-	//   OSSM_1.1.0-291c5419cf19d2b015e7e5dee970c458fb8f1982-Clean
-	// Example Istio snapshot version is:
-	//   root@f72e3d3ef3c2-docker.io/istio-release-1.0-20180927-21-10-cbe9c05c470ec1924f7bcf02334b183e7e6175cb-Clean
-	// Example Istio alpha RC version is:
-	//   1.7.0-alpha.1-cd46a166947eac363380c3aa3523b26a8c391f98-dirty-Modified
-	// Example Istio dev version is:
-	//   1.5-alpha.dbd2aca8887fb42c2bb358417621a78de372f906-dbd2aca8887fb42c2bb358417621a78de372f906-Clean
-	maistraProductVersionExpr = regexp.MustCompile(`maistra-([0-9]+\.[0-9]+\.[0-9]+)`)
-	ossmVersionExpr           = regexp.MustCompile(`(?:OSSM_|openshift-service-mesh-)([0-9]+\.[0-9]+\.[0-9]+)`)
-	maistraProjectVersionExpr = regexp.MustCompile(`(?:Maistra_|openshift-istio.*-)([0-9]+\.[0-9]+\.[0-9]+)`)
-	istioDevVersionExpr       = regexp.MustCompile(`(\d+\.\d+)-alpha\.([[:alnum:]]+)-.*`)
-	istioRCVersionExpr        = regexp.MustCompile(`(\d+\.\d+.\d+)-((?:alpha|beta|rc|RC)\.\d+)`)
-	istioSnapshotVersionExpr  = regexp.MustCompile(`istio-release-([0-9]+\.[0-9]+)(-[0-9]{8})`)
-	istioVersionExpr          = regexp.MustCompile(`([0-9]+\.[0-9]+\.[0-9]+)`)
-)
-
-func getVersions() {
-	components := []externalService{
-		istioVersion,
-		prometheusVersion,
-		kubernetesVersion,
+	if conf.ExternalServices.Prometheus.Enabled {
+		pv, err := prometheusVersion(ctx, prom)
+		if err != nil {
+			log.Infof("Error getting Prometheus version: %v", err)
+		} else {
+			components = append(components, *pv)
+		}
 	}
 
-	if config.Get().ExternalServices.Grafana.Enabled {
-		components = append(components, grafanaVersion)
+	if conf.ExternalServices.Grafana.Enabled && grafana != nil {
+		gv, err := grafanaVersion(ctx, grafana, conf, clientFactory.GetSAHomeClusterClient())
+		if err != nil {
+			log.Infof("Error getting Grafana version: %v", err)
+		} else {
+			components = append(components, *gv)
+		}
 	} else {
 		log.Debugf("Grafana is disabled in Kiali by configuration")
 	}
 
-	if config.Get().ExternalServices.Tracing.Enabled {
-		components = append(components, jaegerVersion)
+	if conf.ExternalServices.Perses.Enabled && perses != nil {
+		pev, err := persesVersion(ctx, perses, conf, clientFactory.GetSAHomeClusterClient())
+		if err != nil {
+			log.Infof("Error getting Perses version: %v", err)
+		} else {
+			components = append(components, *pev)
+		}
 	} else {
-		log.Debugf("Jaeger is disabled in Kiali by configuration")
+		log.Debugf("Perses is disabled in Kiali by configuration")
 	}
 
-	for _, comp := range components {
-		getVersionComponent(comp)
+	if conf.ExternalServices.Tracing.Enabled {
+		tv, err := tracingVersion(conf, clientFactory.GetSAHomeClusterClient())
+		if err != nil {
+			log.Infof("Error getting Tracing version: %v", err)
+		} else {
+			components = append(components, *tv)
+		}
+	} else {
+		log.Debugf("Tracing is disabled in Kiali by configuration")
 	}
+
+	return components
 }
 
-func getVersionComponent(serviceComponent externalService) {
-	componentInfo, err := serviceComponent()
-	if err == nil {
-		info.ExternalServices = append(info.ExternalServices, *componentInfo)
-	}
+type jaegerResponseVersion struct {
+	Version string `json:"gitVersion"`
 }
 
-// validateVersion returns true if requiredVersion "<op> version" (e.g. ">= 0.7.1") is satisfied by installedversion
-func validateVersion(requiredVersion string, installedVersion string) bool {
-	reqWords := strings.Split(requiredVersion, " ")
-	requirementV, errReqV := version.NewVersion(reqWords[1])
-	installedV, errInsV := version.NewVersion(installedVersion)
-	if errReqV != nil || errInsV != nil {
-		return false
-	}
-	switch operator := reqWords[0]; operator {
-	case "==":
-		return installedV.Equal(requirementV)
-	case ">=":
-		return installedV.GreaterThan(requirementV) || installedV.Equal(requirementV)
-	case ">":
-		return installedV.GreaterThan(requirementV)
-	case "<=":
-		return installedV.LessThan(requirementV) || installedV.Equal(requirementV)
-	case "<":
-		return installedV.LessThan(requirementV)
-	}
-	return false
+type tempoResponseVersion struct {
+	Version   string `json:"version"`
+	Revision  string `json:"revision"`
+	Branch    string `json:"branch"`
+	BuildUser string `json:"buildUser"`
+	BuildDate string `json:"buildDate"`
+	GoVersion string `json:"goVersion"`
 }
 
-// istioVersion returns the current istio version information
-func istioVersion() (*ExternalServiceInfo, error) {
-	istioConfig := config.Get().ExternalServices.Istio
-	body, code, err := httputil.HttpGet(istioConfig.UrlServiceVersion, nil, 10*time.Second)
+func tracingVersion(conf *config.Config, homeClusterSAClient kubernetes.ClientInterface) (*models.ExternalServiceInfo, error) {
+	tracingConfig := conf.ExternalServices.Tracing
+
+	if !tracingConfig.Enabled {
+		return nil, nil
+	}
+
+	product := models.ExternalServiceInfo{}
+	product.Name = string(tracingConfig.Provider)
+	product.Url = tracingConfig.ExternalURL
+
+	// we want to go to the internal URL to obtain the version. If it isn't specified, fallback to the external URL.
+	versionUrl := tracingConfig.InternalURL
+	isInternalURL := versionUrl != ""
+	if versionUrl == "" {
+		versionUrl = tracingConfig.ExternalURL
+	}
+
+	if versionUrl != "" && !tracingConfig.DisableVersionCheck {
+		// Parse URL to apply Tempo tenant-specific path if needed
+		parsedUrl, err := url.Parse(versionUrl)
+		if err == nil {
+			tempo.ConstructTempoTenantURL(parsedUrl, &tracingConfig, isInternalURL)
+			versionUrl = parsedUrl.String()
+		}
+		// try to determine version by querying
+		if tracingConfig.Provider == config.JaegerProvider {
+			auth := tracingConfig.Auth
+			if auth.UseKialiToken {
+				auth.Token = config.Credential(kubernetes.GetServiceAccountTokenCredential(homeClusterSAClient))
+			}
+
+			// there is no known way to get the version from GRPC. So we'll try to change the URL to go over HTTP,
+			// but this is not guaranteed to work. But it is worth a try.
+			if tracingConfig.UseGRPC {
+				parsedUrl, err := url.Parse(versionUrl)
+				if err == nil {
+					// strip the port - if the URL is http, it'll go over 80, if https, it'll go over 443
+					if host := parsedUrl.Hostname(); host != "" {
+						parsedUrl.Host = host
+						versionUrl = parsedUrl.String()
+						log.Debugf("Cannot get tracing version via GRPC; will try over HTTP: [%v]", versionUrl)
+					}
+				}
+			}
+
+			body, statusCode, _, err := httputil.HttpGet(versionUrl, &auth, 10*time.Second, nil, nil, conf)
+			if err != nil || statusCode > 399 {
+				log.Infof("jaeger version check failed: url=[%v], code=[%v], err=[%v]", versionUrl, statusCode, err)
+			} else {
+				// Jaeger does not provide api to get version, so it is obtained from js function inside html main page
+				// const JAEGER_VERSION = {"gitCommit: xxx, gitVersion: yyy, buildDate: zzz"}
+				bodyStr := string(body)
+				jaegerVersionConst := "const JAEGER_VERSION = "
+				jsonStartIndex := strings.Index(bodyStr, jaegerVersionConst) + len(jaegerVersionConst)
+				jsonEndIndex := jsonStartIndex + strings.Index(bodyStr[jsonStartIndex:], ";") // version json ends with ;
+				jaegerVersion := bodyStr[jsonStartIndex:jsonEndIndex]
+
+				jaegerV := new(jaegerResponseVersion)
+				err = json.Unmarshal([]byte(jaegerVersion), &jaegerV)
+				if err == nil {
+					product.Version = jaegerV.Version
+				}
+			}
+		} else {
+			// Tempo
+			if tracingConfig.Provider == config.TempoProvider {
+				auth := tracingConfig.Auth
+				if auth.UseKialiToken {
+					auth.Token = config.Credential(kubernetes.GetServiceAccountTokenCredential(homeClusterSAClient))
+				}
+				body, statusCode, _, err := httputil.HttpGet(fmt.Sprintf("%s/api/status/buildinfo", versionUrl), &auth, 10*time.Second, tracingConfig.CustomHeaders, nil, conf)
+				if err != nil || statusCode > 399 {
+					log.Infof("tempo version check failed: url=[%v], code=[%v], err=[%v]", versionUrl, statusCode, err)
+				} else {
+					tempoV := new(tempoResponseVersion)
+					err = json.Unmarshal(body, &tempoV)
+					if err == nil {
+						product.Version = tempoV.Version
+					}
+				}
+			}
+		}
+	}
+
+	product.TempoConfig = tracingConfig.TempoConfig
+
+	return &product, nil
+}
+
+type grafanaBuildInfo struct {
+	Version string `json:"version"`
+}
+
+type grafanaResponseVersion struct {
+	BuildInfo grafanaBuildInfo `json:"buildInfo"`
+}
+
+type persesResponseVersion struct {
+	Version string `json:"version"`
+}
+
+func grafanaVersion(ctx context.Context, grafana *grafana.Service, conf *config.Config, homeClusterSAClient kubernetes.ClientInterface) (*models.ExternalServiceInfo, error) {
+	product := models.ExternalServiceInfo{}
+	product.Name = "Grafana"
+	product.Url = grafana.URL(ctx)
+
+	versionUrl := grafana.VersionURL(ctx)
+	if versionUrl != "" {
+		// Be sure to copy config.Auth and not modify the existing
+		auth := conf.ExternalServices.Grafana.Auth
+		if auth.UseKialiToken {
+			auth.Token = config.Credential(kubernetes.GetServiceAccountTokenCredential(homeClusterSAClient))
+		}
+		body, statusCode, _, err := httputil.HttpGet(versionUrl, &auth, 10*time.Second, nil, nil, conf)
+
+		if err != nil || statusCode > 399 {
+			log.Infof("grafana version check failed: url=[%v], code=[%v]", versionUrl, statusCode)
+		} else {
+			grafanaV := new(grafanaResponseVersion)
+			err = json.Unmarshal(body, &grafanaV)
+			if err == nil {
+				product.Version = grafanaV.BuildInfo.Version
+			}
+		}
+	}
+
+	return &product, nil
+}
+
+func persesVersion(ctx context.Context, perses *perses.Service, conf *config.Config, homeClusterSAClient kubernetes.ClientInterface) (*models.ExternalServiceInfo, error) {
+	product := models.ExternalServiceInfo{}
+	product.Name = "Perses"
+	product.Url = perses.URL(ctx)
+
+	versionUrl := perses.VersionURL(ctx)
+	if versionUrl != "" {
+		body, statusCode, _, err := httputil.HttpGet(versionUrl, perses.GetAuth(ctx), 10*time.Second, nil, nil, conf)
+
+		if err != nil || statusCode > 399 {
+			log.Infof("perses version check failed: url=[%v], code=[%v]", versionUrl, statusCode)
+		} else {
+			persesV := new(persesResponseVersion)
+			err = json.Unmarshal(body, &persesV)
+			if err == nil {
+				product.Version = persesV.Version
+			}
+		}
+	}
+
+	return &product, nil
+}
+
+func prometheusVersion(ctx context.Context, prom prometheus.ClientInterface) (*models.ExternalServiceInfo, error) {
+	info, err := prom.GetBuildInfo(ctx)
 	if err != nil {
 		return nil, err
 	}
-	if code >= 400 {
-		return nil, fmt.Errorf("getting istio version returned error code %d", code)
-	}
-	rawVersion := string(body)
-	return parseIstioRawVersion(rawVersion)
+
+	return &models.ExternalServiceInfo{
+		Name:    "Prometheus",
+		Version: info.Version,
+	}, nil
 }
 
-func parseIstioRawVersion(rawVersion string) (*ExternalServiceInfo, error) {
-	product := ExternalServiceInfo{Name: "Unknown", Version: "Unknown"}
-
-	// First see if we detect Maistra (either product or upstream project).
-	// If it is not Maistra, see if it is upstream Istio (either a release or snapshot).
-	// If it is neither then it is some unknown Istio implementation that we do not support.
-
-	maistraVersionStringArr := maistraProductVersionExpr.FindStringSubmatch(rawVersion)
-	if maistraVersionStringArr != nil {
-		log.Debugf("Detected Maistra product version [%v]", rawVersion)
-		if len(maistraVersionStringArr) > 1 {
-			product.Name = "Maistra"
-			product.Version = maistraVersionStringArr[1] // get regex group #1 ,which is the "#.#.#" version string
-			if !validateVersion(config.MaistraVersionSupported, product.Version) {
-				info.WarningMessages = append(info.WarningMessages, "Maistra version "+product.Version+" is not supported, the version should be "+config.MaistraVersionSupported)
-			}
-
-			// we know this is Maistra - either a supported or unsupported version - return now
-			return &product, nil
-		}
-	}
-
-	maistraVersionStringArr = maistraProjectVersionExpr.FindStringSubmatch(rawVersion)
-	if maistraVersionStringArr != nil {
-		log.Debugf("Detected Maistra project version [%v]", rawVersion)
-		if len(maistraVersionStringArr) > 1 {
-			product.Name = "Maistra Project"
-			product.Version = maistraVersionStringArr[1] // get regex group #1 ,which is the "#.#.#" version string
-			if !validateVersion(config.MaistraVersionSupported, product.Version) {
-				info.WarningMessages = append(info.WarningMessages, "Maistra project version "+product.Version+" is not supported, the version should be "+config.MaistraVersionSupported)
-			}
-
-			// we know this is Maistra - either a supported or unsupported version - return now
-			return &product, nil
-		}
-	}
-
-	// OpenShift Service Mesh
-	ossmStringArr := ossmVersionExpr.FindStringSubmatch(rawVersion)
-	if ossmStringArr != nil {
-		log.Debugf("Detected OpenShift Service Mesh version [%v]", rawVersion)
-		if len(ossmStringArr) > 1 {
-			product.Name = "OpenShift Service Mesh"
-			product.Version = ossmStringArr[1] // get regex group #1 ,which is the "#.#.#" version string
-			if !validateVersion(config.OSSMVersionSupported, product.Version) {
-				info.WarningMessages = append(info.WarningMessages, "OpenShift Service Mesh version "+product.Version+" is not supported, the version should be "+config.OSSMVersionSupported)
-			}
-
-			// we know this is OpenShift Service Mesh - either a supported or unsupported version - return now
-			return &product, nil
-		}
-	}
-
-	// see if it is a snapshot version of Istio
-	istioVersionStringArr := istioSnapshotVersionExpr.FindStringSubmatch(rawVersion)
-	if istioVersionStringArr != nil {
-		log.Debugf("Detected Istio snapshot version [%v]", rawVersion)
-		if len(istioVersionStringArr) > 2 {
-			product.Name = "Istio Snapshot"
-			majorMinor := istioVersionStringArr[1]  // regex group #1 is the "#.#" version numbers
-			snapshotStr := istioVersionStringArr[2] // regex group #2 is the date/time stamp
-			product.Version = majorMinor + snapshotStr
-			if !validateVersion(config.IstioVersionSupported, majorMinor) {
-				info.WarningMessages = append(info.WarningMessages, "Istio snapshot version "+product.Version+" is not supported, the version should be "+config.IstioVersionSupported)
-			}
-			// we know this is Istio upstream - either a supported or unsupported version - return now
-			return &product, nil
-		}
-	}
-
-	// see if it is an RC version of Istio
-	istioVersionStringArr = istioRCVersionExpr.FindStringSubmatch(rawVersion)
-	if istioVersionStringArr != nil {
-		log.Debugf("Detected Istio RC version [%v]", rawVersion)
-		if len(istioVersionStringArr) > 2 {
-			product.Name = "Istio RC"
-			majorMinor := istioVersionStringArr[1] // regex group #1 is the "#.#.#" version numbers
-			rc := istioVersionStringArr[2]         // regex group #2 is the alpha or beta version
-			product.Version = fmt.Sprintf("%s (%s)", majorMinor, rc)
-			if !validateVersion(config.IstioVersionSupported, majorMinor) {
-				info.WarningMessages = append(info.WarningMessages, "Istio release candidate version "+product.Version+" is not supported, the version should be "+config.IstioVersionSupported)
-			}
-			// we know this is Istio upstream - either a supported or unsupported version - return now
-			return &product, nil
-		}
-	}
-
-	// see if it is a dev version of Istio
-	istioVersionStringArr = istioDevVersionExpr.FindStringSubmatch(rawVersion)
-	if istioVersionStringArr != nil {
-		log.Debugf("Detected Istio dev version [%v]", rawVersion)
-		if len(istioVersionStringArr) > 2 {
-			product.Name = "Istio Dev"
-			majorMinor := istioVersionStringArr[1] // regex group #1 is the "#.#" version numbers
-			buildHash := istioVersionStringArr[2]  // regex group #2 is the build hash
-			product.Version = fmt.Sprintf("%s (dev %s)", majorMinor, buildHash)
-			if !validateVersion(config.IstioVersionSupported, majorMinor) {
-				info.WarningMessages = append(info.WarningMessages, "Istio dev version "+product.Version+" is not supported, the version should be "+config.IstioVersionSupported)
-			}
-			// we know this is Istio upstream - either a supported or unsupported version - return now
-			return &product, nil
-		}
-	}
-
-	// see if it is a released version of Istio
-	istioVersionStringArr = istioVersionExpr.FindStringSubmatch(rawVersion)
-	if istioVersionStringArr != nil {
-		log.Debugf("Detected Istio version [%v]", rawVersion)
-		if len(istioVersionStringArr) > 1 {
-			product.Name = "Istio"
-			product.Version = istioVersionStringArr[1] // get regex group #1 ,which is the "#.#.#" version string
-			if !validateVersion(config.IstioVersionSupported, product.Version) {
-				info.WarningMessages = append(info.WarningMessages, "Istio version "+product.Version+" is not supported, the version should be "+config.IstioVersionSupported)
-			}
-			// we know this is Istio upstream - either a supported or unsupported version - return now
-			return &product, nil
-		}
-	}
-
-	log.Debugf("Detected unknown Istio implementation version [%v]", rawVersion)
-	product.Name = "Unknown Istio Implementation"
-	product.Version = rawVersion
-	info.WarningMessages = append(info.WarningMessages, "Unknown Istio implementation version "+product.Version+" is not recognized, thus not supported.")
-	return &product, nil
-}
-
-type p8sResponseVersion struct {
-	Version  string `json:"version"`
-	Revision string `json:"revision"`
-}
-
-func jaegerVersion() (*ExternalServiceInfo, error) {
-	jaegerConfig := config.Get().ExternalServices.Tracing
-
-	if !jaegerConfig.Enabled {
-		return nil, nil
-	}
-	product := ExternalServiceInfo{}
-	product.Name = "Jaeger"
-	product.Url = jaegerConfig.URL
-
-	return &product, nil
-}
-
-func grafanaVersion() (*ExternalServiceInfo, error) {
-	product := ExternalServiceInfo{}
-	product.Name = "Grafana"
-	product.Url = DiscoverGrafana()
-
-	return &product, nil
-}
-
-func prometheusVersion() (*ExternalServiceInfo, error) {
-	product := ExternalServiceInfo{}
-	prometheusV := new(p8sResponseVersion)
-	cfg := config.Get().ExternalServices.Prometheus
-
-	// Be sure to copy config.Auth and not modify the existing
-	auth := cfg.Auth
-	if auth.UseKialiToken {
-		token, err := kubernetes.GetKialiToken()
+func getKubernetesVersions(clientFactory kubernetes.ClientFactory) []models.ExternalServiceInfo {
+	// Use the Kiali Service Account client to get the Kubernetes version
+	// since the status endpoint does not have a user token.
+	// Loop through all SA clients to get Kubernetes versions of all clusters
+	var k8sVersions []models.ExternalServiceInfo
+	for clusterName, saClient := range clientFactory.GetSAClients() {
+		serverVersion, err := saClient.GetServerVersion()
 		if err != nil {
-			log.Errorf("Could not read the Kiali Service Account token: %v", err)
-			return nil, err
+			log.Debugf("Unable to get Kubernetes version for cluster [%s]: %v", clusterName, err)
+			continue
 		}
-		auth.Token = token
+
+		k8sVersions = append(k8sVersions, models.ExternalServiceInfo{
+			Name:    fmt.Sprintf("%s-%s", "Kubernetes", clusterName),
+			Version: serverVersion.GitVersion,
+		})
 	}
 
-	body, _, err := httputil.HttpGet(cfg.URL+"/version", &auth, 10*time.Second)
-	if err == nil {
-		err = json.Unmarshal(body, &prometheusV)
-		if err == nil {
-			product.Name = "Prometheus"
-			product.Version = prometheusV.Version
-			return &product, nil
-		}
-	}
-	return nil, err
-}
-
-func kubernetesVersion() (*ExternalServiceInfo, error) {
-	var (
-		err           error
-		k8sConfig     *rest.Config
-		k8s           *kube.Clientset
-		serverVersion *kversion.Info
-	)
-
-	product := ExternalServiceInfo{}
-	k8sConfig, err = kubernetes.ConfigClient()
-	if err == nil {
-		k8sConfig.QPS = config.Get().KubernetesConfig.QPS
-		k8sConfig.Burst = config.Get().KubernetesConfig.Burst
-		k8s, err = kube.NewForConfig(k8sConfig)
-		if err == nil {
-			serverVersion, err = k8s.Discovery().ServerVersion()
-			if err == nil {
-				product.Name = "Kubernetes"
-				product.Version = serverVersion.GitVersion
-				return &product, nil
-			}
-		}
-	}
-	return nil, err
-}
-
-// Check Iter8 Supported Version
-func IsIter8Supported(analyticsImgVersion string) bool {
-	return validateVersion(config.Iter8VersionSupported, analyticsImgVersion)
+	return k8sVersions
 }

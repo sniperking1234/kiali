@@ -1,0 +1,52 @@
+name: Backend Unit Tests and Linters
+
+on:
+  workflow_call:
+    inputs:
+      build_branch:
+        required: true
+        type: string
+jobs:
+  build_backend:
+    name: Run backend unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        ref: ${{ inputs.build_branch }}
+
+    - name: Set up Go
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      with:
+        go-version-file: go.mod
+        cache: true
+        cache-dependency-path: go.sum
+
+    - name: Verify code formatting
+      run: |
+        make format
+        if [[ $(git diff --stat) != '' ]]; then
+          echo "Code is not properly formatted. Please run 'make format' and commit the changes."
+          git diff
+          exit 1
+        fi
+
+    - name: Verify code linting
+      uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+      with:
+        version: v2.12.2
+
+    - name: Run backend unit tests with coverage
+      run: |
+        make -e GO_TEST_FLAGS="-race -coverpkg=github.com/kiali/kiali/... -coverprofile=coverage-unit.out" test
+
+    - name: Verify coverage profile
+      run: wc -l coverage-unit.out
+
+    - name: Upload unit coverage artifact
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: coverage-unit
+        path: coverage-unit.out

@@ -1,0 +1,435 @@
+import * as React from 'react';
+import { connect } from 'react-redux';
+import { bindActionCreators } from 'redux';
+import type { KialiDispatch } from 'types/Redux';
+import { Card, CardBody, Checkbox, Toolbar, ToolbarGroup, ToolbarItem } from '@patternfly/react-core';
+import { classes } from 'typestyle';
+import {
+  tabCardStyle,
+  constrainedScrollStyle,
+  flexCardStyle,
+  flexFillStyle,
+  noShrinkStyle,
+  scrollableContentStyle
+} from 'styles/FlexStyles';
+import * as API from 'services/Api';
+import type { KialiAppState } from 'store/Store';
+import type { TimeRange, TimeInMilliseconds, IntervalInMilliseconds } from 'types/Common';
+import { evalTimeRange, isEqualTimeRange } from 'types/Common';
+import type { Direction, IstioMetricsOptions } from 'types/MetricsOptions';
+import { withWaypoint, baseReporter } from 'types/MetricsOptions';
+import { addError } from 'utils/AlertUtils';
+import * as MetricsHelper from './Helper';
+import { KioskElement } from '../Kiosk/KioskElement';
+import type { MetricsSettings, LabelsSettings } from '../MetricsOptions/MetricsSettings';
+import { MetricsSettingsDropdown } from '../MetricsOptions/MetricsSettingsDropdown';
+import { MetricsReporter } from '../MetricsOptions/MetricsReporter';
+import { TimeDurationModal } from '../Time/TimeDurationModal';
+import { location, router, URLParam } from 'app/History';
+import { MetricsObjectTypes } from 'types/Metrics';
+import type { JaegerLineInfo } from './SpanOverlay';
+import { SpanOverlay } from './SpanOverlay';
+import type { ChartModel, DashboardModel } from 'types/Dashboards';
+import type { Overlay } from 'types/Overlay';
+import type { RawOrBucket } from 'types/VictoryChartInfo';
+import { Dashboard } from 'components/Charts/Dashboard';
+import { languageSelector, refreshIntervalSelector, timeRangeSelector } from 'store/Selectors';
+import { UserSettingsActions } from 'actions/UserSettingsActions';
+import type { KialiDisabledFeatures } from 'types/ServerConfig';
+import { TimeDurationIndicator } from '../Time/TimeDurationIndicator';
+import type { ApiResponse } from 'types/Api';
+import { isParentKiosk, kioskNavigateAction } from 'components/Kiosk/KioskActions';
+import { TraceSpansLimit } from './TraceSpansLimit';
+import { t } from 'utils/I18nUtils';
+
+type MetricsState = {
+  dashboard?: DashboardModel;
+  disabledFeatures?: KialiDisabledFeatures;
+  isTimeOptionsOpen: boolean;
+  labelsSettings: LabelsSettings;
+  showSpans: boolean;
+  showTrendlines: boolean;
+  spanOverlay?: Overlay<JaegerLineInfo>;
+  traceLimit: number;
+};
+
+type ObjectId = {
+  cluster?: string;
+  namespace: string;
+  object: string;
+};
+
+type IstioMetricsProps = ObjectId & {
+  direction: Direction;
+  includeWaypoint: boolean;
+  objectType: MetricsObjectTypes;
+} & {
+  lastRefreshAt: TimeInMilliseconds;
+};
+
+type ReduxStateProps = {
+  kiosk: string;
+  language: string;
+  refreshInterval: IntervalInMilliseconds;
+  timeRange: TimeRange;
+  tracingIntegration: boolean;
+};
+
+type ReduxDispatchProps = {
+  setTimeRange: (range: TimeRange) => void;
+};
+
+type Props = ReduxStateProps & ReduxDispatchProps & IstioMetricsProps;
+
+// lower that the standard default, we apply it to several small charts
+const traceLimitDefault = 20;
+
+class IstioMetricsComponent extends React.Component<Props, MetricsState> {
+  options: IstioMetricsOptions;
+  spanOverlay: SpanOverlay;
+
+  constructor(props: Props) {
+    super(props);
+    const settings = MetricsHelper.retrieveMetricsSettings(traceLimitDefault);
+    this.options = this.initOptions(settings);
+
+    this.state = {
+      labelsSettings: settings.labelsSettings,
+      isTimeOptionsOpen: false,
+      showSpans: settings.showSpans,
+      showTrendlines: settings.showTrendlines,
+      traceLimit: settings.spanLimit
+    };
+
+    this.spanOverlay = new SpanOverlay(changed => {
+      this.setState({ spanOverlay: changed });
+    });
+  }
+
+  componentDidMount(): void {
+    API.getDisabledFeatures()
+      .then(response => {
+        this.setState({ disabledFeatures: response.data });
+      })
+      .catch(() => {});
+
+    this.refresh();
+  }
+
+  componentDidUpdate(prevProps: Props, prevState: MetricsState): void {
+    if (
+      this.props.direction !== prevProps.direction ||
+      this.props.namespace !== prevProps.namespace ||
+      this.props.object !== prevProps.object ||
+      this.props.objectType !== prevProps.objectType ||
+      this.props.lastRefreshAt !== prevProps.lastRefreshAt ||
+      this.state.showSpans !== prevState.showSpans ||
+      this.state.traceLimit !== prevState.traceLimit ||
+      !isEqualTimeRange(this.props.timeRange, prevProps.timeRange)
+    ) {
+      if (this.props.direction !== prevProps.direction) {
+        const settings = MetricsHelper.retrieveMetricsSettings(this.state.traceLimit);
+        this.options = this.initOptions(settings);
+
+        this.setState({
+          labelsSettings: settings.labelsSettings,
+          showSpans: settings.showSpans,
+          showTrendlines: settings.showTrendlines,
+          traceLimit: settings.spanLimit
+        });
+      }
+
+      this.spanOverlay.reset();
+      this.refresh();
+    }
+  }
+
+  render(): React.ReactNode {
+    const urlParams = new URLSearchParams(location.getSearch());
+    const expandedChart = urlParams.get('expand') ?? undefined;
+
+    return (
+      <>
+        <div className={classes(flexFillStyle, constrainedScrollStyle)}>
+          <Card className={classes(flexCardStyle, tabCardStyle)}>
+            <CardBody>
+              <div className={scrollableContentStyle}>
+                {this.renderOptionsBar()}
+
+                {this.state.dashboard && (
+                  <Dashboard
+                    key={this.props.language}
+                    dashboard={this.state.dashboard}
+                    labelValues={MetricsHelper.convertAsPromLabels(this.state.labelsSettings)}
+                    maximizedChart={expandedChart}
+                    onExpand={this.handleExpand}
+                    onClick={this.onClickDataPoint}
+                    labelPrettifier={MetricsHelper.prettyLabelValues}
+                    overlay={this.state.spanOverlay}
+                    showSpans={this.state.showSpans}
+                    showTrendlines={this.state.showTrendlines}
+                    timeWindow={evalTimeRange(this.props.timeRange)}
+                    brushHandlers={{ onDomainChangeEnd: (_, props) => this.onDomainChange(props.currentDomain.x) }}
+                  />
+                )}
+              </div>
+            </CardBody>
+          </Card>
+        </div>
+
+        <TimeDurationModal
+          customDuration={true}
+          isOpen={this.state.isTimeOptionsOpen}
+          onConfirm={this.toggleTimeOptionsVisibility}
+          onCancel={this.toggleTimeOptionsVisibility}
+        />
+      </>
+    );
+  }
+
+  private initOptions(settings: MetricsSettings): IstioMetricsOptions {
+    const initialReporter = MetricsReporter.initialReporter(this.props.direction);
+    const options: IstioMetricsOptions = {
+      direction: this.props.direction,
+      reporter: withWaypoint(initialReporter, this.props.includeWaypoint)
+    };
+
+    const defaultLabels = [
+      this.props.direction === 'inbound' ? 'source_canonical_service' : 'destination_canonical_service',
+      this.props.direction === 'inbound' ? 'source_workload_namespace' : 'destination_workload_namespace'
+    ];
+
+    MetricsHelper.settingsToOptions(settings, options, defaultLabels);
+
+    return options;
+  }
+
+  private refresh = (): void => {
+    this.fetchMetrics();
+
+    if (this.state.showSpans) {
+      this.spanOverlay.fetch({
+        cluster: this.props.cluster,
+        limit: this.state.traceLimit,
+        namespace: this.props.namespace,
+        range: this.props.timeRange,
+        target: this.props.object,
+        targetKind: this.props.objectType
+      });
+    }
+  };
+
+  private fetchMetrics = (): Promise<void> => {
+    // Time range needs to be reevaluated everytime fetching
+    MetricsHelper.timeRangeToOptions(this.props.timeRange, this.options);
+    const opts = { ...this.options };
+
+    if (opts.reporter === 'both') {
+      opts.byLabels = (opts.byLabels ?? []).concat('reporter');
+    }
+
+    let promise: Promise<ApiResponse<DashboardModel>>;
+
+    switch (this.props.objectType) {
+      case MetricsObjectTypes.WORKLOAD:
+        promise = API.getWorkloadDashboard(this.props.namespace, this.props.object, opts, this.props.cluster);
+        break;
+      case MetricsObjectTypes.APP:
+        promise = API.getAppDashboard(this.props.namespace, this.props.object, opts, this.props.cluster);
+        break;
+      case MetricsObjectTypes.SERVICE:
+      default:
+        promise = API.getServiceDashboard(this.props.namespace, this.props.object, opts, this.props.cluster);
+        break;
+    }
+
+    return promise
+      .then(response => {
+        const labelsSettings = MetricsHelper.extractLabelsSettings(response.data, this.state.labelsSettings);
+
+        this.setState({
+          dashboard: response.data,
+          labelsSettings: labelsSettings
+        });
+      })
+      .catch(error => {
+        addError('Could not fetch metrics.', error);
+        throw error;
+      });
+  };
+
+  private onMetricsSettingsChanged = (settings: MetricsSettings): void => {
+    const defaultLabels = [
+      this.props.direction === 'inbound' ? 'source_canonical_service' : 'destination_canonical_service'
+    ];
+
+    MetricsHelper.settingsToOptions(settings, this.options, defaultLabels);
+    this.fetchMetrics();
+  };
+
+  private onLabelsFiltersChanged = (labelsFilters: LabelsSettings): void => {
+    this.setState({ labelsSettings: labelsFilters });
+  };
+
+  private onReporterChanged = (reporter: string): void => {
+    this.options.reporter = withWaypoint(reporter, this.props.includeWaypoint);
+    this.fetchMetrics();
+  };
+
+  private onClickDataPoint = (_chart: ChartModel, datum: RawOrBucket<JaegerLineInfo>): void => {
+    if ('start' in datum && 'end' in datum) {
+      // Zoom-in bucket
+      this.onDomainChange([datum.start as Date, datum.end as Date]);
+    } else if ('traceId' in datum) {
+      const traceId = datum.traceId;
+      const spanId = datum.spanId;
+
+      const domain =
+        this.props.objectType === MetricsObjectTypes.APP
+          ? 'applications'
+          : this.props.objectType === MetricsObjectTypes.SERVICE
+            ? 'services'
+            : 'workloads';
+
+      const traceUrl = `/namespaces/${this.props.namespace}/${domain}/${this.props.object}?tab=traces&${URLParam.TRACING_TRACE_ID}=${traceId}&${URLParam.TRACING_SPAN_ID}=${spanId}`;
+
+      if (isParentKiosk(this.props.kiosk)) {
+        kioskNavigateAction(traceUrl);
+      } else {
+        router.navigate(traceUrl);
+      }
+    }
+  };
+
+  private onDomainChange(dates: [Date, Date]): void {
+    if (dates && dates[0] && dates[1]) {
+      const range: TimeRange = {
+        from: dates[0].getTime(),
+        to: dates[1].getTime()
+      };
+
+      this.props.setTimeRange(range);
+    }
+  }
+
+  private onTraceSpansChange = (checked: boolean, limit: number): void => {
+    const urlParams = new URLSearchParams(location.getSearch());
+    urlParams.set(URLParam.SHOW_SPANS, String(checked));
+    if (checked) {
+      urlParams.set(URLParam.TRACING_LIMIT_TRACES, String(limit));
+    } else {
+      urlParams.delete(URLParam.SHOW_SPANS);
+    }
+    router.navigate(`${location.getPathname()}?${urlParams.toString()}`, { replace: true });
+    this.setState({ showSpans: checked, traceLimit: limit });
+  };
+
+  private onTrendlines = (checked: boolean): void => {
+    const urlParams = new URLSearchParams(location.getSearch());
+    urlParams.set(URLParam.SHOW_TRENDLINES, String(checked));
+    router.navigate(`${location.getPathname()}?${urlParams.toString()}`, { replace: true });
+    this.setState({ showTrendlines: !this.state.showTrendlines });
+  };
+
+  private toggleTimeOptionsVisibility = (): void => {
+    this.setState(prevState => ({ isTimeOptionsOpen: !prevState.isTimeOptionsOpen }));
+  };
+
+  private renderOptionsBar(): React.ReactNode {
+    const hasHistogramsAverage =
+      !this.state.disabledFeatures?.requestSizeAverage ||
+      !this.state.disabledFeatures?.responseSizeAverage ||
+      !this.state.disabledFeatures?.responseTimeAverage;
+
+    const hasHistogramsPercentiles =
+      !this.state.disabledFeatures?.requestSizePercentiles ||
+      !this.state.disabledFeatures?.responseSizePercentiles ||
+      !this.state.disabledFeatures?.responseTimePercentiles;
+
+    return (
+      <div className={noShrinkStyle}>
+        <Toolbar style={{ padding: 0, marginBottom: '1.25rem' }}>
+          <ToolbarGroup style={{ alignItems: 'center' }}>
+            <ToolbarItem>
+              <MetricsSettingsDropdown
+                key={this.props.language}
+                onChanged={this.onMetricsSettingsChanged}
+                onLabelsFiltersChanged={this.onLabelsFiltersChanged}
+                direction={this.props.direction}
+                labelsSettings={this.state.labelsSettings}
+                hasHistograms={true}
+                hasHistogramsAverage={hasHistogramsAverage}
+                hasHistogramsPercentiles={hasHistogramsPercentiles}
+              />
+            </ToolbarItem>
+
+            <ToolbarItem>
+              <MetricsReporter
+                key={this.props.language}
+                onChanged={this.onReporterChanged}
+                direction={this.props.direction}
+                reporter={baseReporter(this.options.reporter)}
+              />
+            </ToolbarItem>
+
+            {this.props.tracingIntegration && (
+              <ToolbarItem>
+                <TraceSpansLimit
+                  label={t('Spans')}
+                  onChange={this.onTraceSpansChange}
+                  showSpans={this.state.showSpans}
+                  traceLimit={this.state.traceLimit}
+                />
+              </ToolbarItem>
+            )}
+
+            <ToolbarItem>
+              <Checkbox
+                id="trendlines-show-"
+                isChecked={this.state.showTrendlines}
+                key="trendlines-show-chart"
+                label={t('Trendlines')}
+                onChange={(_event, checked) => this.onTrendlines(checked)}
+              />
+            </ToolbarItem>
+
+            <KioskElement>
+              <ToolbarItem>
+                <TimeDurationIndicator onClick={this.toggleTimeOptionsVisibility} />
+              </ToolbarItem>
+            </KioskElement>
+          </ToolbarGroup>
+        </Toolbar>
+      </div>
+    );
+  }
+
+  private handleExpand = (expandedChart?: string): void => {
+    const urlParams = new URLSearchParams(location.getSearch());
+    urlParams.delete('expand');
+
+    if (expandedChart) {
+      urlParams.set('expand', expandedChart);
+    }
+
+    router.navigate(`${location.getPathname()}?${urlParams.toString()}`);
+  };
+}
+
+const mapStateToProps = (state: KialiAppState): ReduxStateProps => {
+  return {
+    kiosk: state.globalState.kiosk,
+    language: languageSelector(state),
+    tracingIntegration: state.tracingState.info ? state.tracingState.info.integration : false,
+    timeRange: timeRangeSelector(state),
+    refreshInterval: refreshIntervalSelector(state)
+  };
+};
+
+const mapDispatchToProps = (dispatch: KialiDispatch): ReduxDispatchProps => {
+  return {
+    setTimeRange: bindActionCreators(UserSettingsActions.setTimeRange, dispatch)
+  };
+};
+
+export const IstioMetrics = connect(mapStateToProps, mapDispatchToProps)(IstioMetricsComponent);

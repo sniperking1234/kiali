@@ -1,13 +1,16 @@
 package peerauthentications
 
 import (
+	networking_v1 "istio.io/client-go/pkg/apis/networking/v1"
+	security_v1 "istio.io/client-go/pkg/apis/security/v1"
+
 	"github.com/kiali/kiali/kubernetes"
 	"github.com/kiali/kiali/models"
 )
 
 type DisabledMeshWideChecker struct {
-	PeerAuthn        kubernetes.IstioObject
-	DestinationRules []kubernetes.IstioObject
+	PeerAuthn        *security_v1.PeerAuthentication
+	DestinationRules []*networking_v1.DestinationRule
 }
 
 func (c DisabledMeshWideChecker) Check() ([]*models.IstioCheck, bool) {

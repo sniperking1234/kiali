@@ -1,0 +1,28 @@
+apiVersion: ols.openshift.io/v1alpha1
+kind: OLSConfig
+metadata:
+  name: cluster
+spec:
+  featureGates:
+  - MCPServer
+  llm:
+    providers:
+    - name: openAICompatible
+      type: openai
+      credentialsSecretRef:
+        name: credentials
+      url: ${LLM_PROVIDER_URL}
+      models:
+      - name: ${LLM_MODEL}
+  mcpServers:
+  - name: ${MCP_PROVIDER}-mcp    
+    headers:
+      - name: kubernetes-authorization
+        valueFrom:
+          type: kubernetes
+    url: 'http://${MCP_PROVIDER}-mcp-server.${MCP_PROVIDER}-mcp:8080/mcp'
+    timeout: 30   
+  ols:
+    defaultModel: ${LLM_MODEL}
+    defaultProvider: openAICompatible
+    logLevel: DEBUG

@@ -1,0 +1,345 @@
+#!/bin/bash
+# shellcheck disable=SC2155
+set -e
+
+##############################################################################
+# install-multi-primary.sh
+#
+# Installs Istio across two clusters using the "multi-primary" model.
+#
+# See: https://istio.io/latest/docs/setup/install/multicluster/multi-primary/
+#
+# See --help for more details on options to this script.
+#
+##############################################################################
+
+infomsg() {
+  echo "[INFO] ${1}"
+}
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source ${SCRIPT_DIR}/env.sh "$@"
+source ${SCRIPT_DIR}/install-ambient-multicluster.sh "$@"
+
+create_remote_secret() {
+  local clustername="${1}"
+  local secretcount="$(${CLIENT_EXE} get sa -n ${ISTIO_NAMESPACE} istio-reader-service-account --no-headers | tr -s ' ' | cut -d ' ' -f 2)"
+  local secretname=""
+  if [ "${secretcount}" -gt 1 ]; then
+    # find the service account token secret (the word "token" will be in the secret name)
+    secretname="--secret-name $(${CLIENT_EXE} get sa -n ${ISTIO_NAMESPACE} istio-reader-service-account -o jsonpath='{.secrets[0].name}')"
+    if ! echo ${secretname} | grep "token"; then
+      secretname="--secret-name $(${CLIENT_EXE} get sa -n ${ISTIO_NAMESPACE} istio-reader-service-account -o jsonpath='{.secrets[1].name}')"
+      if ! echo ${secretname} | grep "token"; then
+        echo "Failed to find the sa token secret"
+        exit 1
+      fi
+    fi
+    echo "Choosing to use: [${secretname}]"
+  fi
+  if ! REMOTE_SECRET="$("${ISTIOCTL}" create-remote-secret --name "${clustername}" ${secretname})"; then
+    echo "Failed to generate remote secret for cluster [${clustername}]"
+    exit 1
+  fi
+
+  # if kind, then we have to make sure the remote secret has the external IP to the API server
+  if [ "${MANAGE_KIND}" == "true" ]; then
+    local kind_ip=$(${DORP} inspect ${clustername}-control-plane --format "{{ .NetworkSettings.Networks.kind.IPAddress }}")
+    REMOTE_SECRET="$(printf '%s' "${REMOTE_SECRET}" | sed -E 's!server:.*!server: https://'"${kind_ip}"':6443!')"
+    echo "Updating remote secret for kind cluster [${clustername}] to use API IP [${kind_ip}]"
+  fi
+}
+
+# Configuration is now generated dynamically by the ambient script or install_istio function
+
+# Find the files necessary to create the crossnetwork gateway, if required
+if [ "${CROSSNETWORK_GATEWAY_REQUIRED}" == "true" ]; then
+  GEN_GATEWAY_SCRIPT="${ISTIO_DIR}/samples/multicluster/gen-eastwest-gateway.sh"
+  EXPOSE_SERVICES_YAML="${ISTIO_DIR}/samples/multicluster/expose-services.yaml"
+  if [ -x "${GEN_GATEWAY_SCRIPT}" ]; then
+    echo "Generate-gateway script: ${GEN_GATEWAY_SCRIPT}"
+  else
+    echo "Cannot find the generate-gateway script at: ${GEN_GATEWAY_SCRIPT}"
+    exit 1
+  fi
+  if [ -f "${EXPOSE_SERVICES_YAML}" ]; then
+    echo "Expose-services yaml: ${EXPOSE_SERVICES_YAML}"
+  else
+    echo "Cannot find the expose-services yaml at: ${EXPOSE_SERVICES_YAML}"
+    exit 1
+  fi
+fi
+
+# Start up two minikube instances if requested
+if [ "${MANAGE_MINIKUBE}" == "true" ]; then
+  echo "Starting minikube instances"
+  source ${SCRIPT_DIR}/start-minikube.sh
+fi
+
+# Start up two kind instances if requested
+if [ "${MANAGE_KIND}" == "true" ]; then
+  echo "Starting kind instances"
+
+  if [ "${KIALI_AUTH_STRATEGY}" == "openid" ]; then
+    "${SCRIPT_DIR}/../../keycloak.sh" -kcd "${KEYCLOAK_CERTS_DIR}" create-ca
+
+    docker network create kind || true
+
+    # Given: 172.18.0.0/16 this should return 172.18
+    subnet=""
+
+    # we always use docker today, but we'll leave this here just in case in the future Kind and podman play nice
+    if [ "${DORP}" == "docker" ]; then
+      # loop through all known subnets in the kind network and pick out the IPv4 subnet, ignoring any IPv6 that might be in the list
+      subnets_count="$(docker network inspect kind | jq '.[0].IPAM.Config | length')"
+      infomsg "There are [$subnets_count] subnets in the kind network"
+      for ((i=0; i<subnets_count; i++)); do
+        subnet=$(docker network inspect kind --format '{{(index .IPAM.Config '$i').Subnet}}' 2> /dev/null)
+        if [[ -n $subnet && $subnet != *:* && $subnet == *\.* ]]; then
+          infomsg "Using subnet [$subnet]"
+          break
+        else
+          infomsg "Ignoring subnet [$subnet]"
+          subnet=""
+        fi
+      done
+      if [ -z "$subnet" ]; then
+        infomsg "No subnets found in the expected docker network list. Maybe this is a podman network - let's check"
+        subnet=$(docker network inspect kind | jq -r '.[0].subnets[] | select(.subnet | test("^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+/")) | .subnet' 2>/dev/null)
+      fi
+    else
+      subnet=$(podman network inspect kind | jq -r '.[0].subnets[] | select(.subnet | test("^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+/")) | .subnet' 2>/dev/null)
+    fi
+
+    if [ -z "$subnet" ]; then
+      infomsg "There does not appear to be any IPv4 subnets configured"
+      exit 1
+    fi
+
+    beginning_subnet_octets=$(echo $subnet | cut -d'.' -f1,2 2>/dev/null)
+    lb_range_start="255.70"
+    lb_range_end="255.84"
+
+    KEYCLOAK_ADDRESS="${beginning_subnet_octets}.${lb_range_start}"
+
+    echo "==== START KIND FOR CLUSTER #1 [${CLUSTER1_NAME}] - ${CLUSTER1_CONTEXT}"
+    "${SCRIPT_DIR}"/../../start-kind.sh \
+      --name "${CLUSTER1_NAME}" \
+      --load-balancer-range "${lb_range_start}-${lb_range_end}" \
+      --enable-keycloak true \
+      --keycloak-certs-dir "${KEYCLOAK_CERTS_DIR}" \
+      --keycloak-issuer-uri https://"${KEYCLOAK_ADDRESS}"/realms/kube \
+      --image "${KIND_NODE_IMAGE}"
+
+
+    # Optional: keycloak memory limits
+    KEYCLOAK_LIMIT_MEMORY="${KEYCLOAK_LIMIT_MEMORY:-}"
+    KEYCLOAK_REQUESTS_MEMORY="${KEYCLOAK_REQUESTS_MEMORY:-}"
+    if [ -n "$KEYCLOAK_LIMIT_MEMORY" ]; then
+      MEMORY_LIMIT_ARG="-slm $KEYCLOAK_LIMIT_MEMORY"
+    else
+      MEMORY_LIMIT_ARG=""
+    fi
+    if [ -n "$KEYCLOAK_REQUESTS_MEMORY" ]; then
+      MEMORY_REQUEST_ARG="-srm $KEYCLOAK_REQUESTS_MEMORY"
+    else
+      MEMORY_REQUEST_ARG=""
+    fi
+    "${SCRIPT_DIR}/../../keycloak.sh" -kcd "${KEYCLOAK_CERTS_DIR}" -kip "${KEYCLOAK_ADDRESS}" $MEMORY_LIMIT_ARG $MEMORY_REQUEST_ARG deploy
+
+    echo "==== START KIND FOR CLUSTER #2 [${CLUSTER2_NAME}] - ${CLUSTER2_CONTEXT}"
+    "${SCRIPT_DIR}"/../../start-kind.sh \
+      --name "${CLUSTER2_NAME}" \
+      --load-balancer-range "255.85-255.98" \
+      --enable-keycloak true \
+      --keycloak-certs-dir "${KEYCLOAK_CERTS_DIR}" \
+      --keycloak-issuer-uri https://"${KEYCLOAK_ADDRESS}"/realms/kube \
+      --image "${KIND_NODE_IMAGE}"
+  else
+    echo "==== START KIND FOR CLUSTER #1 [${CLUSTER1_NAME}] - ${CLUSTER1_CONTEXT}"
+    "${SCRIPT_DIR}"/../../start-kind.sh \
+      --name "${CLUSTER1_NAME}" \
+      --load-balancer-range "255.70-255.84" \
+      --image "${KIND_NODE_IMAGE}"
+
+    echo "==== START KIND FOR CLUSTER #2 [${CLUSTER2_NAME}] - ${CLUSTER2_CONTEXT}"
+    "${SCRIPT_DIR}"/../../start-kind.sh \
+      --name "${CLUSTER2_NAME}" \
+      --load-balancer-range "255.85-255.98" \
+      --image "${KIND_NODE_IMAGE}"
+  fi
+fi
+
+# Setup the certificates
+source ${SCRIPT_DIR}/setup-ca.sh
+
+if [ "${AMBIENT}" == "true" ]; then
+ ensure_gateway_api_crds "" "--context=${CLUSTER1_CONTEXT}"
+ ensure_gateway_api_crds "" "--context=${CLUSTER2_CONTEXT}"
+ if [ "${CLUSTER2_AMBIENT}" == "true" ]; then
+    echo "==== Installing Istio Ambient on both clusters (default behavior)"
+    install_ambient_multicluster "${SAIL}"
+  else
+    echo "==== Installing Istio Ambient on cluster 1 (east) and regular Istio on cluster 2 (west)"
+
+    # Setup Istio environment (needed for install_ambient_on_cluster)
+    HACK_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    setup_istio_environment "${HACK_SCRIPT_DIR}"
+
+    # Install ambient on cluster 1 (east)
+    echo "==== INSTALL ISTIO AMBIENT ON CLUSTER #1 [${CLUSTER1_NAME}] - ${CLUSTER1_CONTEXT}"
+    install_ambient_on_cluster "${CLUSTER1_CONTEXT}" "${CLUSTER1_USER}" "${CLUSTER1_PASS}" "${CLUSTER1_NAME}" "${NETWORK1_ID}" "${SAIL}"
+
+    # Install regular Istio on cluster 2 (west)
+    MC_WEST_YAML=$(mktemp)
+    cat <<EOF > "$MC_WEST_YAML"
+spec:
+  values:
+    global:
+      meshID: ${MESH_ID}
+      multiCluster:
+        clusterName: ${CLUSTER2_NAME}
+      network: ${NETWORK2_ID}
+EOF
+
+    echo "==== INSTALL ISTIO ON CLUSTER #2 [${CLUSTER2_NAME}] - ${CLUSTER2_CONTEXT}"
+    switch_cluster "${CLUSTER2_CONTEXT}" "${CLUSTER2_USER}" "${CLUSTER2_PASS}"
+    install_istio --patch-file "${MC_WEST_YAML}"
+    rm -f "${MC_WEST_YAML}"
+  fi
+else
+  # Generate configuration for cluster 1
+  MC_EAST_YAML=$(mktemp)
+  cat <<EOF > "$MC_EAST_YAML"
+spec:
+  values:
+    global:
+      meshID: ${MESH_ID}
+      multiCluster:
+        clusterName: ${CLUSTER1_NAME}
+      network: ${NETWORK1_ID}
+EOF
+
+  echo "==== INSTALL ISTIO ON CLUSTER #1 [${CLUSTER1_NAME}] - ${CLUSTER1_CONTEXT}"
+  switch_cluster "${CLUSTER1_CONTEXT}" "${CLUSTER1_USER}" "${CLUSTER1_PASS}"
+  install_istio --patch-file "${MC_EAST_YAML}"
+  rm -f "${MC_EAST_YAML}"
+
+  # Generate configuration for cluster 2
+  MC_WEST_YAML=$(mktemp)
+  cat <<EOF > "$MC_WEST_YAML"
+spec:
+  values:
+    global:
+      meshID: ${MESH_ID}
+      multiCluster:
+        clusterName: ${CLUSTER2_NAME}
+      network: ${NETWORK2_ID}
+EOF
+
+  echo "==== INSTALL ISTIO ON CLUSTER #2 [${CLUSTER2_NAME}] - ${CLUSTER2_CONTEXT}"
+  switch_cluster "${CLUSTER2_CONTEXT}" "${CLUSTER2_USER}" "${CLUSTER2_PASS}"
+  install_istio --patch-file "${MC_WEST_YAML}"
+  rm -f "${MC_WEST_YAML}"
+fi
+
+if [ "${AMBIENT}" != "true" ]; then
+  echo "==== DEPLOY ISTIO INGRESS GATEWAY ON CLUSTER #1 [${CLUSTER1_NAME}] - ${CLUSTER1_CONTEXT}"
+  switch_cluster "${CLUSTER1_CONTEXT}" "${CLUSTER1_USER}" "${CLUSTER1_PASS}"
+  kubectl apply -n istio-system -f "${SCRIPT_DIR}/../istio-gateway.yaml"
+fi
+
+if [ "${CROSSNETWORK_GATEWAY_REQUIRED}" == "true" ]; then
+  echo "==== CREATE CROSSNETWORK GATEWAY ON CLUSTER #1 [${CLUSTER1_NAME}] - ${CLUSTER1_CONTEXT}"
+  switch_cluster "${CLUSTER1_CONTEXT}" "${CLUSTER1_USER}" "${CLUSTER1_PASS}"
+  create_crossnetwork_gateway "${CLUSTER1_NAME}" "${NETWORK1_ID}"
+
+  echo "==== CREATE CROSSNETWORK GATEWAY ON CLUSTER #2 [${CLUSTER2_NAME}] - ${CLUSTER2_CONTEXT}"
+  switch_cluster "${CLUSTER2_CONTEXT}" "${CLUSTER2_USER}" "${CLUSTER2_PASS}"
+  # Cluster 2 is not ambient when AMBIENT is true but CLUSTER2_AMBIENT is false
+  # In that case, temporarily override AMBIENT for this call
+  if [ "${AMBIENT}" == "true" ] && [ "${CLUSTER2_AMBIENT}" == "false" ]; then
+    AMBIENT_SAVE="${AMBIENT}"
+    AMBIENT="false"
+    create_crossnetwork_gateway "${CLUSTER2_NAME}" "${NETWORK2_ID}"
+    AMBIENT="${AMBIENT_SAVE}"
+  else
+    create_crossnetwork_gateway "${CLUSTER2_NAME}" "${NETWORK2_ID}"
+  fi
+
+  echo "==== SETTING UP THE MESH NETWORK CONFIGURATION MANUALLY"
+  source ${SCRIPT_DIR}/config-mesh-networks.sh
+else
+  echo "Crossnetwork gateway is not required - will not create one"
+fi
+
+echo "==== ENABLE ENDPOINT DISCOVERY ON CLUSTER #1 [${CLUSTER1_NAME}] - ${CLUSTER1_CONTEXT}"
+switch_cluster "${CLUSTER1_CONTEXT}" "${CLUSTER1_USER}" "${CLUSTER1_PASS}"
+create_remote_secret "${CLUSTER1_NAME}"
+switch_cluster "${CLUSTER2_CONTEXT}" "${CLUSTER2_USER}" "${CLUSTER2_PASS}"
+printf "%s" "${REMOTE_SECRET}" | ${CLIENT_EXE} apply -f -
+
+echo "==== ENABLE ENDPOINT DISCOVERY ON CLUSTER #2 [${CLUSTER2_NAME}] - ${CLUSTER2_CONTEXT}"
+switch_cluster "${CLUSTER2_CONTEXT}" "${CLUSTER2_USER}" "${CLUSTER2_PASS}"
+create_remote_secret "${CLUSTER2_NAME}"
+switch_cluster "${CLUSTER1_CONTEXT}" "${CLUSTER1_USER}" "${CLUSTER1_PASS}"
+printf "%s" "${REMOTE_SECRET}" | ${CLIENT_EXE} apply -f -
+
+# Configure Prometheus federation
+${CLIENT_EXE} patch svc prometheus -n ${ISTIO_NAMESPACE} --context ${CLUSTER2_CONTEXT} -p "{\"spec\": {\"type\": \"LoadBalancer\"}}"
+
+WEST_PROMETHEUS_ADDRESS=$(${CLIENT_EXE} --context=${CLUSTER2_CONTEXT} -n ${ISTIO_NAMESPACE} get svc prometheus -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+if [ -z "${WEST_PROMETHEUS_ADDRESS}" ]; then
+  echo "WARNING! Prometheus not updated - cannot determine the west prometheus load balancer ingress IP"
+else
+  ## TODO: prometheus.yaml has CLUSTER_NAME in it that should also be searched-replaced, but that is not done here
+  cat ${SCRIPT_DIR}/prometheus.yaml | sed -e "s/WEST_PROMETHEUS_ADDRESS/$WEST_PROMETHEUS_ADDRESS/g" | ${CLIENT_EXE} apply -n ${ISTIO_NAMESPACE} --context ${CLUSTER1_CONTEXT} -f -
+fi
+
+# Configure Tracing "federation"
+source ${SCRIPT_DIR}/setup-tracing.sh
+
+# Install bookinfo across cluster if enabled
+if [ "${AMBIENT}" == "true" ] && [ "${WAYPOINT}" == "true" ]; then
+  # Install baseline Bookinfo in the default namespace without enrolling the namespace into a waypoint.
+  # This keeps existing L4 test expectations intact (they target the default bookinfo namespace).
+  echo "==== INSTALLING BASELINE BOOKINFO (NO NAMESPACE WAYPOINT) IN NAMESPACE [${BOOKINFO_NAMESPACE}]"
+  _orig_bookinfo_namespace="${BOOKINFO_NAMESPACE}"
+  _orig_waypoint="${WAYPOINT}"
+
+  BOOKINFO_NAMESPACE="${_orig_bookinfo_namespace}"
+  WAYPOINT="false"
+  source ${SCRIPT_DIR}/split-bookinfo.sh
+
+  # Install a second Bookinfo instance in a dedicated namespace for waypoint/L7 tests.
+  # This allows running L4 and waypoint tests in the same CI job without changing L4 traffic.
+  BOOKINFO_WAYPOINT_NAMESPACE="${BOOKINFO_WAYPOINT_NAMESPACE:-bookinfo-waypoints}"
+  echo "==== INSTALLING WAYPOINT BOOKINFO IN NAMESPACE [${BOOKINFO_WAYPOINT_NAMESPACE}]"
+  BOOKINFO_NAMESPACE="${BOOKINFO_WAYPOINT_NAMESPACE}"
+  WAYPOINT="true"
+  source ${SCRIPT_DIR}/split-bookinfo.sh
+
+  BOOKINFO_NAMESPACE="${_orig_bookinfo_namespace}"
+  WAYPOINT="${_orig_waypoint}"
+else
+  source ${SCRIPT_DIR}/split-bookinfo.sh
+fi
+
+if [ "${AMBIENT}" == "true" ]; then
+  echo "==== Installing Istio Ambient hello world demo"
+  # If cluster 2 is not ambient, pass CLUSTER2_AMBIENT=false to the function
+  if [ "${CLUSTER2_AMBIENT}" == "false" ]; then
+    CLUSTER2_AMBIENT="false" install_helloworld_demo
+  else
+    install_helloworld_demo
+  fi
+fi
+
+# Install Kiali if enabled
+if [ "${KIALI_ENABLED}" == "true" ]; then
+  if [ -z "${KEYCLOAK_ADDRESS}" ] && [ "${MANAGE_MINIKUBE}" == "true" ]; then
+    echo "Keycloak is not available for this cluster setup. Switching Kiali to 'anonymous' mode."
+    export KIALI_AUTH_STRATEGY="anonymous"
+  fi
+  source ${SCRIPT_DIR}/deploy-kiali.sh
+fi

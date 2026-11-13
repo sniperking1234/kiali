@@ -1,0 +1,261 @@
+import type { List as ImmutableList, Map as ImmutableMap } from 'immutable';
+import type { NotificationGroup } from '../types/NotificationCenter';
+import type { Namespace } from '../types/Namespace';
+import type {
+  DurationInSeconds,
+  IntervalInMilliseconds,
+  KioskData,
+  KioskMode,
+  RawDate,
+  TimeInMilliseconds,
+  TimeRange,
+  UserName
+} from '../types/Common';
+import type {
+  EdgeLabelMode,
+  EdgeMode,
+  GraphDefinition,
+  GraphLayout,
+  GraphType,
+  NodeParamsType,
+  RankMode,
+  RankResult,
+  SummaryData,
+  TrafficRate
+} from '../types/Graph';
+import type { TLSStatus } from '../types/TLSStatus';
+import type { StatusState } from '../types/StatusState';
+import type { TourInfo } from 'components/Tour/TourStop';
+import type { ComponentStatus } from '../types/IstioStatus';
+import type { TracingState } from 'reducers/TracingState';
+import type { MetricsStatsState } from 'reducers/MetricsStatsState';
+import type { MeshCluster, MeshDefinition, MeshTarget } from '../types/Mesh';
+import type { MeshLayout } from 'pages/Mesh/layouts/LayoutFactory';
+import type { ChatInteractionMode, ChatResourceHealth, ProviderAI } from 'types/Chatbot';
+import type { ChatbotDisplayMode } from '@patternfly/chatbot';
+
+// Store is the Redux Data store
+
+export interface GlobalState {
+  readonly colorScheme: string;
+  readonly contrastMode: string;
+  readonly isPageVisible: boolean;
+  readonly kiosk: KioskMode;
+  readonly kioskData?: KioskData;
+  readonly language: string;
+  readonly loadingCounter: number;
+  readonly systemAppearanceRevision: number;
+  readonly theme: string;
+}
+
+export interface ClusterState {
+  readonly activeClusters: MeshCluster[];
+  readonly filter: string;
+}
+
+export interface NamespaceState {
+  readonly activeNamespaces: Namespace[]; // the namespaces currently selected in NamespaceDropdown
+  readonly filter: string; // the filter currently defined in NamespaceDropdown
+  readonly isFetching: boolean;
+  // "items" is the Set of unique namespace names. It is a
+  // convenience for when we want to list namespaces without
+  // duplication for namespaces found on multiple clusters.
+  // Do not use this expecting it to be a complete list of namespaces
+  // across all clusters. For that, use "namespaces".
+  // TODO: Can this be non-optional since we default to empty list?
+  readonly items?: Namespace[];
+  readonly lastUpdated?: Date;
+  // "namespaces" provides the complete set of namespace info, across clusters.
+  readonly namespaces: Namespace[];
+  // "namespacesPerCluster" is a convenience mapping of cluster names to namespace names.
+  readonly namespacesPerCluster: Map<string, string[]>; // map clusterName -> namespaces on cluster
+}
+
+/** Namespaces list page: column visibility and order */
+export interface NamespacesListState {
+  readonly columnOrder: string[];
+  readonly hiddenColumnIds: string[];
+}
+
+/** Services list page: column visibility and order */
+export interface ServicesListState {
+  readonly columnOrder: string[];
+  readonly hiddenColumnIds: string[];
+}
+
+/** Apps list page: column visibility and order */
+export interface AppsListState {
+  readonly columnOrder: string[];
+  readonly hiddenColumnIds: string[];
+}
+
+/** Workloads list page: column visibility and order */
+export interface WorkloadsListState {
+  readonly columnOrder: string[];
+  readonly hiddenColumnIds: string[];
+}
+
+// Various pages are described here with their various sections
+export interface GraphToolbarState {
+  // Toggle props
+  boxByCluster: boolean;
+  boxByNamespace: boolean;
+  // dropdown props
+  edgeLabels: EdgeLabelMode[];
+  // find props
+  findValue: string;
+  graphType: GraphType;
+  hideValue: string;
+  rankBy: RankMode[];
+  showIdleEdges: boolean;
+  showIdleNodes: boolean;
+  showLegend: boolean;
+  showOperationNodes: boolean;
+  showOutOfMesh: boolean;
+  showRank: boolean;
+  showSecurity: boolean;
+  showServiceNodes: boolean;
+  showTrafficAnimation: boolean;
+  showVirtualServices: boolean;
+  showWaypoints: boolean;
+  trafficRates: TrafficRate[];
+}
+
+export interface GraphState {
+  edgeMode: EdgeMode;
+  graphDefinition: GraphDefinition | null; // Not for consumption. Only for "Debug" dialog.
+  layout: GraphLayout;
+  namespaceLayout: GraphLayout;
+  node?: NodeParamsType;
+  rankResult: RankResult;
+  summaryData: SummaryData | null;
+  toolbarState: GraphToolbarState;
+  updateTime: TimeInMilliseconds;
+}
+
+export enum LoginStatus {
+  logging,
+  loggedIn,
+  loggedOut,
+  error,
+  expired
+}
+
+export interface SessionClusterInfo {
+  name: string;
+}
+
+export interface LoginSession {
+  clusterInfo?: { [cluster: string]: SessionClusterInfo };
+  expiresOn: RawDate;
+  username: UserName;
+}
+
+export interface LoginState {
+  landingRoute?: string;
+  message: string;
+  session?: LoginSession;
+  status: LoginStatus;
+}
+
+export interface MeshToolbarState {
+  // find props
+  findValue: string;
+  hideValue: string;
+  showGateways: boolean;
+  showKiali: boolean;
+  showLegend: boolean;
+  showWaypoints: boolean;
+}
+
+export interface MeshState {
+  definition: MeshDefinition | null;
+  layout: MeshLayout;
+  target: MeshTarget | null;
+  toolbarState: MeshToolbarState;
+  updateTime: TimeInMilliseconds;
+}
+
+export interface NotificationCenterState {
+  expanded: boolean;
+  groups: NotificationGroup[];
+  nextId: number;
+}
+
+export interface InterfaceSettings {
+  navCollapse: boolean;
+  serviceInsightsMetrics?: string;
+}
+
+export interface UserSettings {
+  duration: DurationInSeconds;
+  interface: InterfaceSettings;
+  refreshInterval: IntervalInMilliseconds;
+  replayActive: boolean;
+  replayQueryTime: TimeInMilliseconds;
+  timeRange: TimeRange;
+}
+
+export interface TourState {
+  activeStop?: number; // index into the TourInfo.stops array
+  activeTour?: TourInfo;
+}
+
+export interface AIState {
+  chat: ChatAIState;
+  consumption: AIRightView;
+  enabled: boolean;
+}
+
+export interface AIRightView {
+  allowed: boolean;
+  enabled: boolean;
+}
+
+export interface ChatAIState {
+  allowed: boolean;
+  alwaysNavigate: boolean;
+  chatContext: string;
+  chatHistory: ImmutableList<ImmutableMap<string, unknown>>;
+  chatbotVisible: boolean;
+  conversationID: string;
+  defaultProvider: string;
+  displayMode: ChatbotDisplayMode;
+  enabled: boolean;
+  interactionMode: ChatInteractionMode;
+  openTool: ImmutableMap<string, any>;
+  providers: ProviderAI[];
+  query: string;
+  resourceHealth?: ChatResourceHealth;
+  selectedModel: string;
+  selectedProvider: string;
+}
+
+// This defines the Kiali Global Application State
+export interface KialiAppState {
+  // Global state === across multiple pages
+  // could also be session state
+  /** AI Settings */
+  ai: AIState;
+  appsList: AppsListState;
+  /** Page Settings */
+  authentication: LoginState;
+  clusters: ClusterState;
+  globalState: GlobalState;
+  graph: GraphState;
+  istioStatus: { [cluster: string]: ComponentStatus[] };
+  mesh: MeshState;
+  /** Tracing Settings */
+  meshTLSStatus: TLSStatus;
+  metricsStats: MetricsStatsState;
+  namespaces: NamespaceState;
+  namespacesList: NamespacesListState;
+  notificationCenter: NotificationCenterState;
+  servicesList: ServicesListState;
+  statusState: StatusState;
+  tourState: TourState;
+  tracingState: TracingState;
+  /** User Settings */
+  userSettings: UserSettings;
+  workloadsList: WorkloadsListState;
+}

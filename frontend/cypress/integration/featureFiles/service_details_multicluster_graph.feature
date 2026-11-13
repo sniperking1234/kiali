@@ -1,0 +1,20 @@
+@service-details-multi-cluster
+# don't change first line of this file - the tag is used for the test scripts to identify the test suite
+@multi-cluster
+
+Feature: Kiali Service Details page for remote cluster
+
+  User opens the Services page and sees the bookinfo namespaces,
+  clicks in the productpage service, and page loads correctly.
+
+  Background:
+    Given user is at administrator perspective
+    And user is at the details page for the "service" "bookinfo/ratings" located in the "west" cluster
+
+  Scenario: See service minigraph for details app.
+    Then user sees a minigraph
+    And user sees "service" from a remote "west" cluster in the minigraph
+
+  Scenario: Minigraph should not be visible for a service, which is not deployed in specific cluster.
+    And user is at the details page for the "service" "bookinfo/details" located in the "west" cluster
+    Then user does not see a minigraph

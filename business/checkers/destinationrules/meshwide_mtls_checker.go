@@ -1,12 +1,14 @@
 package destinationrules
 
 import (
+	networking_v1 "istio.io/client-go/pkg/apis/networking/v1"
+
 	"github.com/kiali/kiali/kubernetes"
 	"github.com/kiali/kiali/models"
 )
 
 type MeshWideMTLSChecker struct {
-	DestinationRule kubernetes.IstioObject
+	DestinationRule *networking_v1.DestinationRule
 	MTLSDetails     kubernetes.MTLSDetails
 }
 
@@ -15,6 +17,12 @@ func (m MeshWideMTLSChecker) Check() ([]*models.IstioCheck, bool) {
 
 	// if DestinationRule doesn't enable mTLS, stop validation with any check
 	if enabled, _ := kubernetes.DestinationRuleHasMeshWideMTLSEnabled(m.DestinationRule); !enabled {
+		return validations, true
+	}
+
+	// With auto-mTLS, Istio encrypts without requiring an explicit PeerAuthentication
+	// (same escape hatch as KIA0401 / MeshMtlsChecker).
+	if m.MTLSDetails.EnabledAutoMtls {
 		return validations, true
 	}
 

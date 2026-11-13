@@ -1,0 +1,189 @@
+import * as React from 'react';
+import { connect } from 'react-redux';
+import type { KialiDispatch } from 'types/Redux';
+import { RenderPage } from './RenderPage';
+import { MastheadItems } from './Masthead/Masthead';
+import {
+  Page,
+  Masthead,
+  MastheadToggle,
+  MastheadMain,
+  MastheadLogo,
+  MastheadBrand,
+  MastheadContent,
+  PageSection,
+  PageSidebar,
+  PageToggleButton,
+  ButtonVariant,
+  PageSidebarBody
+} from '@patternfly/react-core';
+
+import { kialiStyle } from 'styles/StyleUtils';
+import { homeCluster, kialiLogoDark, kialiLogoLight, serverConfig } from '../../config';
+import type { KialiAppState } from '../../store/Store';
+import { UserSettingsThunkActions } from '../../actions/UserSettingsThunkActions';
+import { Menu } from './Menu';
+import { Link, useLocation } from 'react-router-dom-v5-compat';
+import type { ExternalServiceInfo } from '../../types/StatusState';
+import { ColorScheme } from 'types/Common';
+import { useKialiTranslation } from 'utils/I18nUtils';
+import { useKialiColorScheme } from 'utils/AppearanceUtils';
+import { isKiosk } from '../Kiosk/KioskActions';
+import { NotificationCenter } from 'components/NotificationCenter/NotificationCenter';
+import { ChatBot } from 'components/ChatBot/ChatBot';
+import { ParentAppearanceSync } from 'components/Kiosk/ParentAppearanceSync';
+
+type ReduxStateProps = {
+  ai: boolean;
+  chatbotEnabled: boolean;
+  colorScheme: string;
+  externalServices: ExternalServiceInfo[];
+  kiosk: string;
+  navCollapsed: boolean;
+  showNotificationCenter: boolean;
+  tracingUrl?: string;
+};
+
+type ReduxDispatchProps = {
+  setNavCollapsed: (collapse: boolean) => void;
+};
+
+type NavigationProps = ReduxStateProps & ReduxDispatchProps;
+
+const flexBoxColumnStyle = kialiStyle({
+  display: 'flex',
+  flex: 1,
+  flexDirection: 'column',
+  minHeight: 0
+});
+
+export const NavigationComponent: React.FC<NavigationProps> = (props: NavigationProps) => {
+  const [isMobileView, setIsMobileView] = React.useState<boolean>(false);
+  const [isNavOpenDesktop, setIsNavOpenDesktop] = React.useState<boolean>(true);
+  const [isNavOpenMobile, setIsNavOpenMobile] = React.useState<boolean>(false);
+
+  const { t } = useKialiTranslation();
+  const { pathname } = useLocation();
+
+  React.useEffect((): void => {
+    let pageTitle = serverConfig.installationTag ?? 'Kiali';
+
+    if (homeCluster?.name) {
+      pageTitle += ` [${homeCluster?.name}]`;
+    }
+
+    document.title = pageTitle;
+  }, []);
+
+  // Keep page content aligned when the notification drawer is collapsed. Focus or
+  // automation can scroll drawer__main horizontally into the reserved panel slot.
+  React.useEffect(() => {
+    if (props.showNotificationCenter) {
+      return;
+    }
+
+    const resetDrawerScroll = (): void => {
+      document.querySelectorAll('.pf-v6-c-page__drawer > .pf-v6-c-drawer > .pf-v6-c-drawer__main').forEach(el => {
+        (el as HTMLElement).scrollLeft = 0;
+      });
+    };
+
+    resetDrawerScroll();
+    const id = requestAnimationFrame(resetDrawerScroll);
+    return () => cancelAnimationFrame(id);
+  }, [props.showNotificationCenter, pathname]);
+
+  const isGraph = (): boolean => {
+    return pathname.startsWith('/graph') || pathname.startsWith('/mesh');
+  };
+
+  const onNavToggleDesktop = (): void => {
+    setIsNavOpenDesktop(!isNavOpenDesktop);
+    props.setNavCollapsed(!props.navCollapsed);
+  };
+
+  const onNavToggleMobile = (): void => {
+    setIsNavOpenMobile(!isNavOpenMobile);
+  };
+
+  const onPageResize = ({ mobileView, windowSize }: { mobileView: boolean; windowSize: number }): void => {
+    let ismobile = mobileView;
+
+    if (windowSize < 1000) {
+      ismobile = true;
+    }
+
+    setIsMobileView(ismobile);
+  };
+
+  const isNavOpen = isMobileView ? isNavOpenMobile : isNavOpenDesktop || !props.navCollapsed;
+
+  const colorScheme = useKialiColorScheme();
+  const darkTheme = colorScheme === ColorScheme.DARK;
+  const kioskMode = isKiosk(props.kiosk);
+
+  const masthead = kioskMode ? undefined : (
+    <Masthead>
+      <MastheadMain>
+        <MastheadToggle>
+          <PageToggleButton
+            aria-label={t('Kiali navigation')}
+            isHamburgerButton
+            isSidebarOpen={isNavOpen}
+            onSidebarToggle={isMobileView ? onNavToggleMobile : onNavToggleDesktop}
+            variant={ButtonVariant.plain}
+          />
+        </MastheadToggle>
+        <MastheadBrand>
+          <MastheadLogo component={linkProps => <Link {...linkProps} to="/" />}>
+            <img src={darkTheme ? kialiLogoDark : kialiLogoLight} alt={t('Kiali Logo')} />
+          </MastheadLogo>
+        </MastheadBrand>
+      </MastheadMain>
+      <MastheadContent>
+        <MastheadItems />
+      </MastheadContent>
+    </Masthead>
+  );
+
+  const menu = <Menu isNavOpen={isNavOpen} externalServices={props.externalServices} ai={props.ai} />;
+
+  const Sidebar = kioskMode ? undefined : (
+    <PageSidebar isSidebarOpen={isNavOpen}>
+      <PageSidebarBody>{menu}</PageSidebarBody>
+    </PageSidebar>
+  );
+
+  return (
+    <Page
+      masthead={masthead}
+      sidebar={Sidebar}
+      notificationDrawer={<NotificationCenter />}
+      isNotificationDrawerExpanded={props.showNotificationCenter}
+      onPageResize={(_, { mobileView, windowSize }) => onPageResize({ mobileView, windowSize })}
+    >
+      {kioskMode && <ParentAppearanceSync />}
+      <PageSection hasBodyWrapper={false} className={flexBoxColumnStyle}>
+        <RenderPage isGraph={isGraph()} />
+      </PageSection>
+      {!kioskMode && props.chatbotEnabled && <ChatBot />}
+    </Page>
+  );
+};
+
+const mapStateToProps = (state: KialiAppState): ReduxStateProps => ({
+  chatbotEnabled: state.ai.enabled && state.ai.chat.enabled,
+  ai: state.ai.enabled,
+  externalServices: state.statusState.externalServices,
+  kiosk: state.globalState.kiosk,
+  navCollapsed: state.userSettings.interface.navCollapse,
+  showNotificationCenter: state.notificationCenter.expanded,
+  colorScheme: state.globalState.colorScheme,
+  tracingUrl: state.tracingState.info && state.tracingState.info.url ? state.tracingState.info.url : undefined
+});
+
+const mapDispatchToProps = (dispatch: KialiDispatch): ReduxDispatchProps => ({
+  setNavCollapsed: (collapse: boolean) => dispatch(UserSettingsThunkActions.setNavCollapsed(collapse))
+});
+
+export const Navigation = connect(mapStateToProps, mapDispatchToProps)(NavigationComponent);

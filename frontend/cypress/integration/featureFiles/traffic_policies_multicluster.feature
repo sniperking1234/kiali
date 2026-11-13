@@ -1,0 +1,65 @@
+@traffic-policies-multi-cluster
+# don't change first line of this file - the tag is used for the test scripts to identify the test suite
+@multi-cluster
+
+Feature: Manipulate Traffic Policies in the Primary-Remote and Multi-Primary setup
+  In Primary-Remote setup, user should be able to create, update and delete policies on the local cluster only.
+  In Multi-Primary setup, user should be able to create, update and delete policies on both clusters.
+
+	Background:
+		Given user is at administrator perspective
+
+  Scenario: Create a Traffic Policy in a local cluster
+    When user deletes a Traffic Policy and the resource is no longer available in any cluster
+    And user navigates to the namespace detail page for "bookinfo" in cluster "east"
+    And user decides to "create" a Traffic Policy
+    And user confirms to "create" the Traffic Policy
+    Then an info message "Traffic policies created for bookinfo namespace." is displayed
+    When user is at the "istio" list page
+    And user selects the "bookinfo" namespace
+    Then user sees the generated Traffic policy objects located in the "east" cluster
+    And user should not see the generated Traffic policy objects located in the "west" cluster
+
+  Scenario: Update a Traffic Policy scenario in a local cluster
+    When user navigates to the namespace detail page for "bookinfo" in cluster "east"
+    And user decides to "update" a Traffic Policy
+    And user confirms to "update" the Traffic Policy
+    Then an info message "Traffic policies updated for bookinfo namespace." is displayed
+
+  Scenario: Delete the Traffic Policy scenario in a local cluster
+    When user navigates to the namespace detail page for "bookinfo" in cluster "east"
+    And user decides to "delete" a Traffic Policy
+    And user confirms to "delete" the Traffic Policy
+    Then an info message "Traffic policies deleted for bookinfo namespace." is displayed
+    When user is at the "istio" list page
+    And user selects the "bookinfo" namespace
+    Then user should not see the generated Traffic policy objects located in the "east" cluster
+
+  @multi-primary
+  Scenario: Create a Traffic Policy in a remote cluster
+    When user deletes a Traffic Policy and the resource is no longer available in any cluster
+    And user navigates to the namespace detail page for "bookinfo" in cluster "west"
+    And user decides to "create" a Traffic Policy
+    And user confirms to "create" the Traffic Policy
+    Then an info message "Traffic policies created for bookinfo namespace." is displayed
+    When user is at the "istio" list page
+    And user selects the "bookinfo" namespace
+    Then user sees the generated Traffic policy objects located in the "west" cluster
+    And user should not see the generated Traffic policy objects located in the "east" cluster
+
+  @multi-primary
+  Scenario: Update a Traffic Policy scenario in a remote cluster
+    When user navigates to the namespace detail page for "bookinfo" in cluster "west"
+    And user decides to "update" a Traffic Policy
+    And user confirms to "update" the Traffic Policy
+    Then an info message "Traffic policies updated for bookinfo namespace." is displayed
+
+  @multi-primary
+  Scenario: Delete the Traffic Policy scenario in a remote cluster
+    When user navigates to the namespace detail page for "bookinfo" in cluster "west"
+    And user decides to "delete" a Traffic Policy
+    And user confirms to "delete" the Traffic Policy
+    Then an info message "Traffic policies deleted for bookinfo namespace." is displayed
+    When user is at the "istio" list page
+    And user selects the "bookinfo" namespace
+    Then user should not see the generated Traffic policy objects located in the "west" cluster

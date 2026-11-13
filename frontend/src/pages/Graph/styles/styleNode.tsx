@@ -1,0 +1,200 @@
+import {
+  DefaultNode,
+  getShapeComponent,
+  Layer,
+  NodeShape,
+  observer,
+  ScaleDetailsLevel,
+  TOP_LAYER,
+  useHover
+} from '@patternfly/react-topology';
+import type { Node, ShapeProps, WithSelectionProps } from '@patternfly/react-topology';
+import { useDetailsLevel } from '@patternfly/react-topology';
+import * as React from 'react';
+import { KeyIcon, TopologyIcon } from '@patternfly/react-icons';
+import { PFColors } from 'components/Pf/PfColors';
+import { kialiStyle } from 'styles/StyleUtils';
+import { Triangle, TriangleSharp } from '../../Graph/elements/triangle';
+import { Plate, PlateSharp } from '../../Graph/elements/plate';
+import { RectSharp } from '../elements/RectSharp';
+import { graphIsReady } from '../Graph';
+
+// This is the registered Node component override that utilizes our customized Node.tsx component.
+
+type StyleNodeProps = {
+  dragging?: boolean;
+  element: Node;
+} & WithSelectionProps;
+
+const renderIcon = (element: Node): React.ReactNode => {
+  let Component: React.ComponentClass<React.ComponentProps<any>> | undefined;
+  const data = element.getData();
+  const isInaccessible = data.isInaccessible;
+  const isServiceEntry = data.isServiceEntry;
+  const isBox = data.isBox;
+  if (isInaccessible && !isServiceEntry && !isBox) {
+    Component = KeyIcon;
+  }
+  const isOutside = data.isOutside;
+  if (isOutside && !isBox) {
+    Component = TopologyIcon;
+  }
+
+  const { width, height } = element.getDimensions();
+  const dim = Math.min(width, height);
+  let iconX = dim * 0.27;
+  let iconY = dim * 0.27;
+  let iconDim = dim * 0.45;
+
+  switch (element.getNodeShape()) {
+    case NodeShape.rhombus:
+      // will be a triangle, slightly reduce icon size and adjust position
+      iconDim = dim * 0.4;
+      iconX = dim * 0.28;
+      iconY = dim * 0.43;
+      break;
+    default:
+    // use defaults
+  }
+
+  return Component ? (
+    <g transform={`translate(${iconX} , ${iconY})`}>
+      <Component width={iconDim} height={iconDim} />
+    </g>
+  ) : (
+    <></>
+  );
+};
+
+const nodeStyle = kialiStyle({
+  $nest: {
+    '&.pf-m-hover': {
+      cursor: 'pointer'
+    },
+    '&.pf-m-selected .pf-topology__node__background': {
+      stroke: PFColors.Active,
+      strokeWidth: 6
+    }
+  }
+});
+
+const labelStyle = kialiStyle({
+  $nest: {
+    '& .pf-topology__node__label__icon__background': {
+      fill: 'var(--pf-t--global--color--nonstatus--purple--300)'
+    }
+  }
+});
+
+const StyleNodeComponent: React.FC<StyleNodeProps> = ({ element, ...rest }) => {
+  const data = element.getData();
+  const detailsLevel = useDetailsLevel();
+  const [hover, hoverRef] = useHover<SVGGElement>();
+
+  const ColorFind = PFColors.Gold400;
+  const ColorFocus = PFColors.Blue200;
+  const ColorSpan = PFColors.Purple40;
+  const OverlayOpacity = 0.35;
+  const OverlayWidth = 40;
+
+  const findOverlayStyle = kialiStyle({
+    strokeWidth: OverlayWidth,
+    stroke: ColorFind,
+    strokeOpacity: OverlayOpacity
+  });
+
+  const focusOverlayStyle = kialiStyle({
+    strokeWidth: OverlayWidth,
+    stroke: ColorFocus
+  });
+
+  const traceOverlayStyle = kialiStyle({
+    strokeWidth: OverlayWidth,
+    stroke: ColorSpan,
+    strokeOpacity: OverlayOpacity
+  });
+
+  // Set the path style when unhighlighted (opacity), but keep trace-overlay nodes visible
+  let opacity = 1;
+  if (data.isUnhighlighted && !data.hasSpans) {
+    opacity = 0.1;
+  }
+
+  const onMouseEnter = (): void => {
+    data.onHover?.(element, true);
+  };
+
+  const onMouseLeave = (): void => {
+    data.onHover?.(element, false);
+  };
+
+  const getCustomNodeShape = React.useCallback(
+    (node: Node): React.FunctionComponent<ShapeProps> => {
+      switch (node.getNodeShape()) {
+        case NodeShape.rect:
+          return RectSharp;
+        case NodeShape.rhombus:
+          return graphIsReady() && detailsLevel === ScaleDetailsLevel.high ? Triangle : TriangleSharp;
+        case NodeShape.trapezoid:
+          return graphIsReady() && detailsLevel === ScaleDetailsLevel.high ? Plate : PlateSharp;
+        default:
+          return getShapeComponent(node);
+      }
+    },
+    [detailsLevel]
+  );
+
+  const passedData = React.useMemo(() => {
+    const newData = { ...data };
+    if (detailsLevel !== ScaleDetailsLevel.high) {
+      newData.tag = undefined;
+    }
+    Object.keys(newData).forEach(key => {
+      if (newData[key] === undefined) {
+        delete newData[key];
+      }
+    });
+    return newData;
+  }, [data, detailsLevel]);
+
+  const { width, height } = element.getDimensions();
+  const ShapeComponent = getCustomNodeShape(element);
+
+  return (
+    <g onMouseEnter={onMouseEnter} onMouseLeave={onMouseLeave}>
+      {/* Move the hover ref with the entire node, keeping its label and decorators in the same boundary. */}
+      <Layer id={hover || rest.dragging ? TOP_LAYER : undefined}>
+        <g style={{ opacity: opacity }} ref={hoverRef}>
+          {data.hasSpans && (
+            <ShapeComponent className={traceOverlayStyle} width={width} height={height} element={element} />
+          )}
+          {data.isFind && (
+            <ShapeComponent className={findOverlayStyle} width={width} height={height} element={element} />
+          )}
+          {data.isFocus && (
+            <ShapeComponent className={focusOverlayStyle} width={width} height={height} element={element} />
+          )}
+          <DefaultNode
+            className={nodeStyle}
+            labelClassName={labelStyle}
+            element={element}
+            {...rest}
+            {...passedData}
+            raiseLabelOnHover={false}
+            hover={hover}
+            attachments={hover || detailsLevel === ScaleDetailsLevel.high ? data.attachments : undefined}
+            getCustomShape={getCustomNodeShape}
+            scaleLabel={hover && detailsLevel === ScaleDetailsLevel.high}
+            scaleNode={hover && detailsLevel !== ScaleDetailsLevel.high}
+            showLabel={hover || detailsLevel === ScaleDetailsLevel.high}
+            showStatusBackground={detailsLevel !== ScaleDetailsLevel.high}
+          >
+            {(hover || detailsLevel !== ScaleDetailsLevel.low) && renderIcon(element)}
+          </DefaultNode>
+        </g>
+      </Layer>
+    </g>
+  );
+};
+
+export const StyleNode = observer(StyleNodeComponent);

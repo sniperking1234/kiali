@@ -1,34 +1,29 @@
 package data
 
 import (
-	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
-	"github.com/kiali/kiali/kubernetes"
+	api_networking_v1 "istio.io/api/networking/v1"
+	networking_v1 "istio.io/client-go/pkg/apis/networking/v1"
 )
 
-func CreateSidecar(name string, namespace string) kubernetes.IstioObject {
-	return (&kubernetes.GenericIstioObject{
-		ObjectMeta: meta_v1.ObjectMeta{
-			Name:        name,
-			Namespace:   namespace,
-			ClusterName: "svc.cluster.local",
-		},
-		Spec: map[string]interface{}{},
-	}).DeepCopyIstioObject()
+func CreateSidecar(name string, namespace string) *networking_v1.Sidecar {
+	sc := networking_v1.Sidecar{}
+	sc.Name = name
+	sc.Namespace = namespace
+	return &sc
 }
 
-func AddSelectorToSidecar(selector map[string]interface{}, sc kubernetes.IstioObject) kubernetes.IstioObject {
-	sc.GetSpec()["workloadSelector"] = selector
+func AddSelectorToSidecar(selector map[string]string, sc *networking_v1.Sidecar) *networking_v1.Sidecar {
+	sc.Spec.WorkloadSelector = &api_networking_v1.WorkloadSelector{
+		Labels: selector,
+	}
 	return sc
 }
 
-func AddHostsToSidecar(hl []interface{}, sc kubernetes.IstioObject) kubernetes.IstioObject {
-	fullEgress := []interface{}{
-		map[string]interface{}{
-			"hosts": hl,
+func AddHostsToSidecar(hl []string, sc *networking_v1.Sidecar) *networking_v1.Sidecar {
+	sc.Spec.Egress = []*api_networking_v1.IstioEgressListener{
+		{
+			Hosts: hl,
 		},
 	}
-
-	sc.GetSpec()["egress"] = fullEgress
 	return sc
 }

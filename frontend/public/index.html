@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no" />
+    <meta name="theme-color" content="#000000" />
+    <base href="/" />
+    <script type="text/javascript" src="./env.js"></script>
+    <!--
+      manifest.json provides metadata used when your web app is added to the
+      homescreen on Android. See https://developers.google.com/web/fundamentals/engage-and-retain/web-app-manifest/
+    -->
+    <link rel="manifest" href="<%= assetPrefix %>/manifest.json" />
+    <link rel="shortcut icon" href="<%= assetPrefix %>/kiali_icon_lightbkg_16px.png" />
+    <title>Kiali</title>
+    <!-- Preload the pf-v6-pficon font to ensure it is available immediately for Graph edges or ace editors -->
+    <link rel="preload font" as="font" type="font/woff2" crossorigin="anonymous" href="<%= assetPrefix %>/pf-v6-pficon.woff2" />
+    <style>
+      @font-face {
+        font-family: 'pf-v6-pficon';
+        src: url('<%= assetPrefix %>/pf-v6-pficon.woff2') format('woff2');
+      }
+    </style>
+  </head>
+  <body class="pf-m-redhat-font">
+    <noscript> You need to enable JavaScript to run this app. </noscript>
+    <div id="root"></div>
+  </body>
+</html>

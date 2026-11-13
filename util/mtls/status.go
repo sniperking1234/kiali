@@ -1,10 +1,11 @@
 package mtls
 
 import (
-	v1 "k8s.io/api/core/v1"
+	networking_v1 "istio.io/client-go/pkg/apis/networking/v1"
+	security_v1 "istio.io/client-go/pkg/apis/security/v1"
+	core_v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/labels"
 
-	"github.com/kiali/kiali/business/checkers/common"
 	"github.com/kiali/kiali/kubernetes"
 )
 
@@ -16,13 +17,12 @@ const (
 )
 
 type MtlsStatus struct {
-	Namespace           string
-	PeerAuthentications []kubernetes.IstioObject
-	DestinationRules    []kubernetes.IstioObject
-	MatchingLabels      labels.Labels
-	Services            []v1.Service
-	AutoMtlsEnabled     bool
 	AllowPermissive     bool
+	AutoMtlsEnabled     bool
+	DestinationRules    []*networking_v1.DestinationRule
+	MatchingLabels      labels.Labels
+	PeerAuthentications []*security_v1.PeerAuthentication
+	Services            []core_v1.Service
 }
 
 type TlsStatus struct {
@@ -41,9 +41,9 @@ func (m MtlsStatus) hasPeerAuthnNamespacemTLSDefinition() string {
 	return ""
 }
 
-func (m MtlsStatus) hasDesinationRuleEnablingNamespacemTLS() string {
+func (m MtlsStatus) hasDesinationRuleEnablingNamespacemTLS(namespace string, identityDomain string) string {
 	for _, dr := range m.DestinationRules {
-		if _, mode := kubernetes.DestinationRuleHasNamespaceWideMTLSEnabled(m.Namespace, dr); mode != "" {
+		if _, mode := kubernetes.DestinationRuleHasNamespaceWideMTLSEnabled(namespace, dr, identityDomain); mode != "" {
 			return mode
 		}
 	}
@@ -52,13 +52,22 @@ func (m MtlsStatus) hasDesinationRuleEnablingNamespacemTLS() string {
 }
 
 // Returns the mTLS status at workload level (matching the m.MatchingLabels)
-func (m MtlsStatus) WorkloadMtlsStatus() string {
+func (m MtlsStatus) WorkloadMtlsStatus(namespace string, identityDomain string) string {
 	for _, pa := range m.PeerAuthentications {
-		selectorLabels := common.GetSelectorLabels(pa)
-		if selectorLabels == nil {
+		var selectorLabels map[string]string
+		if pa.Spec.Selector != nil {
+			selectorLabels = pa.Spec.Selector.MatchLabels
+		} else {
 			continue
 		}
-
+		// Pre-existing bug fix: when a PA uses only MatchExpressions (no MatchLabels),
+		// selectorLabels is nil. labels.Set(nil).AsSelector() produces an empty selector
+		// that matches everything, causing all services to be treated as matching.
+		// K8s Service selectors are simple key=value maps, so we cannot evaluate
+		// MatchExpressions against them — skip PAs that have no MatchLabels.
+		if len(selectorLabels) == 0 {
+			continue
+		}
 		selector := labels.Set(selectorLabels).AsSelector()
 		match := selector.Matches(m.MatchingLabels)
 		if !match {
@@ -66,29 +75,33 @@ func (m MtlsStatus) WorkloadMtlsStatus() string {
 		}
 
 		_, mode := kubernetes.PeerAuthnMTLSMode(pa)
-		if mode == "STRICT" {
+		switch mode {
+		case "STRICT":
 			return MTLSEnabled
-		} else if mode == "DISABLE" {
+		case "DISABLE":
 			return MTLSDisabled
-		} else if mode == "PERMISSIVE" {
+		case "PERMISSIVE":
 			if len(m.DestinationRules) == 0 {
 				return MTLSNotEnabled
 			} else {
-				// Filter DR that applies to the Services matching with the selector
-				// Fetch hosts from DRs and its mtls mode [details, ISTIO_STATUS]
-				// Filter Svc and extract its workloads selectors
-				filteredSvcs := kubernetes.FilterServicesForSelector(selector, m.Services)
-				for _, svc := range filteredSvcs {
-					filteredDrs := kubernetes.FilterDestinationRules(m.DestinationRules, svc.Namespace, svc.Name)
-					for _, dr := range filteredDrs {
-						enabled, mode := kubernetes.DestinationRuleHasMTLSEnabled(dr)
-						if enabled || mode == "MUTUAL" {
-							return MTLSEnabled
-						} else if mode == "DISABLE" {
-							return MTLSDisabled
+				// Filter K8s Services whose selector matches the PA selector, then check DRs
+				for _, svc := range m.Services {
+					if svc.Namespace != namespace || len(svc.Spec.Selector) == 0 {
+						continue
+					}
+					if selector.Matches(labels.Set(svc.Spec.Selector)) {
+						filteredDrs := kubernetes.FilterDestinationRulesByService(m.DestinationRules, svc.Namespace, svc.Name, identityDomain)
+						for _, dr := range filteredDrs {
+							enabled, mode := kubernetes.DestinationRuleHasMTLSEnabled(dr)
+							if enabled || mode == "MUTUAL" {
+								return MTLSEnabled
+							} else if mode == "DISABLE" {
+								return MTLSDisabled
+							}
 						}
 					}
 				}
+
 				return MTLSNotEnabled
 			}
 		}
@@ -97,8 +110,8 @@ func (m MtlsStatus) WorkloadMtlsStatus() string {
 	return MTLSNotEnabled
 }
 
-func (m MtlsStatus) NamespaceMtlsStatus() TlsStatus {
-	drStatus := m.hasDesinationRuleEnablingNamespacemTLS()
+func (m MtlsStatus) NamespaceMtlsStatus(namespace string, identityDomain string) TlsStatus {
+	drStatus := m.hasDesinationRuleEnablingNamespacemTLS(namespace, identityDomain)
 	paStatus := m.hasPeerAuthnNamespacemTLSDefinition()
 	return m.finalStatus(drStatus, paStatus)
 }
@@ -153,7 +166,7 @@ func (m MtlsStatus) hasDestinationRuleMeshTLSDefinition() string {
 }
 
 func (m MtlsStatus) OverallMtlsStatus(nsStatus, meshStatus TlsStatus) string {
-	var status = MTLSPartiallyEnabled
+	status := MTLSPartiallyEnabled
 	if nsStatus.hasDefinedTls() {
 		status = nsStatus.OverallStatus
 	} else if nsStatus.hasPartialTlsConfig() {
@@ -173,7 +186,7 @@ func (m MtlsStatus) OverallMtlsStatus(nsStatus, meshStatus TlsStatus) string {
 }
 
 func (m MtlsStatus) inheritedOverallStatus(nsStatus, meshStatus TlsStatus) string {
-	var partialDRStatus, partialPAStatus = nsStatus.DestinationRuleStatus, nsStatus.PeerAuthenticationStatus
+	partialDRStatus, partialPAStatus := nsStatus.DestinationRuleStatus, nsStatus.PeerAuthenticationStatus
 	if nsStatus.DestinationRuleStatus == "" {
 		partialDRStatus = meshStatus.DestinationRuleStatus
 	}

@@ -1,0 +1,185 @@
+import type { Store } from 'redux';
+import { createStore, applyMiddleware, compose } from 'redux';
+import type { GlobalState, KialiAppState } from './Store';
+import type { Transform } from 'redux-persist';
+import { persistStore, persistReducer } from 'redux-persist';
+import { persistFilter } from 'redux-persist-transform-filter';
+import { createTransform } from 'redux-persist';
+import { rootReducer } from '../reducers';
+import storage from 'redux-persist/lib/storage';
+import { INITIAL_GLOBAL_STATE } from '../reducers/GlobalState';
+import { INITIAL_LOGIN_STATE } from '../reducers/LoginState';
+import { INITIAL_GRAPH_STATE } from '../reducers/GraphDataState';
+import { INITIAL_USER_SETTINGS_STATE } from '../reducers/UserSettingsState';
+import { INITIAL_NOTIFICATION_CENTER_STATE } from '../reducers/NotificationCenter';
+import { INITIAL_STATUS_STATE } from '../reducers/HelpDropdownState';
+import { INITIAL_NAMESPACE_STATE } from '../reducers/NamespaceState';
+import { INITIAL_NAMESPACES_LIST_STATE } from '../reducers/NamespacesListState';
+import { INITIAL_SERVICES_LIST_STATE } from '../reducers/ServicesListState';
+import { INITIAL_APPS_LIST_STATE } from '../reducers/AppsListState';
+import { INITIAL_WORKLOADS_LIST_STATE } from '../reducers/WorkloadsListState';
+import { INITIAL_CLUSTER_STATE } from '../reducers/ClusterState';
+import { INITIAL_TRACING_STATE } from '../reducers/TracingState';
+import { INITIAL_MESH_TLS_STATE } from '../reducers/MeshTlsState';
+import { INITIAL_TOUR_STATE } from '../reducers/TourState';
+import { INITIAL_ISTIO_STATUS_STATE } from '../reducers/IstioStatusState';
+import { INITIAL_METRICS_STATS_STATE } from '../reducers/MetricsStatsState';
+import type { KialiAppAction } from 'actions/KialiAppAction';
+import { INITIAL_MESH_STATE } from 'reducers/MeshDataState';
+import { webRoot } from 'app/History';
+import { INITIAL_AI_RIGHT_VIEW_STATE, INITIAL_CHAT_AI_STATE } from 'reducers/ChatAIState';
+import { Theme } from 'types/Common';
+import {
+  isColorScheme,
+  isContrastMode,
+  isLanguagePreference,
+  isLegacyColorSchemeTheme,
+  isTheme
+} from 'utils/PreferenceValidation';
+
+declare const window;
+
+const reduxThunkModule = require('redux-thunk');
+const thunk = reduxThunkModule.thunk ?? reduxThunkModule.default;
+
+// `webRoot` can be undefined in some unit tests that mock `app/History`. Be defensive to avoid crashing at import-time.
+const safeWebRoot = typeof webRoot === 'string' && webRoot.length > 0 ? webRoot : '/';
+const persistKeySuffix = safeWebRoot !== '/' ? safeWebRoot.replace(/^\//, '') : 'root';
+const persistKey = `kiali-${persistKeySuffix}`;
+
+// Needed to be able to whitelist fields but allowing to keep an initialState
+const whitelistInputWithInitialState = (
+  reducerName: string,
+  inboundPaths: string[],
+  initialState: any
+): Transform<unknown, Transform<unknown, unknown>> =>
+  createTransform(
+    inboundState => persistFilter(inboundState, inboundPaths, 'whitelist'),
+    outboundState => ({ ...initialState, ...outboundState }),
+    { whitelist: [reducerName] }
+  );
+
+const authenticationPersistFilter = whitelistInputWithInitialState(
+  'authentication',
+  ['landingRoute'],
+  INITIAL_LOGIN_STATE
+);
+
+const namespacePersistFilter = whitelistInputWithInitialState(
+  'namespaces',
+  ['activeNamespaces'],
+  INITIAL_NAMESPACE_STATE
+);
+
+const globalStatePersistPaths = ['colorScheme', 'contrastMode', 'language', 'theme'];
+
+/**
+ * Normalizes globalState read from redux-persist on rehydrate.
+ *
+ * Older builds stored light/dark preference in `theme`; current builds use `colorScheme`
+ * for that and reserve `theme` for the PF variant (default|felt). When `theme` is Light
+ * or Dark, promote it to `colorScheme` and reset `theme` to default.
+ *
+ * Also validates contrast mode and theme variant against known values, falling back to
+ * defaults for anything missing or invalid. Spreads INITIAL_GLOBAL_STATE so new fields
+ * added to GlobalState get sane defaults without breaking existing persisted sessions.
+ */
+export const migratePersistedGlobalState = (outboundState: Partial<GlobalState> & { theme?: string }): GlobalState => {
+  const legacyColorSchemeTheme = isLegacyColorSchemeTheme(outboundState.theme);
+  const legacyColorScheme = legacyColorSchemeTheme ? outboundState.theme : undefined;
+  const theme = legacyColorSchemeTheme
+    ? Theme.DEFAULT
+    : isTheme(outboundState.theme)
+      ? outboundState.theme
+      : INITIAL_GLOBAL_STATE.theme;
+  const rawColorScheme = outboundState.colorScheme;
+  const normalizedColorScheme = isColorScheme(rawColorScheme) ? rawColorScheme : undefined;
+  const colorScheme = normalizedColorScheme || legacyColorScheme || INITIAL_GLOBAL_STATE.colorScheme;
+  const rawContrastMode = outboundState.contrastMode;
+  const contrastMode = isContrastMode(rawContrastMode) ? rawContrastMode : INITIAL_GLOBAL_STATE.contrastMode;
+  const rawLanguage = outboundState.language;
+  const language = isLanguagePreference(rawLanguage) ? rawLanguage : INITIAL_GLOBAL_STATE.language;
+
+  return {
+    ...INITIAL_GLOBAL_STATE,
+    ...outboundState,
+    colorScheme,
+    contrastMode,
+    language,
+    theme
+  };
+};
+
+const globalStateFilter = createTransform(
+  inboundState => persistFilter(inboundState, globalStatePersistPaths, 'whitelist'),
+  outboundState => migratePersistedGlobalState(outboundState as Partial<GlobalState> & { theme?: string }),
+  { whitelist: ['globalState'] }
+);
+
+const graphPersistFilter = whitelistInputWithInitialState('graph', ['filterState', 'layout'], INITIAL_GRAPH_STATE);
+
+const userSettingsPersitFilter = whitelistInputWithInitialState(
+  'userSettings',
+  ['duration', 'refreshInterval', 'timeRange'],
+  INITIAL_USER_SETTINGS_STATE
+);
+
+const persistConfig = {
+  key: persistKey,
+  storage: storage,
+  whitelist: ['authentication', 'globalState', 'graph', 'namespaces', 'statusState', 'tracingState', 'userSettings'],
+  transforms: [
+    authenticationPersistFilter,
+    graphPersistFilter,
+    globalStateFilter,
+    namespacePersistFilter,
+    userSettingsPersitFilter
+  ]
+};
+
+const composeEnhancers =
+  (process.env.NODE_ENV === 'development' && window && window.__REDUX_DEVTOOLS_EXTENSION_COMPOSE__) || compose;
+
+const configureStore = (initialState: KialiAppState): Store<KialiAppState, KialiAppAction> => {
+  // configure middlewares
+  const middlewares = [thunk];
+  // compose enhancers
+  const enhancer = composeEnhancers(applyMiddleware(...middlewares));
+  // persist reducers
+  const persistentReducer = persistReducer(persistConfig, rootReducer);
+
+  return createStore(persistentReducer, initialState, enhancer);
+};
+
+// Setup the initial state of the Redux store with defaults
+// (instead of having things be undefined until they are populated by query)
+// Redux 4.0 actually required this
+const initialStore: KialiAppState = {
+  ai: {
+    chat: INITIAL_CHAT_AI_STATE,
+    consumption: INITIAL_AI_RIGHT_VIEW_STATE,
+    enabled: false
+  },
+  authentication: INITIAL_LOGIN_STATE,
+  clusters: INITIAL_CLUSTER_STATE,
+  globalState: INITIAL_GLOBAL_STATE,
+  graph: INITIAL_GRAPH_STATE,
+  istioStatus: INITIAL_ISTIO_STATUS_STATE,
+  mesh: INITIAL_MESH_STATE,
+  meshTLSStatus: INITIAL_MESH_TLS_STATE,
+  metricsStats: INITIAL_METRICS_STATS_STATE,
+  namespaces: INITIAL_NAMESPACE_STATE,
+  namespacesList: INITIAL_NAMESPACES_LIST_STATE,
+  servicesList: INITIAL_SERVICES_LIST_STATE,
+  appsList: INITIAL_APPS_LIST_STATE,
+  workloadsList: INITIAL_WORKLOADS_LIST_STATE,
+  notificationCenter: INITIAL_NOTIFICATION_CENTER_STATE,
+  statusState: INITIAL_STATUS_STATE,
+  tourState: INITIAL_TOUR_STATE,
+  tracingState: INITIAL_TRACING_STATE,
+  userSettings: INITIAL_USER_SETTINGS_STATE
+};
+
+// pass an optional param to rehydrate state on app start
+export const store = configureStore(initialStore);
+export const persistor = persistStore(store);

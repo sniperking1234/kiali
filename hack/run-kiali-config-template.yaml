@@ -13,39 +13,40 @@
 #
 ###################################################################
 
-istio_namespace: "${ISTIO_NAMESPACE}"
-
 auth:
   strategy: "anonymous"
 
+clustering:
+  ignore_home_cluster: ${IGNORE_HOME_CLUSTER}
+
 deployment:
-  accessible_namespaces: ['**']
+  cluster_wide_access: true
+
+kiali_internal:
+  # TODO: Remove with: https://github.com/kiali/kiali/issues/8263.
+  url_service_version: "${ISTIOD_URL}"
 
 external_services:
   custom_dashboards:
     enabled: false
 
   grafana:
-    enabled: true
-    in_cluster_url: "${GRAFANA_URL}"
-    url: "${GRAFANA_URL}"
+    enabled: ${GRAFANA_ENABLED}
+    internal_url: "${GRAFANA_URL}"
+    external_url: "${GRAFANA_URL}"
 
   prometheus:
     url: "${PROMETHEUS_URL}"
 
   tracing:
-    enabled: true
-    in_cluster_url: "${TRACING_URL}"
-    url: "${TRACING_URL}"
+    enabled: ${TRACING_ENABLED}
+    provider: "${TRACING_PROVIDER}"
+    internal_url: "${TRACING_URL}"
+    external_url: "${TRACING_URL}"
+    use_grpc: false
 
 kubernetes_config:
-  cache_enabled: true
+  cluster_name: "${CLUSTER_NAME}"
 
 login_token:
-   signing_key: "notsecure"
-
-server:
-  static_content_root_directory: "${UI_CONSOLE_DIR}"
-
-# in_cluster must be false - do not change
-in_cluster: false
+  signing_key: "notsecure"

@@ -8,7 +8,7 @@ import (
 	"github.com/kiali/kiali/kubernetes"
 	"github.com/kiali/kiali/models"
 	"github.com/kiali/kiali/tests/data"
-	"github.com/kiali/kiali/tests/data/validations"
+	"github.com/kiali/kiali/tests/testutils/validations"
 )
 
 // Context: AutoMtls enabled
@@ -128,6 +128,22 @@ func TestAutoAuthzMeshMTLSEnabled(t *testing.T) {
 	testNoMtlsChecker("mtls_enabled_checker_14.yaml", t, false)
 }
 
+// Mesh-wide PERMISSIVE without a DestinationRule is Istio's default (inherited by UNSET
+// namespaces). With auto-mTLS, sidecar-to-sidecar traffic is still mTLS so source.namespaces
+// is valid. Without auto-mTLS, KIA0105 is still expected.
+func TestAutoAuthzMeshPermissiveNoDestRule(t *testing.T) {
+	testNoMtlsChecker("mtls_enabled_checker_23.yaml", t, true)
+
+	vals := mtlsCheckerTestPrep("mtls_enabled_checker_23.yaml", false, t)
+	ta := validations.ValidationsTestAsserter{T: t, Validations: vals}
+	ta.AssertValidationsPresent(1)
+	ta.AssertValidationAt(models.IstioValidationKey{
+		ObjectGVK: kubernetes.AuthorizationPolicies,
+		Name:      "policy",
+		Namespace: "bookinfo",
+	}, models.ErrorSeverity, "spec/rules[0]/from[0]/source/namespaces", "authorizationpolicy.mtls.needstobeenabled")
+}
+
 // Context: AutoMtls enabled
 // Context: Authorization Policy found
 // Context: Mesh-wide mTLS enabled
@@ -209,7 +225,7 @@ func TestNeedsIdentities(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		ap := loader.GetResource("AuthorizationPolicy", test.name, "bookinfo")
+		ap := loader.FindAuthorizationPolicy(test.name, "bookinfo")
 		needs, paths := needsMtls(ap)
 		if needs != test.result {
 			t.Errorf("%s needs identities: %t. Expected to be %t", test.name, needs, test.result)
@@ -238,19 +254,19 @@ func mtlsCheckerTestPrep(scenario string, autoMtls bool, t *testing.T) models.Is
 	loader := yamlFixtureLoaderFor(scenario)
 	err := loader.Load()
 	if err != nil {
-		t.Error("Error loading test data.")
+		t.Errorf("Error loading scenario [%s] test data. Error: [%s]", scenario, err)
 	}
 
 	validations := MtlsEnabledChecker{
-		Namespace:             "bookinfo",
-		AuthorizationPolicies: loader.GetResources("AuthorizationPolicy"),
-		Services:              fakeServices([]string{"ratings"}),
+		AuthorizationPolicies: loader.GetResources().AuthorizationPolicies,
+		IdentityDomain:        config.ResolveIdentityDomain(config.Get().ExternalServices.Istio.IstioIdentityDomain, ""),
 		MtlsDetails: kubernetes.MTLSDetails{
-			DestinationRules:        loader.GetResources("DestinationRule"),
-			MeshPeerAuthentications: loader.GetResourcesIn("PeerAuthentication", "istio-system"),
-			PeerAuthentications:     loader.GetResourcesNotIn("PeerAuthentication", "istio-system"),
+			DestinationRules:        loader.GetResources().DestinationRules,
+			MeshPeerAuthentications: loader.FindPeerAuthenticationIn("istio-system"),
+			PeerAuthentications:     loader.FindPeerAuthenticationNotIn("istio-system"),
 			EnabledAutoMtls:         autoMtls,
 		},
+		Services: data.CreateFakeServicesWithSelector("ratings", "bookinfo"),
 	}.Check()
 
 	return validations
@@ -267,13 +283,13 @@ func testMtlsCheckerPresent(scenario string, t *testing.T, autoMtls bool) {
 	ta := validations.ValidationsTestAsserter{T: t, Validations: vals}
 	ta.AssertValidationsPresent(1)
 	ta.AssertValidationAt(models.IstioValidationKey{
-		ObjectType: "authorizationpolicy",
-		Name:       "policy",
-		Namespace:  "bookinfo",
-	}, models.ErrorSeverity, "spec/rules[0]/source/principals", "authorizationpolicy.mtls.needstobeenabled")
+		ObjectGVK: kubernetes.AuthorizationPolicies,
+		Name:      "policy",
+		Namespace: "bookinfo",
+	}, models.ErrorSeverity, "spec/rules[0]/from[0]/source/principals", "authorizationpolicy.mtls.needstobeenabled")
 }
 
-func yamlFixtureLoaderFor(file string) *data.YamlFixtureLoader {
+func yamlFixtureLoaderFor(file string) *validations.YamlFixtureLoader {
 	path := fmt.Sprintf("../../../tests/data/validations/authorization/%s", file)
-	return &data.YamlFixtureLoader{Filename: path}
+	return &validations.YamlFixtureLoader{Filename: path}
 }

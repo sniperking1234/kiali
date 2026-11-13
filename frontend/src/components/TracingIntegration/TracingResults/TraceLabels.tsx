@@ -1,0 +1,67 @@
+import { Label } from '@patternfly/react-core';
+
+import { PFColors } from 'components/Pf/PfColors';
+import type { Span } from 'types/TracingInfo';
+import { isErrorTag } from 'utils/tracing/TracingHelper';
+import { kialiStyle } from 'styles/StyleUtils';
+import { t } from 'utils/I18nUtils';
+
+/**
+ * PF4 adds a wrapper for the label content
+ * And the label color is override by .pf-v6-c-label__content
+ * And there are not styles with the color white
+ */
+const whiteLabelStyle = kialiStyle({
+  $nest: {
+    '& > .pf-v6-c-label__content': {
+      color: PFColors.Color100
+    }
+  }
+});
+
+type Props = {
+  filteredSpans?: Span[];
+  oneline: boolean;
+  spans: Span[];
+};
+
+const countServices = (spans: Span[]): number => {
+  const services = new Set();
+  spans.forEach(s => services.add(s.process.serviceName));
+  return services.size;
+};
+
+const countErrors = (spans: Span[]): number => {
+  return spans.filter(sp => sp.tags.some(isErrorTag)).length;
+};
+
+export const TraceLabels = (p: Props): JSX.Element => {
+  const errors = countErrors(p.spans);
+  const filteredErrors = p.filteredSpans ? countErrors(p.filteredSpans) : undefined;
+  return (
+    <>
+      <Label style={{ margin: 10 }} color="blue">
+        {p.filteredSpans && `${p.filteredSpans.length} / `}
+        {t('{{count}} Span', { count: p.spans.length })}
+      </Label>
+      <Label style={{ margin: 10 }} color="blue">
+        {p.filteredSpans && `${countServices(p.filteredSpans)} / `}
+        {t('{{count}} App involved', { count: countServices(p.spans) })}
+      </Label>
+      {!p.oneline && <br />}
+      {errors === 0 ? (
+        <Label className={whiteLabelStyle} style={{ margin: 10, backgroundColor: PFColors.Success }}>
+          {t('{{count}} Span with error', { count: 0 })}
+        </Label>
+      ) : (
+        <Label
+          className={whiteLabelStyle}
+          style={{ margin: 10, backgroundColor: filteredErrors === 0 ? PFColors.Warning : PFColors.Danger }}
+        >
+          {p.filteredSpans && `${filteredErrors} / `}
+          {t('{{count}} Span with error', { count: errors })}
+        </Label>
+      )}
+    </>
+  );
+};

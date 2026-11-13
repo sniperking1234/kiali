@@ -1,0 +1,78 @@
+package checkers
+
+import (
+	security_v1 "istio.io/client-go/pkg/apis/security/v1"
+	core_v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+
+	ambient "github.com/kiali/kiali/business/checkers/ambient"
+	"github.com/kiali/kiali/business/checkers/workloads"
+	"github.com/kiali/kiali/config"
+	"github.com/kiali/kiali/models"
+)
+
+const WorkloadCheckerType = "workload"
+
+type WorkloadChecker struct {
+	AuthorizationPolicies []*security_v1.AuthorizationPolicy
+	Cluster               string
+	Conf                  *config.Config
+	Namespaces            models.Namespaces
+	RootNamespaces        map[string]string
+	Services              []core_v1.Service
+	WorkloadsPerNamespace map[string]models.Workloads
+}
+
+// NewWorkloadChecker creates a new WorkloadChecker with all attributes.
+// rootNamespaces maps each namespace to its control plane's root namespace.
+// services are used to resolve AuthorizationPolicy targetRefs for Ambient KIA1317 scoping.
+func NewWorkloadChecker(
+	authorizationPolicies []*security_v1.AuthorizationPolicy,
+	cluster string,
+	conf *config.Config,
+	rootNamespaces map[string]string,
+	namespaces models.Namespaces,
+	workloadsPerNamespace map[string]models.Workloads,
+	services []core_v1.Service,
+) WorkloadChecker {
+	return WorkloadChecker{
+		AuthorizationPolicies: authorizationPolicies,
+		Cluster:               cluster,
+		Conf:                  conf,
+		Namespaces:            namespaces,
+		RootNamespaces:        rootNamespaces,
+		Services:              services,
+		WorkloadsPerNamespace: workloadsPerNamespace,
+	}
+}
+
+func (w WorkloadChecker) Check() models.IstioValidations {
+	validations := models.IstioValidations{}
+
+	for ns, workloads := range w.WorkloadsPerNamespace {
+		for _, wl := range workloads {
+			validations.MergeValidations(w.runChecks(wl, ns))
+		}
+	}
+
+	return validations
+}
+
+// runChecks runs all the individual checks for a single workload and appends the result into validations.
+func (w WorkloadChecker) runChecks(workload *models.Workload, namespace string) models.IstioValidations {
+	wlName := workload.Name
+	key, rrValidation := EmptyValidValidation(wlName, namespace, schema.GroupVersionKind{Group: "", Version: "", Kind: WorkloadCheckerType}, w.Cluster)
+
+	enabledCheckers := []Checker{
+		workloads.NewUncoveredWorkloadChecker(w.AuthorizationPolicies, w.RootNamespaces, namespace, workload),
+		ambient.NewAmbientWorkloadChecker(w.Cluster, w.Conf, workload, namespace, w.Namespaces, w.AuthorizationPolicies, w.Services),
+	}
+
+	for _, checker := range enabledCheckers {
+		checks, validChecker := checker.Check()
+		rrValidation.Checks = append(rrValidation.Checks, checks...)
+		rrValidation.Valid = rrValidation.Valid && validChecker
+	}
+
+	return models.IstioValidations{key: rrValidation}
+}

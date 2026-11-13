@@ -1,53 +1,169 @@
 package kubetest
 
 import (
-	"github.com/dgrijalva/jwt-go"
+	"sync"
+
 	osapps_v1 "github.com/openshift/api/apps/v1"
 	"github.com/stretchr/testify/mock"
+	istio_fake "istio.io/client-go/pkg/clientset/versioned/fake"
 	apps_v1 "k8s.io/api/apps/v1"
 	batch_v1 "k8s.io/api/batch/v1"
-	batch_apps_v1 "k8s.io/api/batch/v1beta1"
 	core_v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/version"
 	"k8s.io/client-go/tools/clientcmd/api"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	inferenceapifake "sigs.k8s.io/gateway-api-inference-extension/client-go/clientset/versioned/fake"
+	gatewayapifake "sigs.k8s.io/gateway-api/pkg/client/clientset/versioned/fake"
 
+	"github.com/kiali/kiali/config"
+	"github.com/kiali/kiali/jwt"
 	"github.com/kiali/kiali/kubernetes"
 )
 
 //// Mock for the K8SClientFactory
 
 type K8SClientFactoryMock struct {
-	mock.Mock
-	k8s kubernetes.ClientInterface
+	conf    *config.Config
+	lock    sync.RWMutex
+	Clients map[string]kubernetes.UserClientInterface
+	// SAClients optionally holds ServiceAccount clients that are distinct
+	// from the user Clients above. When nil, GetSAClient(s) fall back to the
+	// user Clients (legacy behavior, where SA and user are the same
+	// identity). Set it to model the production threat where the SA can see
+	// namespaces the user cannot: the SA clients should be unfiltered while
+	// the user Clients carry the restricted/list-authorized reactors.
+	SAClients map[string]kubernetes.ClientInterface
 }
 
+// Interface guard to ensure K8SClientFactoryMock implements ClientFactory.
+var _ kubernetes.ClientFactory = &K8SClientFactoryMock{}
+
 // Constructor
-func NewK8SClientFactoryMock(k8s kubernetes.ClientInterface) *K8SClientFactoryMock {
-	k8sClientFactory := new(K8SClientFactoryMock)
-	k8sClientFactory.k8s = k8s
-	return k8sClientFactory
+// Deprecated: use NewFakeClientFactory or NewFakeClientFactoryWithClient instead since those doesn't rely on the global config.Get()
+func NewK8SClientFactoryMock(k8s kubernetes.UserClientInterface) *K8SClientFactoryMock {
+	conf := config.Get()
+	clients := map[string]kubernetes.UserClientInterface{conf.KubernetesConfig.ClusterName: k8s}
+	return NewFakeClientFactory(conf, clients)
+}
+
+func NewFakeClientFactory(conf *config.Config, clients map[string]kubernetes.UserClientInterface) *K8SClientFactoryMock {
+	return &K8SClientFactoryMock{conf: conf, Clients: clients}
+}
+
+// NewFakeClientFactoryWithClient lets you pass a single client instead of a map.
+func NewFakeClientFactoryWithClient(conf *config.Config, client kubernetes.UserClientInterface) *K8SClientFactoryMock {
+	return &K8SClientFactoryMock{
+		conf:    conf,
+		Clients: map[string]kubernetes.UserClientInterface{conf.KubernetesConfig.ClusterName: client},
+	}
+}
+
+// Testing specific methods
+func (o *K8SClientFactoryMock) SetClients(clients map[string]kubernetes.UserClientInterface) {
+	o.lock.Lock()
+	defer o.lock.Unlock()
+	o.Clients = clients
 }
 
 // Business Methods
-func (o *K8SClientFactoryMock) GetClient(authInfo *api.AuthInfo) (kubernetes.ClientInterface, error) {
-	return o.k8s, nil
+func (o *K8SClientFactoryMock) GetClient(authInfo *api.AuthInfo, cluster string) (kubernetes.UserClientInterface, error) {
+	o.lock.RLock()
+	defer o.lock.RUnlock()
+	return o.Clients[cluster], nil
+}
+
+// Business Methods
+func (o *K8SClientFactoryMock) GetClients(map[string]*api.AuthInfo) (map[string]kubernetes.UserClientInterface, error) {
+	o.lock.RLock()
+	defer o.lock.RUnlock()
+	return o.Clients, nil
+}
+
+func (o *K8SClientFactoryMock) GetSAClient(cluster string) kubernetes.ClientInterface {
+	o.lock.RLock()
+	defer o.lock.RUnlock()
+	if o.SAClients != nil {
+		return o.SAClients[cluster]
+	}
+	return o.Clients[cluster]
+}
+
+func (o *K8SClientFactoryMock) GetSAClients() map[string]kubernetes.ClientInterface {
+	o.lock.RLock()
+	defer o.lock.RUnlock()
+	if o.SAClients != nil {
+		return o.SAClients
+	}
+	return kubernetes.ConvertFromUserClients(o.Clients)
+}
+
+func (o *K8SClientFactoryMock) GetSAHomeClusterClient() kubernetes.ClientInterface {
+	o.lock.RLock()
+	defer o.lock.RUnlock()
+	if o.SAClients != nil {
+		return o.SAClients[o.conf.KubernetesConfig.ClusterName]
+	}
+	return o.Clients[o.conf.KubernetesConfig.ClusterName]
+}
+
+// WithSAClient sets a distinct, unfiltered SA client for the cluster, built
+// from the given objects (token "sa-token"), so tests can model "the SA
+// sees it, the user does not". Forgetting the distinct token — or the
+// separate SA client altogether — is exactly what makes a restricted-LIST
+// test exercise "absent" instead of "denied" whenever the code under test
+// consults the SA set; this helper makes the right setup the easy one.
+func (o *K8SClientFactoryMock) WithSAClient(cluster string, objects ...runtime.Object) *K8SClientFactoryMock {
+	sa := NewFakeK8sClient(objects...)
+	sa.Token = "sa-token"
+	o.lock.Lock()
+	defer o.lock.Unlock()
+	if o.SAClients == nil {
+		o.SAClients = make(map[string]kubernetes.ClientInterface)
+	}
+	o.SAClients[cluster] = sa
+	return o
+}
+
+// GetSAClientsAsUserClientInterfaces returns all the SA clients as read-write clients (UserClientInterface).
+// Note: this deliberately returns the user Clients, NOT the (test-only) SAClients field —
+// the SAClients field holds plain ClientInterface values that cannot be converted back to
+// UserClientInterface. Callers (e.g. the health cache monitor, which acts as the SA) want a
+// full read-write layer, which the user Clients provide.
+func (o *K8SClientFactoryMock) GetSAClientsAsUserClientInterfaces() map[string]kubernetes.UserClientInterface {
+	o.lock.RLock()
+	defer o.lock.RUnlock()
+	return o.Clients
 }
 
 /////
 
 type K8SClientMock struct {
 	mock.Mock
+	istioClientset        *istio_fake.Clientset
+	gatewayapiClientSet   *gatewayapifake.Clientset
+	inferenceapiClientSet *inferenceapifake.Clientset
+	client.Reader
 }
 
-// Constructor
+// Interface guard to ensure K8SClientMock implements ClientInterface.
+var _ kubernetes.ClientInterface = &K8SClientMock{}
 
+// Constructor
+// TODO: Remove this.
 func NewK8SClientMock() *K8SClientMock {
 	k8s := new(K8SClientMock)
 	k8s.On("IsOpenShift").Return(true)
-	k8s.On("GetKialiToken").Return("")
+	k8s.On("IsGatewayAPI").Return(false)
+	k8s.On("HasTCPRouteInV1").Return(false)
+	k8s.On("HasTLSRouteInV1").Return(false)
+	k8s.On("HasUDPRouteInV1").Return(false)
+	k8s.On("IsInferenceAPI").Return(false)
+	k8s.On("IsIstioGateway").Return(true)
+	k8s.On("IsIstioAPI").Return(true)
 	return k8s
 }
 
@@ -62,7 +178,7 @@ func (o *K8SClientMock) MockEmptyWorkloads(namespace interface{}) {
 	o.On("GetStatefulSets", namespace).Return([]apps_v1.StatefulSet{}, nil)
 	o.On("GetDaemonSets", namespace).Return([]apps_v1.DaemonSet{}, nil)
 	o.On("GetJobs", namespace).Return([]batch_v1.Job{}, nil)
-	o.On("GetCronJobs", namespace).Return([]batch_apps_v1.CronJob{}, nil)
+	o.On("GetCronJobs", namespace).Return([]batch_v1.CronJob{}, nil)
 }
 
 // MockEmptyWorkload setup the current mock to return an empty workload for every type of workloads (deployment, dc, rs, jobs, etc.)
@@ -79,7 +195,7 @@ func (o *K8SClientMock) MockEmptyWorkload(namespace interface{}, workload interf
 	o.On("GetReplicaSets", namespace).Return([]apps_v1.ReplicaSet{}, nil)
 	o.On("GetReplicationControllers", namespace).Return([]core_v1.ReplicationController{}, nil)
 	o.On("GetJobs", namespace).Return([]batch_v1.Job{}, nil)
-	o.On("GetCronJobs", namespace).Return([]batch_apps_v1.CronJob{}, nil)
+	o.On("GetCronJobs", namespace).Return([]batch_v1.CronJob{}, nil)
 }
 
 func (o *K8SClientMock) IsOpenShift() bool {
@@ -87,7 +203,37 @@ func (o *K8SClientMock) IsOpenShift() bool {
 	return args.Get(0).(bool)
 }
 
-func (o *K8SClientMock) IsMaistraApi() bool {
+func (o *K8SClientMock) IsGatewayAPI() bool {
+	args := o.Called()
+	return args.Get(0).(bool)
+}
+
+func (o *K8SClientMock) HasTCPRouteInV1() bool {
+	args := o.Called()
+	return args.Get(0).(bool)
+}
+
+func (o *K8SClientMock) HasTLSRouteInV1() bool {
+	args := o.Called()
+	return args.Get(0).(bool)
+}
+
+func (o *K8SClientMock) HasUDPRouteInV1() bool {
+	args := o.Called()
+	return args.Get(0).(bool)
+}
+
+func (o *K8SClientMock) IsInferenceAPI() bool {
+	args := o.Called()
+	return args.Get(0).(bool)
+}
+
+func (o *K8SClientMock) IsIstioGateway() bool {
+	args := o.Called()
+	return args.Get(0).(bool)
+}
+
+func (o *K8SClientMock) IsIstioAPI() bool {
 	args := o.Called()
 	return args.Get(0).(bool)
 }
@@ -97,43 +243,62 @@ func (o *K8SClientMock) GetServerVersion() (*version.Info, error) {
 	return args.Get(0).(*version.Info), args.Error(1)
 }
 
+func (o *K8SClientMock) GetCacheKey() string {
+	args := o.Called()
+	return args.Get(0).(string)
+}
+
 func (o *K8SClientMock) GetToken() string {
 	args := o.Called()
 	return args.Get(0).(string)
 }
 
-// GetAuthInfo returns the AuthInfo struct for the client
-func (o *K8SClientMock) GetAuthInfo() *api.AuthInfo {
+func (o *K8SClientMock) ClusterInfo() kubernetes.ClusterInfo {
 	args := o.Called()
-	return args.Get(0).(*api.AuthInfo)
+	return args.Get(0).(kubernetes.ClusterInfo)
 }
 
 // GetTokenSubject returns the subject of the authInfo using
 // the TokenReview api
 func (o *K8SClientMock) GetTokenSubject(authInfo *api.AuthInfo) (string, error) {
-	parsedClusterToken, _, err := new(jwt.Parser).ParseUnverified(authInfo.Token, &jwt.StandardClaims{})
+	parsedToken, err := jwt.ParseSigned(authInfo.Token)
 	if err != nil {
 		return authInfo.Token, nil
 	}
 
-	return parsedClusterToken.Claims.(*jwt.StandardClaims).Subject, nil
+	var claims map[string]interface{} // generic map to store parsed token
+	err = parsedToken.UnsafeClaimsWithoutVerification(&claims)
+	if err != nil {
+		return authInfo.Token, nil
+	}
+
+	if sub, ok := claims["sub"]; ok {
+		return sub.(string), nil
+	}
+
+	return authInfo.Token, nil
+}
+
+func (o *K8SClientMock) ForwardGetRequest(namespace, podName string, destinationPort int, path string) ([]byte, error) {
+	args := o.Called(namespace, podName, destinationPort, path)
+	return args.Get(0).([]byte), args.Error(1)
 }
 
 func (o *K8SClientMock) MockService(namespace, name string) {
-	s := fakeService(namespace, name)
+	s := FakeService(namespace, name)
 	o.On("GetService", namespace, name).Return(&s, nil)
 }
 
 func (o *K8SClientMock) MockServices(namespace string, names []string) {
 	services := []core_v1.Service{}
 	for _, name := range names {
-		services = append(services, fakeService(namespace, name))
+		services = append(services, FakeService(namespace, name))
 	}
 	o.On("GetServices", namespace, mock.AnythingOfType("map[string]string")).Return(services, nil)
 	o.On("GetDeployments", mock.AnythingOfType("string"), mock.AnythingOfType("string")).Return([]apps_v1.Deployment{}, nil)
 }
 
-func fakeService(namespace, name string) core_v1.Service {
+func FakeService(namespace, name string) core_v1.Service {
 	return core_v1.Service{
 		ObjectMeta: meta_v1.ObjectMeta{
 			Name:      name,
@@ -167,6 +332,7 @@ func FakePodList() []core_v1.Pod {
 		{
 			ObjectMeta: meta_v1.ObjectMeta{
 				Name:        "reviews-v1",
+				Namespace:   "ns",
 				Labels:      map[string]string{"app": "reviews", "version": "v1"},
 				Annotations: FakeIstioAnnotations(),
 			},
@@ -174,6 +340,7 @@ func FakePodList() []core_v1.Pod {
 		{
 			ObjectMeta: meta_v1.ObjectMeta{
 				Name:        "reviews-v2",
+				Namespace:   "ns",
 				Labels:      map[string]string{"app": "reviews", "version": "v2"},
 				Annotations: FakeIstioAnnotations(),
 			},
@@ -181,6 +348,7 @@ func FakePodList() []core_v1.Pod {
 		{
 			ObjectMeta: meta_v1.ObjectMeta{
 				Name:        "httpbin-v1",
+				Namespace:   "ns",
 				Labels:      map[string]string{"app": "httpbin", "version": "v1"},
 				Annotations: FakeIstioAnnotations(),
 			},
@@ -192,10 +360,54 @@ func FakeIstioAnnotations() map[string]string {
 	return map[string]string{"sidecar.istio.io/status": "{\"version\":\"\",\"initContainers\":[\"istio-init\",\"enable-core-dump\"],\"containers\":[\"istio-proxy\"],\"volumes\":[\"istio-envoy\",\"istio-certs\"]}"}
 }
 
+func FakeIstioAmbientAnnotations() map[string]string {
+	return map[string]string{"ambient.istio.io/redirection": "enabled", "sidecar.istio.io/status": "{\"version\":\"\",\"initContainers\":[\"istio-init\",\"enable-core-dump\"],\"containers\":[\"istio-proxy\"],\"volumes\":[\"istio-envoy\",\"istio-certs\"]}"}
+}
+
 func FakeNamespace(name string) *core_v1.Namespace {
+	return FakeNamespaceWithLabels(name, nil)
+}
+
+func FakeNamespaceWithLabels(name string, labels map[string]string) *core_v1.Namespace {
+	if labels == nil {
+		labels = map[string]string{}
+	}
+	// discovery selectors often match on the name, so let's make sure all our test namespaces have it
+	labels["kubernetes.io/metadata.name"] = name
 	return &core_v1.Namespace{
 		ObjectMeta: meta_v1.ObjectMeta{
-			Name: name,
+			Name:   name,
+			Labels: labels,
 		},
+	}
+}
+
+func FakeWaypointAndEnrolledClients(name, cluster, namespace string) map[string]kubernetes.UserClientInterface {
+	return map[string]kubernetes.UserClientInterface{
+		cluster: NewFakeK8sClient(
+			FakeNamespaceWithLabels(namespace, map[string]string{}),
+			&core_v1.Service{ObjectMeta: meta_v1.ObjectMeta{Name: name, Namespace: namespace, Labels: map[string]string{
+				"istio.io/use-waypoint": "waypoint",
+			}}},
+			&core_v1.Service{ObjectMeta: meta_v1.ObjectMeta{Name: "productpage", Namespace: namespace}},
+			&apps_v1.Deployment{
+				ObjectMeta: meta_v1.ObjectMeta{
+					Name:      "ratings-v1",
+					Namespace: namespace,
+					Annotations: map[string]string{
+						"not-relevant": "true",
+					},
+				},
+			},
+			&apps_v1.Deployment{
+				ObjectMeta: meta_v1.ObjectMeta{
+					Name:      "waypoint",
+					Namespace: namespace,
+					Annotations: map[string]string{
+						"gateway.istio.io/managed": "istio.io-mesh-controller",
+					},
+				},
+			},
+		),
 	}
 }

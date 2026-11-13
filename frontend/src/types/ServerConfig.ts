@@ -1,0 +1,190 @@
+import type { AIConfig } from './Chatbot';
+import type { DurationInSeconds } from './Common';
+import type { MeshCluster } from './Mesh';
+
+export type IstioLabelKey = 'appLabelName' | 'versionLabelName';
+
+interface DeploymentConfig {
+  viewOnlyMode: boolean;
+}
+
+interface IstioAnnotations {
+  ambientAnnotation: string;
+  ambientAnnotationEnabled: string;
+  // this could also be the name of the pod label, both label and annotation are supported
+  istioInjectionAnnotation: string;
+}
+
+interface GraphFindOption {
+  autoSelect: boolean;
+  description: string;
+  expression: string;
+}
+
+interface GraphTraffic {
+  ambient: string;
+  grpc: string;
+  http: string;
+  tcp: string;
+}
+
+interface GraphSettings {
+  animation: 'point' | 'dash';
+}
+
+interface GraphUIDefaults {
+  findOptions: GraphFindOption[];
+  hideOptions: GraphFindOption[];
+  settings: GraphSettings;
+  traffic: GraphTraffic;
+}
+
+interface I18nUIDefaults {
+  language: string;
+  showSelector: boolean;
+}
+
+interface ListUIDefaults {
+  includeHealth: boolean;
+  includeIstioResources: boolean;
+  includeValidations: boolean;
+  showIncludeToggles: boolean;
+}
+
+interface MeshUIDefaults {
+  findOptions: GraphFindOption[];
+  hideOptions: GraphFindOption[];
+}
+
+interface TracingDefaults {
+  limit: number;
+}
+
+interface UIDefaults {
+  graph: GraphUIDefaults;
+  i18n: I18nUIDefaults;
+  list: ListUIDefaults;
+  mesh: MeshUIDefaults;
+  metricsPerRefresh?: string;
+  namespaces?: string[];
+  refreshInterval?: string;
+  tracing: TracingDefaults;
+}
+
+interface CustomWorkloadType {
+  group: string;
+  kind: string;
+  version: string;
+}
+
+interface KialiFeatureFlags {
+  customWorkloadTypes?: CustomWorkloadType[];
+  disabledFeatures: string[];
+  istioAnnotationAction: boolean;
+  istioInjectionAction: boolean;
+  istioUpgradeAction: boolean;
+  uiDefaults: UIDefaults;
+}
+
+export interface GatewayAPIClass {
+  className: string;
+  name: string;
+}
+
+// Not based exactly on Kiali configuration but rather whether things like prometheus config
+// allow for certain Kiali features. True means the feature is disabled, false means supported.
+export interface KialiDisabledFeatures {
+  requestSize: boolean;
+  requestSizeAverage: boolean;
+  requestSizePercentiles: boolean;
+  responseSize: boolean;
+  responseSizeAverage: boolean;
+  responseSizePercentiles: boolean;
+  responseTime: boolean;
+  responseTimeAverage: boolean;
+  responseTimePercentiles: boolean;
+}
+
+/*
+ Health Config
+*/
+export type RegexConfig = string | RegExp;
+
+export interface HealthConfig {
+  // all fields are duration strings from backend (e.g. "5m", "1h")
+  compute?: {
+    duration?: string;
+    refreshInterval?: string;
+    timeout?: string;
+  };
+  rate: RateHealthConfig[];
+}
+
+export interface HealthCompute {
+  Duration: DurationInSeconds;
+  RefreshInterval: DurationInSeconds;
+  Timeout: DurationInSeconds;
+}
+
+// rateHealthConfig
+export interface RateHealthConfig {
+  kind?: RegexConfig;
+  name?: RegexConfig;
+  namespace?: RegexConfig;
+  tolerance: ToleranceConfig[];
+}
+// toleranceConfig
+export interface ToleranceConfig {
+  code: RegexConfig;
+  degraded: number;
+  direction?: RegexConfig;
+  failure: number;
+  protocol?: RegexConfig;
+}
+
+/*
+ End Health Config
+*/
+
+// enum for run mode
+export enum RunMode {
+  APP = 'app',
+  LOCAL = 'local',
+  OFFLINE = 'offline'
+}
+
+// Offline mode configuration based on OfflineManifest
+export type OfflineRunConfig = {
+  timestamp?: string; // RFC3339 string
+};
+
+export interface ServerConfig {
+  ai: AIConfig;
+  ambientEnabled: boolean;
+  authStrategy: string;
+  clusterWideAccess: boolean;
+  clusters: { [key: string]: MeshCluster }; // cluster => MeshCluster
+  controlPlanes: { [key: string]: string }; // cluster => namespace
+  deployment: DeploymentConfig;
+  gatewayAPIClasses: GatewayAPIClass[];
+  gatewayAPIEnabled: boolean;
+  healthConfig: HealthConfig;
+  healthStatusMetricsEnabled: boolean;
+  ignoreHomeCluster: boolean;
+  installationTag?: string;
+  istioAPIInstalled: boolean;
+  istioAnnotations: IstioAnnotations;
+  istioGatewayInstalled: boolean;
+  istioIdentityDomain: string;
+  istioLabels: { [key in IstioLabelKey]: string };
+  kialiFeatureFlags: KialiFeatureFlags;
+  logLevel: string;
+  prometheus: {
+    disabledReason?: string;
+    enabled: boolean;
+    globalScrapeInterval?: DurationInSeconds;
+    storageTsdbRetention?: DurationInSeconds;
+  };
+  runConfig?: OfflineRunConfig;
+  runMode: RunMode;
+}

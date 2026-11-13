@@ -1,45 +1,46 @@
 package checkers
 
 import (
+	networking_v1 "istio.io/client-go/pkg/apis/networking/v1"
+
 	"github.com/kiali/kiali/business/checkers/gateways"
+	"github.com/kiali/kiali/config"
 	"github.com/kiali/kiali/kubernetes"
 	"github.com/kiali/kiali/models"
 )
 
-const GatewayCheckerType = "gateway"
-
 type GatewayChecker struct {
-	GatewaysPerNamespace  [][]kubernetes.IstioObject
-	Namespace             string
-	WorkloadsPerNamespace map[string]models.WorkloadList
+	Cluster               string
+	Conf                  *config.Config
+	Gateways              []*networking_v1.Gateway
+	IsGatewayToNamespace  bool
+	WorkloadsPerNamespace map[string]models.Workloads
 }
 
 // Check runs checks for the all namespaces actions as well as for the single namespace validations
 func (g GatewayChecker) Check() models.IstioValidations {
 	// Multinamespace checkers
 	validations := gateways.MultiMatchChecker{
-		GatewaysPerNamespace: g.GatewaysPerNamespace,
+		Conf:     g.Conf,
+		Gateways: g.Gateways,
+		Cluster:  g.Cluster,
 	}.Check()
 
-	// Single namespace
-	for _, nssGw := range g.GatewaysPerNamespace {
-		for _, gw := range nssGw {
-			if gw.GetObjectMeta().Namespace == g.Namespace {
-				validations.MergeValidations(g.runSingleChecks(gw))
-			}
-		}
+	for _, gw := range g.Gateways {
+		validations.MergeValidations(g.runSingleChecks(gw))
 	}
 
 	return validations
 }
 
-func (g GatewayChecker) runSingleChecks(gw kubernetes.IstioObject) models.IstioValidations {
-	key, validations := EmptyValidValidation(gw.GetObjectMeta().Name, gw.GetObjectMeta().Namespace, GatewayCheckerType)
+func (g GatewayChecker) runSingleChecks(gw *networking_v1.Gateway) models.IstioValidations {
+	key, validations := EmptyValidValidation(gw.Name, gw.Namespace, kubernetes.Gateways, g.Cluster)
 
 	enabledCheckers := []Checker{
 		gateways.SelectorChecker{
 			Gateway:               gw,
 			WorkloadsPerNamespace: g.WorkloadsPerNamespace,
+			IsGatewayToNamespace:  g.IsGatewayToNamespace,
 		},
 	}
 

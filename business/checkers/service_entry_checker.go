@@ -1,36 +1,25 @@
 package checkers
 
 import (
-	"github.com/kiali/kiali/kubernetes"
+	networking_v1 "istio.io/client-go/pkg/apis/networking/v1"
+
+	"github.com/kiali/kiali/business/checkers/common"
+	"github.com/kiali/kiali/business/checkers/serviceentries"
 	"github.com/kiali/kiali/models"
 )
 
-const ServiceEntryCheckerType = "serviceentry"
-
+// ServiceEntryChecker checks host conflicts among entries available in the validation namespace.
 type ServiceEntryChecker struct {
-	ServiceEntries []kubernetes.IstioObject
+	Cluster        string
+	ImportScope    common.ImportScope
+	ServiceEntries []*networking_v1.ServiceEntry
 }
 
 func (s ServiceEntryChecker) Check() models.IstioValidations {
-	validations := models.IstioValidations{}
-
-	for _, se := range s.ServiceEntries {
-		validations.MergeValidations(s.runSingleChecks(se))
-	}
-
-	return validations
-}
-
-func (s ServiceEntryChecker) runSingleChecks(se kubernetes.IstioObject) models.IstioValidations {
-	key, validations := EmptyValidValidation(se.GetObjectMeta().Name, se.GetObjectMeta().Namespace, ServiceEntryCheckerType)
-
-	enabledCheckers := []Checker{}
-
-	for _, checker := range enabledCheckers {
-		checks, validChecker := checker.Check()
-		validations.Checks = append(validations.Checks, checks...)
-		validations.Valid = validations.Valid && validChecker
-	}
-
-	return models.IstioValidations{key: validations}
+	// Multi-match (KIA1211/1212) only considers Sidecar-imported ServiceEntries.
+	conflictSEs := common.FilterServiceEntriesByImport(s.ServiceEntries, s.ImportScope)
+	return serviceentries.MultiMatchChecker{
+		Cluster:        s.Cluster,
+		ServiceEntries: conflictSEs,
+	}.Check()
 }

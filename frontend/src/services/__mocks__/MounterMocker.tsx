@@ -1,0 +1,91 @@
+import { render, waitFor } from '@testing-library/react';
+import * as API from '../Api';
+import { Provider } from 'react-redux';
+import { MemoryRouter } from 'react-router-dom-v5-compat';
+import { store } from '../../store/ConfigStore';
+
+export class MounterMocker {
+  private promises: Promise<void>[] = [];
+  private toMount: JSX.Element = (<></>);
+  private caughtErrors: string[] = [];
+  private unsubscribe: (() => void) | undefined;
+
+  constructor() {
+    this.unsubscribe = store.subscribe(() => {
+      this.caughtErrors = [];
+      const state = store.getState();
+      state.notificationCenter.groups.forEach(g => {
+        g.messages.forEach(m => {
+          this.caughtErrors.push(`${m.content} [${m.detail}]`);
+        });
+      });
+    });
+  }
+
+  // About nestData: set it accordingly to the object returned by API promise:
+  // - if it's the Api response directly, keep default (true) as content is encapsulated in 'data' field
+  // - if it's a transformed object extracted from Api response, set to false.
+  addMock = (func: keyof typeof API, obj: any, nestData = true): MounterMocker => {
+    this.promises.push(
+      new Promise((resolve, reject) => {
+        rstest.spyOn(API, func).mockImplementation(() => {
+          return new Promise(r => {
+            nestData ? r({ data: obj }) : r(obj);
+            setTimeout(() => {
+              try {
+                resolve();
+              } catch (e) {
+                reject(e);
+              }
+            }, 1);
+          });
+        });
+      })
+    );
+    return this;
+  };
+
+  mount = (elem: JSX.Element): MounterMocker => {
+    this.toMount = elem;
+    return this;
+  };
+
+  mountWithStore = (elem: JSX.Element): MounterMocker => {
+    this.toMount = (
+      <Provider store={store}>
+        <MemoryRouter>{elem}</MemoryRouter>
+      </Provider>
+    );
+
+    return this;
+  };
+
+  run = (expectFn: (container: HTMLElement) => void): Promise<void> => {
+    const utils = render(this.toMount);
+    return Promise.all(this.promises)
+      .then(async () => {
+        this.checkErrors();
+        try {
+          await waitFor(
+            () => {
+              expectFn(utils.container);
+            },
+            { timeout: 10000 }
+          );
+        } finally {
+          utils.unmount();
+          this.unsubscribe?.();
+        }
+      })
+      .catch((err: unknown) => {
+        this.unsubscribe?.();
+        throw err instanceof Error ? err : new Error(String(err));
+      });
+  };
+
+  private checkErrors(): void {
+    if (this.caughtErrors.length > 0) {
+      console.warn(`MounterMocker caught some errors:${this.caughtErrors.map(e => `\n- ${e}`).join('')}`);
+    }
+  }
+}

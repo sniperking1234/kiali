@@ -38,12 +38,10 @@ type Protocol struct {
 // Each supported protocol is defined below.  Each rate provided as node or edge metadata must be defined.
 // Each method below should have a section handling each supported protocol.
 
-//
 // GRPC Protocol
-//
 const (
 	grpc             = "grpc"
-	grpcNoResponse   = "grpcNoResponse" //typically a client termination (envoy flag=DC)
+	grpcNoResponse   = "grpcNoResponse" // typically a client termination (envoy flag=DC)
 	grpcErr          = "grpcErr"
 	grpcPercentErr   = "grpcPercentErr"
 	grpcPercentReq   = "grpcPercentReq"
@@ -54,7 +52,6 @@ const (
 	grpcOut          = "grpcOut"
 )
 
-// GRPC Protocol
 var GRPC = Protocol{
 	Name: grpc,
 	EdgeRates: []Rate{
@@ -75,9 +72,7 @@ var GRPC = Protocol{
 	UnitShort: rps,
 }
 
-//
 // HTTP Protocol
-//
 const (
 	http             = "http"
 	httpNoResponse   = "httpNoResponse" // typically a client termination (envoy flag=DC)
@@ -95,7 +90,6 @@ const (
 	httpOut          = "httpOut"
 )
 
-// HTTP Protocol
 var HTTP = Protocol{
 	Name: http,
 	EdgeRates: []Rate{
@@ -120,9 +114,7 @@ var HTTP = Protocol{
 	UnitShort: rps,
 }
 
-//
 // TCP Protocol
-//
 const (
 	tcp            = "tcp"
 	tcpResponses   = "tcpResponses"
@@ -132,7 +124,6 @@ const (
 	bps            = "bps"
 )
 
-// TCP Protocol
 var TCP = Protocol{
 	Name: tcp,
 	EdgeRates: []Rate{
@@ -174,8 +165,8 @@ func addToMetadataGrpc(val float64, code, flags, host string, sourceMetadata, de
 	addToMetadataValue(edgeMetadata, grpc, val)
 	addToMetadataResponses(edgeMetadata, grpcResponses, code, flags, host, val)
 
-	switch {
-	case code == "-":
+	switch code {
+	case "-":
 		addToMetadataValue(destMetadata, grpcInNoResponse, val)
 		addToMetadataValue(edgeMetadata, grpcNoResponse, val)
 	default:
@@ -232,7 +223,7 @@ func IsHTTPErr(code string) bool {
 
 // IsGRPCErr return true if code != 0
 func IsGRPCErr(code string) bool {
-	return code != "0"
+	return code != "0" && code != ""
 }
 
 // AddOutgoingEdgeToMetadata updates the source node's outgoing traffic with the outgoing edge traffic value
@@ -279,6 +270,9 @@ func AggregateEdgeTraffic(edge, aggregateEdge *Edge) {
 		if val, ok := edge.Metadata[grpc]; ok {
 			addToMetadataValue(aggregateEdge.Metadata, grpc, val.(float64))
 		}
+		if val, ok := edge.Metadata[grpcNoResponse]; ok {
+			addToMetadataValue(aggregateEdge.Metadata, grpcNoResponse, val.(float64))
+		}
 		if val, ok := edge.Metadata[grpcErr]; ok {
 			addToMetadataValue(aggregateEdge.Metadata, grpcErr, val.(float64))
 		}
@@ -288,6 +282,9 @@ func AggregateEdgeTraffic(edge, aggregateEdge *Edge) {
 	case http:
 		if val, ok := edge.Metadata[http]; ok {
 			addToMetadataValue(aggregateEdge.Metadata, http, val.(float64))
+		}
+		if val, ok := edge.Metadata[httpNoResponse]; ok {
+			addToMetadataValue(aggregateEdge.Metadata, httpNoResponse, val.(float64))
 		}
 		if val, ok := edge.Metadata[http3xx]; ok {
 			addToMetadataValue(aggregateEdge.Metadata, http3xx, val.(float64))
@@ -375,6 +372,11 @@ func addToMetadataResponses(md Metadata, k MetadataKey, code, flags, host string
 	var responses Responses
 	var responseDetail *ResponseDetail
 	var ok bool
+
+	if code == "" {
+		code = "-"
+	}
+
 	responses, ok = md[k].(Responses)
 	if !ok {
 		responses = Responses{}

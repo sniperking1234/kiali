@@ -1,26 +1,22 @@
 package appender
 
 import (
+	"context"
 	"fmt"
 	"math"
-	"regexp"
 	"time"
 
 	"github.com/prometheus/common/model"
 
+	"github.com/kiali/kiali/config"
 	"github.com/kiali/kiali/graph"
 	"github.com/kiali/kiali/graph/telemetry/istio/util"
 	"github.com/kiali/kiali/log"
-	"github.com/kiali/kiali/prometheus"
 )
 
 const (
 	// ResponseTimeAppenderName uniquely identifies the appender: responseTime
 	ResponseTimeAppenderName = "responseTime"
-)
-
-var (
-	regexpHTTPFailure, _ = regexp.Compile(`^0$|^[4|5]\d\d$`) // include 0, Istio's flag for no response received
 )
 
 // ResponseTimeAppender is responsible for adding responseTime information to the graph. ResponseTime
@@ -29,7 +25,7 @@ var (
 // reported in milliseconds.
 // Response Times are reported using destination proxy telemetry, when available, which should remove
 // network latency fluctuations.
-// TODO: Should we report both source and destination when possible?
+// TODO: Should we report both source and destination when possible (with and without latency)?
 // Name: responseTime
 type ResponseTimeAppender struct {
 	GraphType          string
@@ -37,6 +33,7 @@ type ResponseTimeAppender struct {
 	Namespaces         graph.NamespaceInfoMap
 	Quantile           float64
 	QueryTime          int64 // unix time in seconds
+	Rates              graph.RequestedRates
 }
 
 // Name implements Appender
@@ -44,57 +41,133 @@ func (a ResponseTimeAppender) Name() string {
 	return ResponseTimeAppenderName
 }
 
+// IsFinalizer implements Appender
+func (a ResponseTimeAppender) IsFinalizer() bool {
+	return false
+}
+
 // AppendGraph implements Appender
-func (a ResponseTimeAppender) AppendGraph(trafficMap graph.TrafficMap, globalInfo *graph.AppenderGlobalInfo, namespaceInfo *graph.AppenderNamespaceInfo) {
+func (a ResponseTimeAppender) AppendGraph(ctx context.Context, trafficMap graph.TrafficMap, globalInfo *GlobalInfo, namespaceInfo *AppenderNamespaceInfo) {
 	if len(trafficMap) == 0 {
 		return
 	}
 
-	if globalInfo.PromClient == nil {
-		var err error
-		globalInfo.PromClient, err = prometheus.NewClient()
-		graph.CheckError(err)
+	// Response times only apply to request traffic (not TCP or gRPC-message traffic)
+	if a.Rates.Grpc != graph.RateRequests && a.Rates.Http != graph.RateRequests {
+		return
 	}
 
-	a.appendGraph(trafficMap, namespaceInfo.Namespace, globalInfo.PromClient)
+	a.appendGraph(ctx, trafficMap, a.Namespaces[namespaceInfo.Namespace], globalInfo)
 }
 
-func (a ResponseTimeAppender) appendGraph(trafficMap graph.TrafficMap, namespace string, client *prometheus.Client) {
-	quantile := a.Quantile
-	if a.Quantile <= 0.0 || a.Quantile >= 100.0 {
-		log.Warningf("Replacing invalid quantile [%.2f] with default [%.2f]", a.Quantile, defaultQuantile)
-		quantile = defaultQuantile
-	}
-	log.Tracef("Generating responseTime using quantile [%.2f]; namespace = %v", quantile, namespace)
+func (a ResponseTimeAppender) appendGraph(ctx context.Context, trafficMap graph.TrafficMap, namespaceInfo graph.NamespaceInfo, gi *GlobalInfo) {
+	zl := log.FromContext(ctx)
 
+	namespace := namespaceInfo.Name
+	client := gi.PromClient
 	// create map to quickly look up responseTime
 	responseTimeMap := make(map[string]float64)
 	duration := a.Namespaces[namespace].Duration
 
-	// query prometheus for the responseTime info in four queries:
-	groupBy := "le,source_cluster,source_workload_namespace,source_workload,source_canonical_service,source_canonical_revision,destination_cluster,destination_service_namespace,destination_service,destination_service_name,destination_workload_namespace,destination_workload,destination_canonical_service,destination_canonical_revision,response_code,grpc_response_status"
+	quantile := a.Quantile
+	if a.Quantile == 0.0 {
+		zl.Trace().Msgf("Generating average responseTime; namespace = %v", namespace)
 
-	// 1) Incoming: query destination telemetry to capture namespace services' incoming traffic
-	// note - the query order is important as both queries may have overlapping results for edges within
-	//        the namespace.  This query uses destination proxy and so must come first.
-	query := fmt.Sprintf(`histogram_quantile(%.2f, sum(rate(%s{reporter="destination",destination_service_namespace="%s"}[%vs])) by (%s)) > 0`,
-		quantile,
-		"istio_request_duration_milliseconds_bucket",
-		namespace,
-		int(duration.Seconds()), // range duration for the query
-		groupBy)
-	incomingVector := promQuery(query, time.Unix(a.QueryTime, 0), client.GetContext(), client.API(), a)
-	a.populateResponseTimeMap(responseTimeMap, &incomingVector)
+		// query prometheus for the responseTime info in two queries:
+		groupBy := "source_cluster,source_workload_namespace,source_workload,source_canonical_service,source_canonical_revision,destination_cluster,destination_service_namespace,destination_service,destination_service_name,destination_workload_namespace,destination_workload,destination_canonical_service,destination_canonical_revision,request_protocol"
 
-	// 2) Outgoing: query source telemetry to capture namespace workloads' outgoing traffic
-	query = fmt.Sprintf(`histogram_quantile(%.2f, sum(rate(%s{reporter="source",source_workload_namespace="%s"}[%vs])) by (%s)) > 0`,
-		quantile,
-		"istio_request_duration_milliseconds_bucket",
-		namespace,
-		int(duration.Seconds()), // range duration for the query
-		groupBy)
-	outgoingVector := promQuery(query, time.Unix(a.QueryTime, 0), client.GetContext(), client.API(), a)
-	a.populateResponseTimeMap(responseTimeMap, &outgoingVector)
+		// 0) Incoming: Ambient only: query source telemetry, typically from a non-waypoint ingress gateway, that will likely not have overlapping dest or waypoint telem for the traffic (that traffic will be picked up in query #2)
+		if namespaceInfo.IsAmbient {
+			query := fmt.Sprintf(`sum(rate(%s{reporter="source",source_workload_namespace!="%s",destination_service_namespace="%s"}[%vs])) by (%s) / sum(rate(%s{reporter="source",source_workload_namespace!="%s",destination_service_namespace="%s"}[%vs])) by (%s) > 0`,
+				"istio_request_duration_milliseconds_sum",
+				namespace,
+				namespace,
+				int(duration.Seconds()), // range duration for the query
+				groupBy,
+				"istio_request_duration_milliseconds_count",
+				namespace,
+				namespace,
+				int(duration.Seconds()), // range duration for the query
+				groupBy)
+			incomingVector := graph.PromQueryAppender(ctx, query, time.Unix(a.QueryTime, 0), client.API(), gi.Conf, a.Name())
+			a.populateResponseTimeMap(ctx, responseTimeMap, &incomingVector, gi.Conf)
+		}
+
+		// 1) Incoming: query destination telemetry to capture namespace services' incoming traffic
+		// note - the order of the next two queries is important as both queries may have overlapping results for edges within
+		//        the namespace.  This query uses destination proxy and so must come first.
+		query := fmt.Sprintf(`sum(rate(%s{%s,destination_service_namespace="%s"}[%vs])) by (%s) / sum(rate(%s{%s,destination_service_namespace="%s"}[%vs])) by (%s) > 0`,
+			"istio_request_duration_milliseconds_sum",
+			util.GetReporter("destination", a.Rates),
+			namespace,
+			int(duration.Seconds()), // range duration for the query
+			groupBy,
+			"istio_request_duration_milliseconds_count",
+			util.GetReporter("destination", a.Rates),
+			namespace,
+			int(duration.Seconds()), // range duration for the query
+			groupBy)
+		incomingVector := graph.PromQueryAppender(ctx, query, time.Unix(a.QueryTime, 0), client.API(), gi.Conf, a.Name())
+		a.populateResponseTimeMap(ctx, responseTimeMap, &incomingVector, gi.Conf)
+
+		// 2) Outgoing: query source telemetry to capture namespace workloads' outgoing traffic
+		query = fmt.Sprintf(`sum(rate(%s{%s,source_workload_namespace="%s"}[%vs])) by (%s) / sum(rate(%s{%s,source_workload_namespace="%s"}[%vs])) by (%s) > 0`,
+			"istio_request_duration_milliseconds_sum",
+			util.GetReporter("source", a.Rates),
+			namespace,
+			int(duration.Seconds()), // range duration for the query
+			groupBy,
+			"istio_request_duration_milliseconds_count",
+			util.GetReporter("source", a.Rates),
+			namespace,
+			int(duration.Seconds()), // range duration for the query
+			groupBy)
+		outgoingVector := graph.PromQueryAppender(ctx, query, time.Unix(a.QueryTime, 0), client.API(), gi.Conf, a.Name())
+		a.populateResponseTimeMap(ctx, responseTimeMap, &outgoingVector, gi.Conf)
+
+	} else {
+		zl.Trace().Msgf("Generating responseTime for quantile [%.2f]; namespace = %v", quantile, namespace)
+
+		// query prometheus for the responseTime info in two queries:
+		groupBy := "le,source_cluster,source_workload_namespace,source_workload,source_canonical_service,source_canonical_revision,destination_cluster,destination_service_namespace,destination_service,destination_service_name,destination_workload_namespace,destination_workload,destination_canonical_service,destination_canonical_revision,request_protocol"
+
+		// 0) Incoming: Ambient only: query source telemetry, typically from a non-waypoint ingress gateway, that will likely not have overlapping dest or waypoint telem for the traffic (that traffic will be picked up in query #2)
+		if namespaceInfo.IsAmbient {
+			query := fmt.Sprintf(`histogram_quantile(%.2f, sum(rate(%s{reporter="source",source_workload_namespace!="%s",destination_service_namespace="%s"}[%vs])) by (%s)) > 0`,
+				quantile,
+				"istio_request_duration_milliseconds_bucket",
+				namespace,
+				namespace,
+				int(duration.Seconds()), // range duration for the query
+				groupBy)
+			incomingVector := graph.PromQueryAppender(ctx, query, time.Unix(a.QueryTime, 0), client.API(), gi.Conf, a.Name())
+			a.populateResponseTimeMap(ctx, responseTimeMap, &incomingVector, gi.Conf)
+		}
+
+		// 1) Incoming: query destination telemetry to capture namespace services' incoming traffic
+		// note - the query order is important as both queries may have overlapping results for edges within
+		//        the namespace.  This query uses destination proxy and so must come first.
+		query := fmt.Sprintf(`histogram_quantile(%.2f, sum(rate(%s{%s,destination_service_namespace="%s"}[%vs])) by (%s)) > 0`,
+			quantile,
+			"istio_request_duration_milliseconds_bucket",
+			util.GetReporter("destination", a.Rates),
+			namespace,
+			int(duration.Seconds()), // range duration for the query
+			groupBy)
+		incomingVector := graph.PromQueryAppender(ctx, query, time.Unix(a.QueryTime, 0), client.API(), gi.Conf, a.Name())
+		a.populateResponseTimeMap(ctx, responseTimeMap, &incomingVector, gi.Conf)
+
+		// 2) Outgoing: query source telemetry to capture namespace workloads' outgoing traffic
+		query = fmt.Sprintf(`histogram_quantile(%.2f, sum(rate(%s{%s,source_workload_namespace="%s"}[%vs])) by (%s)) > 0`,
+			quantile,
+			"istio_request_duration_milliseconds_bucket",
+			util.GetReporter("source", a.Rates),
+			namespace,
+			int(duration.Seconds()), // range duration for the query
+			groupBy)
+		outgoingVector := graph.PromQueryAppender(ctx, query, time.Unix(a.QueryTime, 0), client.API(), gi.Conf, a.Name())
+		a.populateResponseTimeMap(ctx, responseTimeMap, &outgoingVector, gi.Conf)
+	}
 
 	applyResponseTime(trafficMap, responseTimeMap)
 }
@@ -102,7 +175,7 @@ func (a ResponseTimeAppender) appendGraph(trafficMap graph.TrafficMap, namespace
 func applyResponseTime(trafficMap graph.TrafficMap, responseTimeMap map[string]float64) {
 	for _, n := range trafficMap {
 		for _, e := range n.Edges {
-			key := fmt.Sprintf("%s %s", e.Source.ID, e.Dest.ID)
+			key := fmt.Sprintf("%s %s %s", e.Source.ID, e.Dest.ID, e.Metadata[graph.ProtocolKey].(string))
 			if val, ok := responseTimeMap[key]; ok {
 				e.Metadata[graph.ResponseTime] = val
 			}
@@ -110,7 +183,12 @@ func applyResponseTime(trafficMap graph.TrafficMap, responseTimeMap map[string]f
 	}
 }
 
-func (a ResponseTimeAppender) populateResponseTimeMap(responseTimeMap map[string]float64, vector *model.Vector) {
+func (a ResponseTimeAppender) populateResponseTimeMap(ctx context.Context, responseTimeMap map[string]float64, vector *model.Vector, conf *config.Config) {
+	zl := log.FromContext(ctx)
+
+	skipRequestsGrpc := a.Rates.Grpc != graph.RateRequests
+	skipRequestsHttp := a.Rates.Http != graph.RateRequests
+
 	for _, s := range *vector {
 		m := s.Metric
 		lSourceCluster, sourceClusterOk := m["source_cluster"]
@@ -126,11 +204,10 @@ func (a ResponseTimeAppender) populateResponseTimeMap(responseTimeMap map[string
 		lDestWl, destWlOk := m["destination_workload"]
 		lDestApp, destAppOk := m["destination_canonical_service"]
 		lDestVer, destVerOk := m["destination_canonical_revision"]
-		lResponseCode, responseCodeOk := m["response_code"]
-		lGrpcResponseStatus, grpcReponseStatusOk := m["grpc_response_status"]
+		lProtocol, protocolOk := m["request_protocol"]
 
-		if !sourceWlNsOk || !sourceWlOk || !sourceAppOk || !sourceVerOk || !destSvcNsOk || !destSvcNameOk || !destSvcOk || !destWlNsOk || !destWlOk || !destAppOk || !destVerOk || !responseCodeOk {
-			log.Warningf("Skipping %v, missing expected labels", m.String())
+		if !sourceWlNsOk || !sourceWlOk || !sourceAppOk || !sourceVerOk || !destSvcNsOk || !destSvcNameOk || !destSvcOk || !destWlNsOk || !destWlOk || !destAppOk || !destVerOk || !protocolOk {
+			zl.Warn().Msgf("populateResponseTimeMap: Skipping %s, missing expected labels", m.String())
 			continue
 		}
 
@@ -139,7 +216,11 @@ func (a ResponseTimeAppender) populateResponseTimeMap(responseTimeMap map[string
 		sourceApp := string(lSourceApp)
 		sourceVer := string(lSourceVer)
 		destSvc := string(lDestSvc)
-		responseCode := string(lResponseCode)
+		protocol := string(lProtocol)
+
+		if (skipRequestsHttp && protocol == graph.HTTP.Name) || (skipRequestsGrpc && protocol == graph.GRPC.Name) {
+			continue
+		}
 
 		// handle clusters
 		sourceCluster, destCluster := util.HandleClusters(lSourceCluster, sourceClusterOk, lDestCluster, destClusterOk)
@@ -148,52 +229,60 @@ func (a ResponseTimeAppender) populateResponseTimeMap(responseTimeMap map[string
 			continue
 		}
 
-		// This was added in istio 1.5, handle in a backward compatible way
-		grpcReponseStatus := "0"
-		if grpcReponseStatusOk {
-			grpcReponseStatus = string(lGrpcResponseStatus)
-		}
-
-		// Only valid requests contribute to response time so as not to skew RT when a failed request returns immediately
-		// TODO: Maybe we should control this behavior with a queryParam?
-		if grpcReponseStatus != "0" || regexpHTTPFailure.MatchString(responseCode) {
-			continue
-		}
-
 		val := float64(s.Value)
 
 		// handle unusual destinations
-		destCluster, destSvcNs, destSvcName, destWlNs, destWl, destApp, destVer, _ := util.HandleDestination(sourceCluster, sourceWlNs, sourceWl, destCluster, string(lDestSvcNs), string(lDestSvc), string(lDestSvcName), string(lDestWlNs), string(lDestWl), string(lDestApp), string(lDestVer))
+		destCluster, destSvcNs, destSvcName, destWlNs, destWl, destApp, destVer, _ := util.HandleDestination(sourceCluster, sourceWlNs, sourceWl, destCluster, string(lDestSvcNs), string(lDestSvc), string(lDestSvcName), string(lDestWlNs), string(lDestWl), string(lDestApp), string(lDestVer), conf)
 
 		if util.IsBadDestTelemetry(destCluster, destClusterOk, destSvcNs, destSvc, destSvcName, destWl) {
 			continue
 		}
 
-		// It is possible to get a NaN if there is no traffic (or possibly other reasons). Just skip it
+		// Should not happen but if NaN for any reason, Just skip it
 		if math.IsNaN(val) {
 			continue
 		}
 
-		// don't inject a service node if destSvcName is not set or the dest node is already a service node.
+		// don't inject a service node if any of:
+		// - destSvcName is not set
+		// - destSvcName is PassthroughCluster (see https://github.com/kiali/kiali/issues/4488)
+		// - dest node is already a service node
+		// - note: we ignore the waypoint injection problem here because that deals only with TCP traffic, and
+		//         does not apply to response time.
 		inject := false
-		if a.InjectServiceNodes && graph.IsOK(destSvcName) {
-			_, destNodeType := graph.Id(destCluster, destSvcNs, destSvcName, destWlNs, destWl, destApp, destVer, a.GraphType)
+		if a.InjectServiceNodes && graph.IsOK(destSvcName) && destSvcName != graph.PassthroughCluster {
+			_, destNodeType, err := graph.Id(destCluster, destSvcNs, destSvcName, destWlNs, destWl, destApp, destVer, a.GraphType)
+			if err != nil {
+				zl.Warn().Msgf("Skipping (rt) %s, %s", m.String(), err)
+				continue
+			}
 			inject = (graph.NodeTypeService != destNodeType)
 		}
 
 		if inject {
-			// Do not set response time on the incoming edge, we can't validly aggregate response times of the outgoing edges (kiali-2297)
-			a.addResponseTime(responseTimeMap, val, destCluster, destSvcNs, destSvcName, "", "", "", destCluster, destSvcNs, destSvcName, destWlNs, destWl, destApp, destVer)
+			// Only set response time on the outgoing edge. On the incoming edge, we can't validly aggregate response times of the outgoing edges (kiali-2297)
+			a.addResponseTime(ctx, responseTimeMap, val, protocol, destCluster, destSvcNs, destSvcName, "", "", "", destCluster, destSvcNs, destSvcName, destWlNs, destWl, destApp, destVer)
 		} else {
-			a.addResponseTime(responseTimeMap, val, sourceCluster, sourceWlNs, "", sourceWl, sourceApp, sourceVer, destCluster, destSvcNs, destSvcName, destWlNs, destWl, destApp, destVer)
+			a.addResponseTime(ctx, responseTimeMap, val, protocol, sourceCluster, sourceWlNs, "", sourceWl, sourceApp, sourceVer, destCluster, destSvcNs, destSvcName, destWlNs, destWl, destApp, destVer)
 		}
 	}
 }
 
-func (a ResponseTimeAppender) addResponseTime(responseTimeMap map[string]float64, val float64, sourceCluster, sourceNs, sourceSvc, sourceWl, sourceApp, sourceVer, destCluster, destSvcNs, destSvc, destWlNs, destWl, destApp, destVer string) {
-	sourceID, _ := graph.Id(sourceCluster, sourceNs, sourceSvc, sourceNs, sourceWl, sourceApp, sourceVer, a.GraphType)
-	destID, _ := graph.Id(destCluster, destSvcNs, destSvc, destWlNs, destWl, destApp, destVer, a.GraphType)
-	key := fmt.Sprintf("%s %s", sourceID, destID)
+func (a ResponseTimeAppender) addResponseTime(ctx context.Context, responseTimeMap map[string]float64, val float64, protocol, sourceCluster, sourceNs, sourceSvc, sourceWl, sourceApp, sourceVer, destCluster, destSvcNs, destSvc, destWlNs, destWl, destApp, destVer string) {
+	zl := log.FromContext(ctx)
+
+	sourceID, _, err := graph.Id(sourceCluster, sourceNs, sourceSvc, sourceNs, sourceWl, sourceApp, sourceVer, a.GraphType)
+	if err != nil {
+		zl.Warn().Msgf("Skipping addResponseTime (source), %s", err)
+		return
+	}
+	destID, _, err := graph.Id(destCluster, destSvcNs, destSvc, destWlNs, destWl, destApp, destVer, a.GraphType)
+	if err != nil {
+		zl.Warn().Msgf("Skipping addResponseTime (dest), %s", err)
+		return
+	}
+
+	key := fmt.Sprintf("%s %s %s", sourceID, destID, protocol)
 
 	// For edges within the namespace we may get a responseTime reported from both the incoming and outgoing
 	// traffic queries.  We assume here the first reported value is preferred (i.e. defer to query order)

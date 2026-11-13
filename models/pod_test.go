@@ -1,6 +1,7 @@
 package models
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -10,6 +11,8 @@ import (
 
 	"github.com/kiali/kiali/config"
 )
+
+func fakeIsControlPlane(ctx context.Context, c, n string) bool { return false }
 
 func TestPodFullyParsing(t *testing.T) {
 	assert := assert.New(t)
@@ -37,7 +40,7 @@ func TestPodFullyParsing(t *testing.T) {
 		}}
 
 	pod := Pod{}
-	pod.Parse(&k8sPod)
+	pod.Parse(&k8sPod, fakeIsControlPlane)
 	assert.Equal("details-v1-3618568057-dnkjp", pod.Name)
 	assert.Equal("2018-03-08T14:44:00Z", pod.CreatedAt)
 	assert.Equal(map[string]string{"apps": "details", "version": "v1"}, pod.Labels)
@@ -69,7 +72,7 @@ func TestPodParsingMissingImage(t *testing.T) {
 	}
 
 	pod := Pod{}
-	pod.Parse(&k8sPod)
+	pod.Parse(&k8sPod, fakeIsControlPlane)
 	assert.Equal("details-v1-3618568057-dnkjp", pod.Name)
 	assert.Equal("2018-03-08T14:44:00Z", pod.CreatedAt)
 	assert.Equal(map[string]string{"apps": "details", "version": "v1"}, pod.Labels)
@@ -96,7 +99,7 @@ func TestPodParsingMissingAnnotations(t *testing.T) {
 		}}
 
 	pod := Pod{}
-	pod.Parse(&k8sPod)
+	pod.Parse(&k8sPod, fakeIsControlPlane)
 	assert.Equal("details-v1-3618568057-dnkjp", pod.Name)
 	assert.Equal("2018-03-08T14:44:00Z", pod.CreatedAt)
 	assert.Equal(map[string]string{"apps": "details", "version": "v1"}, pod.Labels)
@@ -118,7 +121,7 @@ func TestPodParsingInvalidAnnotations(t *testing.T) {
 	}
 
 	pod := Pod{}
-	pod.Parse(&k8sPod)
+	pod.Parse(&k8sPod, fakeIsControlPlane)
 	assert.Equal("details-v1-3618568057-dnkjp", pod.Name)
 	assert.Equal("2018-03-08T14:44:00Z", pod.CreatedAt)
 	assert.Equal(map[string]string{"apps": "details", "version": "v1"}, pod.Labels)
@@ -155,7 +158,7 @@ func TestSyncedPodProxiesCount(t *testing.T) {
 
 	pods := make(Pods, 0, 2)
 	pod := &Pod{}
-	pod.Parse(&k8sPod)
+	pod.Parse(&k8sPod, fakeIsControlPlane)
 	pod.ProxyStatus = &ProxyStatus{
 		CDS: "Synced",
 		EDS: "Synced",
@@ -177,8 +180,36 @@ func TestSyncedPodProxiesCount(t *testing.T) {
 
 	pods = make(Pods, 0, 2)
 	pod = &Pod{}
-	pod.Parse(&k8sPod)
+	pod.Parse(&k8sPod, fakeIsControlPlane)
 	pods = append(pods, pod)
 	pods = append(pods, pod)
 	assert.Equal(int32(-1), pods.SyncedPodProxiesCount())
+}
+
+func TestServiceNames(t *testing.T) {
+	pods := Pods{
+		{
+			Name:               "details-1282912-shgf",
+			ServiceAccountName: "bookinfo-details",
+		},
+		{
+			Name:               "details-1282912-hsua8",
+			ServiceAccountName: "bookinfo-details",
+		},
+		{
+			Name:               "rating-1282912-2abj",
+			ServiceAccountName: "bookinfo-rating",
+		},
+		{
+			Name:               "rating-1282912-acnd",
+			ServiceAccountName: "bookinfo-rating",
+		},
+		{
+			Name:               "productpage-1282912-acnd",
+			ServiceAccountName: "bookinfo-productpage",
+		},
+	}
+
+	a := assert.New(t)
+	a.ElementsMatch([]string{"bookinfo-details", "bookinfo-productpage", "bookinfo-rating"}, pods.ServiceAccounts())
 }

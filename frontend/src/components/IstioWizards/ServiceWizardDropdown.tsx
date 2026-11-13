@@ -1,0 +1,241 @@
+import * as React from 'react';
+import { Dropdown, DropdownList, MenuToggle, MenuToggleElement, TooltipPosition } from '@patternfly/react-core';
+import { WorkloadOverview } from '../../types/ServiceInfo';
+import {
+  DestinationRule,
+  DestinationRuleC,
+  getWizardUpdateLabel,
+  K8sGRPCRoute,
+  K8sHTTPRoute,
+  PeerAuthentication,
+  VirtualService
+} from '../../types/IstioObjects';
+import { addError, addSuccess } from '../../utils/AlertUtils';
+import { serverConfig } from '../../config';
+import { TLSStatus } from '../../types/TLSStatus';
+import {
+  WIZARD_REQUEST_ROUTING,
+  WIZARD_FAULT_INJECTION,
+  WIZARD_TRAFFIC_SHIFTING,
+  WIZARD_REQUEST_TIMEOUTS,
+  WIZARD_TCP_TRAFFIC_SHIFTING,
+  WIZARD_K8S_REQUEST_ROUTING,
+  WIZARD_K8S_GRPC_REQUEST_ROUTING
+} from './WizardActions';
+import { ServiceWizard } from './ServiceWizard';
+import { canCreate, canUpdate, ResourcePermissions } from '../../types/Permissions';
+import { ServiceWizardActionsDropdownGroup, DELETE_TRAFFIC_ROUTING } from './ServiceWizardActionsDropdownGroup';
+import { ConfirmDeleteTrafficRoutingModal } from './ConfirmDeleteTrafficRoutingModal';
+import { deleteServiceTrafficRouting } from 'services/Api';
+import { ServiceOverview } from '../../types/ServiceList';
+import { renderDisabledDropdownOption } from 'utils/DropdownUtils';
+import { t } from 'utils/I18nUtils';
+import { getAppLabelName, getVersionLabelName } from 'config/ServerConfig';
+
+type Props = {
+  cluster?: string;
+  destinationRules: DestinationRule[];
+  gateways: string[];
+  istioPermissions: ResourcePermissions;
+  k8sGRPCRoutes: K8sGRPCRoute[];
+  k8sGateways: string[];
+  k8sHTTPRoutes: K8sHTTPRoute[];
+  namespace: string;
+  onChange: () => void;
+  peerAuthentications: PeerAuthentication[];
+  readOnly: boolean;
+  serviceName: string;
+  show: boolean;
+  subServices: ServiceOverview[];
+  tlsStatus?: TLSStatus;
+  virtualServices: VirtualService[];
+  workloads: WorkloadOverview[];
+};
+
+export const ServiceWizardDropdown: React.FC<Props> = (props: Props) => {
+  const [isDeleting, setIsDeleting] = React.useState<boolean>(false);
+  const [isActionsOpen, setIsActionsOpen] = React.useState<boolean>(false);
+  const [showConfirmDelete, setShowConfirmDelete] = React.useState<boolean>(false);
+  const [showWizard, setShowWizard] = React.useState<boolean>(props.show);
+  const [updateWizard, setUpdateWizard] = React.useState<boolean>(false);
+  const [wizardType, setWizardType] = React.useState<string>('');
+
+  const checkHasMeshWorkloads = (): boolean => {
+    let hasMeshWorkloads = false;
+    for (let i = 0; i < props.workloads.length; i++) {
+      if (props.workloads[i].istioSidecar) {
+        // At least one workload with sidecar
+        hasMeshWorkloads = true;
+        break;
+      }
+      // Check for Ambient if in Ambient Mesh
+      if (serverConfig.ambientEnabled && props.workloads[i].isAmbient) {
+        hasMeshWorkloads = true;
+        break;
+      }
+    }
+    return hasMeshWorkloads;
+  };
+
+  const hideConfirmDelete = (): void => {
+    setShowConfirmDelete(false);
+  };
+
+  const getValidWorkloads = (): WorkloadOverview[] => {
+    return props.workloads.filter(workload => {
+      // A workload could skip the version label on this check only when there is a single workload list
+      const appLabelName = getAppLabelName(workload.labels);
+      const verLabelName = getVersionLabelName(workload.labels);
+      return workload.labels && appLabelName && (verLabelName || props.workloads.length === 1);
+    });
+  };
+
+  const onAction = (key: string): void => {
+    const updateLabel = getWizardUpdateLabel(props.virtualServices, props.k8sHTTPRoutes, props.k8sGRPCRoutes);
+
+    switch (key) {
+      case WIZARD_REQUEST_ROUTING:
+      case WIZARD_FAULT_INJECTION:
+      case WIZARD_TRAFFIC_SHIFTING:
+      case WIZARD_TCP_TRAFFIC_SHIFTING:
+      case WIZARD_K8S_REQUEST_ROUTING:
+      case WIZARD_K8S_GRPC_REQUEST_ROUTING:
+      case WIZARD_REQUEST_TIMEOUTS: {
+        setShowWizard(true);
+        setWizardType(key);
+        setUpdateWizard(key === updateLabel);
+        break;
+      }
+      case DELETE_TRAFFIC_ROUTING: {
+        setShowConfirmDelete(true);
+        break;
+      }
+      default:
+        console.log('Unrecognized key');
+    }
+  };
+
+  const onActionsSelect = (): void => {
+    setIsActionsOpen(!isActionsOpen);
+  };
+
+  const onActionsToggle = (isOpen: boolean): void => {
+    setIsActionsOpen(isOpen);
+  };
+
+  const onClose = (changed: boolean): void => {
+    setShowWizard(false);
+    if (changed) {
+      props.onChange();
+    }
+  };
+
+  const onDelete = (): void => {
+    setIsDeleting(true);
+    hideConfirmDelete();
+
+    deleteServiceTrafficRouting(
+      props.virtualServices,
+      DestinationRuleC.fromDrArray(props.destinationRules),
+      props.k8sHTTPRoutes,
+      props.k8sGRPCRoutes,
+      props.cluster
+    )
+      .then(_results => {
+        addSuccess(`Istio Config deleted for ${props.serviceName} service.`);
+
+        setIsDeleting(false);
+        props.onChange();
+      })
+      .catch(error => {
+        addError('Could not delete Istio config objects.', error);
+
+        setIsDeleting(false);
+      });
+  };
+
+  const hasMeshWorkloads = checkHasMeshWorkloads();
+  const toolTipMsgActions = !hasMeshWorkloads
+    ? t('There are no Workloads with sidecar for this service')
+    : `There are no Workloads with ${serverConfig.istioLabels.appLabelName || 'app'} and ${
+        serverConfig.istioLabels.versionLabelName || 'version'
+      } labels`;
+
+  const validWorkloads = getValidWorkloads();
+  const validActions = hasMeshWorkloads && validWorkloads;
+
+  const dropdown = (
+    <Dropdown
+      data-test="service-actions-dropdown"
+      id="actions"
+      toggle={(toggleRef: React.Ref<MenuToggleElement>) => (
+        <MenuToggle
+          ref={toggleRef}
+          id="actions-toggle"
+          onClick={() => onActionsToggle(!isActionsOpen)}
+          data-test="service-actions-toggle"
+          isExpanded={isActionsOpen}
+          isDisabled={!validActions}
+        >
+          {t('Actions')}
+        </MenuToggle>
+      )}
+      isOpen={isActionsOpen}
+      onOpenChange={(isOpen: boolean) => onActionsToggle(isOpen)}
+      onSelect={onActionsSelect}
+      popperProps={{ position: 'right' }}
+    >
+      <DropdownList>
+        <ServiceWizardActionsDropdownGroup
+          key="service_wizard_actions_dropdown_group"
+          isDisabled={isDeleting || props.readOnly}
+          virtualServices={props.virtualServices}
+          destinationRules={props.destinationRules}
+          k8sHTTPRoutes={props.k8sHTTPRoutes ?? []}
+          k8sGRPCRoutes={props.k8sGRPCRoutes ?? []}
+          istioPermissions={props.istioPermissions}
+          onAction={onAction}
+          onDelete={onAction}
+        />
+      </DropdownList>
+    </Dropdown>
+  );
+  return (
+    <>
+      {!hasMeshWorkloads
+        ? renderDisabledDropdownOption('tooltip_wizard_actions', TooltipPosition.top, toolTipMsgActions, dropdown)
+        : dropdown}
+
+      <ServiceWizard
+        show={showWizard}
+        type={wizardType}
+        update={updateWizard}
+        namespace={props.namespace}
+        cluster={props.cluster}
+        serviceName={props.serviceName}
+        workloads={validWorkloads}
+        subServices={props.subServices}
+        createOrUpdate={canCreate(props.istioPermissions) || canUpdate(props.istioPermissions)}
+        virtualServices={props.virtualServices}
+        destinationRules={props.destinationRules}
+        gateways={props.gateways}
+        k8sGateways={props.k8sGateways}
+        k8sGRPCRoutes={props.k8sGRPCRoutes}
+        k8sHTTPRoutes={props.k8sHTTPRoutes}
+        peerAuthentications={props.peerAuthentications}
+        tlsStatus={props.tlsStatus}
+        onClose={onClose}
+      />
+
+      <ConfirmDeleteTrafficRoutingModal
+        destinationRules={DestinationRuleC.fromDrArray(props.destinationRules)}
+        virtualServices={props.virtualServices}
+        k8sGRPCRoutes={props.k8sGRPCRoutes}
+        k8sHTTPRoutes={props.k8sHTTPRoutes}
+        isOpen={showConfirmDelete}
+        onCancel={hideConfirmDelete}
+        onConfirm={onDelete}
+      />
+    </>
+  );
+};

@@ -1,17 +1,44 @@
-#/bin/bash
+#!/bin/bash
 
-# This deploys the travel agency demo
+# This deploys the error rates demo
 
+HACK_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source ${HACK_SCRIPT_DIR}/functions.sh
+
+
+: ${AMBIENT_ENABLED:="false"}
+: ${AUTO_INJECTION:=true}
+: ${AUTO_INJECTION_LABEL:="istio-injection=enabled"}
 : ${CLIENT_EXE:=oc}
+: ${ARCH:=amd64}
 : ${DELETE_DEMO:=false}
-: ${ENABLE_INJECTION:=true}
+: ${INSTALL_BETA:=true}
+: ${INSTALL_GAMMA:=false}
+: ${ISTIO_NAMESPACE:=istio-system}
 : ${NAMESPACE_ALPHA:=alpha}
 : ${NAMESPACE_BETA:=beta}
+: ${NAMESPACE_GAMMA:=gamma}
 : ${SOURCE:="https://raw.githubusercontent.com/kiali/demos/master"}
+: ${DISTRIBUTE_DEMO:=false}
+: ${CLUSTER1_CONTEXT=east}
+: ${CLUSTER2_CONTEXT=west}
+: ${WAYPOINT:="false"}
 
 while [ $# -gt 0 ]; do
   key="$1"
   case $key in
+    -ai|--auto-injection)
+      AUTO_INJECTION="$2"
+      shift;shift
+      ;;
+    -ail|--auto-injection-label)
+      AUTO_INJECTION_LABEL="$2"
+      shift;shift
+      ;;
+    -a|--arch)
+      ARCH="$2"
+      shift;shift
+      ;;
     -c|--client)
       CLIENT_EXE="$2"
       shift;shift
@@ -20,16 +47,49 @@ while [ $# -gt 0 ]; do
       DELETE_DEMO="$2"
       shift;shift
       ;;
-    -ei|--enable-injection)
-      ENABLE_INJECTION="$2"
+    -in|--istio-namespace)
+      ISTIO_NAMESPACE="$2"
+      shift;shift
+      ;;
+    -dd|--distribute-demo)
+      DISTRIBUTE_DEMO="$2"
+      shift;shift
+      ;;
+    -c1|--cluster1)
+      CLUSTER1_CONTEXT="$2"
+      shift;shift
+      ;;
+    -c2|--cluster2)
+      CLUSTER2_CONTEXT="$2"
+      shift;shift
+      ;;
+    -w|--waypoint)
+      WAYPOINT="$2"
+      shift;shift
+      ;;
+    -ib|--install-beta)
+      INSTALL_BETA="$2"
+      shift;shift
+      ;;
+    -ig|--install-gamma)
+      INSTALL_GAMMA="$2"
       shift;shift
       ;;
     -h|--help)
       cat <<HELPMSG
 Valid command line arguments:
+  -a|--arch <amd64|ppc64le|s390x>: Images for given arch will be used (default: amd64).
+  -ai|--auto-injection <true|false>: If you want sidecars to be auto-injected (default: true).
+  -ail|--auto-injection-label <name=value>: If auto-injection is enabled, this is the label added to the namespace. For revision-based installs, you can use something like "istio.io/rev=default-v1-23-0". default: istio-injection=enabled).
   -c|--client: either 'oc' or 'kubectl'
-  -d|--delete: either 'true' or 'false'. If 'true' the travel agency demo will be deleted, not installed.
-  -ei|--enable-injection: either 'true' or 'false' (default is true). If 'true' auto-inject proxies for the workloads.
+  -d|--delete: either 'true' or 'false'. If 'true' the demo will be deleted, not installed.
+  -in|--istio-namespace <name>: Where the Istio control plane is installed (default: istio-system).
+  -dd|--distribute-demo 'true' or 'false'. If 'true' alpha namespace will be created on east cluster, beta and gamma namespaces on west cluster.
+  -c1|--cluster1: context name of the cluster 1. Doesn't do anything if --distribute-demo is set to false (default: east)
+  -c2|--cluster2: context name of the cluster 2. Doesn't do anything if --distribute-demo is set to false (default: west)
+  -w|--waypoint: Create a waypoint proxy per namespace (When ISTIO_INJECTION=false) (default: false)
+  -ib|--install-beta <true|false>: If you want to install the beta namespace and demo (default: true)
+  -ig|--install-gamma <true|false>: If you want to install the gamma namespace and demo (default: false)
   -h|--help: this text
   -s|--source: demo file source. For example: file:///home/me/demos Default: https://raw.githubusercontent.com/kiali/demos/master
 HELPMSG
@@ -47,60 +107,291 @@ HELPMSG
 done
 
 echo Will deploy Error Rates Demo using these settings:
+echo ARCH=${ARCH}
+echo AUTO_INJECTION=${AUTO_INJECTION}
+echo AUTO_INJECTION_LABEL=${AUTO_INJECTION_LABEL}
 echo CLIENT_EXE=${CLIENT_EXE}
+echo CLUSTER1_CONTEXT=${CLUSTER1_CONTEXT}
+echo CLUSTER2_CONTEXT=${CLUSTER2_CONTEXT}
 echo DELETE_DEMO=${DELETE_DEMO}
-echo ENABLE_INJECTION=${ENABLE_INJECTION}
+echo DISTRIBUTE_DEMO=${DISTRIBUTE_DEMO}
+echo INSTALL_BETA=${INSTALL_BETA}
+echo INSTALL_GAMMA=${INSTALL_GAMMA}
+echo ISTIO_NAMESPACE=${ISTIO_NAMESPACE}
 echo NAMESPACE_ALPHA=${NAMESPACE_ALPHA}
 echo NAMESPACE_BETA=${NAMESPACE_BETA}
+echo NAMESPACE_GAMMA=${NAMESPACE_GAMMA}
 echo SOURCE=${SOURCE}
+
+# check arch values
+if [ "${ARCH}" != "ppc64le" ] && [ "${ARCH}" != "s390x" ] && [ "${ARCH}" != "amd64" ] && [ "${ARCH}" != "arm64" ]; then
+  echo "${ARCH} is not supported. Exiting."
+  exit 1
+fi
+
+IS_OPENSHIFT="false"
+if [[ "${CLIENT_EXE}" = *"oc" ]]; then
+  IS_OPENSHIFT="true"
+fi
+
+if [ "${IS_OPENSHIFT}" == "true" ] && [ "${DISTRIBUTE_DEMO}" == "true" ]; then
+  echo "Distribute demo is not supported on OpenShift. Exiting."
+  exit 1
+fi
+
+echo "IS_OPENSHIFT=${IS_OPENSHIFT}"
 
 # If we are to delete, remove everything and exit immediately after
 if [ "${DELETE_DEMO}" == "true" ]; then
   echo "Deleting Error Rates Demo (the envoy filters, if previously created, will remain)"
-  if [ "${CLIENT_EXE}" == "oc" ]; then
-    ${CLIENT_EXE} delete network-attachment-definition istio-cni -n ${NAMESPACE_ALPHA}
-    ${CLIENT_EXE} delete network-attachment-definition istio-cni -n ${NAMESPACE_BETA}
+  if [ "${IS_OPENSHIFT}" == "true" ]; then
+    $CLIENT_EXE delete network-attachment-definition istio-cni -n ${NAMESPACE_ALPHA}
+    if [ "${INSTALL_BETA}" == "true" ]; then
+      $CLIENT_EXE delete network-attachment-definition istio-cni -n ${NAMESPACE_BETA}
+    fi
+    if [ "${INSTALL_GAMMA}" == "true" ]; then
+      $CLIENT_EXE delete network-attachment-definition istio-cni -n ${NAMESPACE_GAMMA}
+    fi
+    $CLIENT_EXE delete scc error-rates-scc
   fi
-  ${CLIENT_EXE} delete namespace ${NAMESPACE_ALPHA}
-  ${CLIENT_EXE} delete namespace ${NAMESPACE_BETA}
+  
+  if [ "${DISTRIBUTE_DEMO}" == "true" ]; then
+    ${CLIENT_EXE} delete namespace ${NAMESPACE_ALPHA} --context ${CLUSTER1_CONTEXT}
+    if [ "${INSTALL_BETA}" == "true" ]; then
+      ${CLIENT_EXE} delete namespace ${NAMESPACE_BETA}  --context ${CLUSTER2_CONTEXT}
+    fi
+    if [ "${INSTALL_GAMMA}" == "true" ]; then
+      ${CLIENT_EXE} delete namespace ${NAMESPACE_GAMMA} --context ${CLUSTER2_CONTEXT}
+    fi
+  else
+    ${CLIENT_EXE} delete namespace ${NAMESPACE_ALPHA}
+    if [ "${INSTALL_BETA}" == "true" ]; then
+      ${CLIENT_EXE} delete namespace ${NAMESPACE_BETA}
+    fi
+    if [ "${INSTALL_GAMMA}" == "true" ]; then
+      ${CLIENT_EXE} delete namespace ${NAMESPACE_GAMMA}
+    fi
+  fi
+  
   exit 0
 fi
 
 # Create and prepare the demo namespaces
 
-if ! ${CLIENT_EXE} get namespace ${NAMESPACE_ALPHA} 2>/dev/null; then
-  ${CLIENT_EXE} create namespace ${NAMESPACE_ALPHA}
-  if [ "${ENABLE_INJECTION}" == "true" ]; then
-    ${CLIENT_EXE} label namespace ${NAMESPACE_ALPHA} istio-injection=enabled
+if [ "${IS_OPENSHIFT}" == "true" ]; then
+  $CLIENT_EXE new-project ${NAMESPACE_ALPHA}
+  if [ "${INSTALL_BETA}" == "true" ]; then
+    $CLIENT_EXE new-project ${NAMESPACE_BETA}
   fi
-  if [ "${CLIENT_EXE}" == "oc" ]; then
-    cat <<EOF | ${CLIENT_EXE} -n ${NAMESPACE_ALPHA} create -f -
-apiVersion: "k8s.cni.cncf.io/v1"
-kind: NetworkAttachmentDefinition
-metadata:
-  name: istio-cni
-EOF
+  if [ "${INSTALL_GAMMA}" == "true" ]; then
+    $CLIENT_EXE new-project ${NAMESPACE_GAMMA}
+  fi
+else
+  if [ "${DISTRIBUTE_DEMO}" == "true" ]; then
+    $CLIENT_EXE create namespace ${NAMESPACE_ALPHA} --context ${CLUSTER1_CONTEXT}
+    if [ "${INSTALL_BETA}" == "true" ]; then
+      $CLIENT_EXE create namespace ${NAMESPACE_BETA} --context ${CLUSTER2_CONTEXT}
+    fi
+    if [ "${INSTALL_GAMMA}" == "true" ]; then
+      $CLIENT_EXE create namespace ${NAMESPACE_GAMMA} --context ${CLUSTER2_CONTEXT}
+    fi
+  else
+    $CLIENT_EXE create namespace ${NAMESPACE_ALPHA}
+    if [ "${INSTALL_BETA}" == "true" ]; then
+      $CLIENT_EXE create namespace ${NAMESPACE_BETA}
+    fi
+    if [ "${INSTALL_GAMMA}" == "true" ]; then
+      $CLIENT_EXE create namespace ${NAMESPACE_GAMMA}
+    fi
   fi
 fi
 
-if ! ${CLIENT_EXE} get namespace ${NAMESPACE_BETA} 2>/dev/null; then
-  ${CLIENT_EXE} create namespace ${NAMESPACE_BETA}
-  if [ "${ENABLE_INJECTION}" == "true" ]; then
-    ${CLIENT_EXE} label namespace ${NAMESPACE_BETA} istio-injection=enabled
+if [ "${AUTO_INJECTION}" == "false" ]; then
+  for n in $(${CLIENT_EXE} get daemonset --all-namespaces -o jsonpath='{.items[*].metadata.name}')
+  do
+    if [ "${n}" == "ztunnel" ]; then
+      AMBIENT_ENABLED="true"
+      echo "AMBIENT_ENABLED=${AMBIENT_ENABLED}"
+      break
+    fi
+  done
+  if [ "${AMBIENT_ENABLED}" == "false" ] && [ "${WAYPOINT}" == "true" ]; then
+   echo "Waypoint proxy cannot be installed as Ambient is not enabled."
+   exit 1
   fi
-  if [ "${CLIENT_EXE}" == "oc" ]; then
-    cat <<EOF | ${CLIENT_EXE} -n ${NAMESPACE_BETA} create -f -
+fi
+
+ISTIO_INJECTION=""
+if [ "${AMBIENT_ENABLED}" == "true" ]; then
+  ISTIO_INJECTION="istio.io/dataplane-mode=ambient"
+  # It could also be applied to service account
+  if [ "${WAYPOINT}" == "true" ]; then
+    # Verify Gateway API
+    ensure_gateway_api_crds
+    # Create Waypoint proxy
+    echo "Create Waypoint proxy"
+    ${ISTIOCTL} x waypoint apply -n ${NAMESPACE_ALPHA}
+    if [ "${INSTALL_BETA}" == "true" ]; then
+      ${ISTIOCTL} x waypoint apply -n ${NAMESPACE_BETA}
+    fi
+    if [ "${INSTALL_GAMMA}" == "true" ]; then
+      ${ISTIOCTL} x waypoint apply -n ${NAMESPACE_GAMMA}
+    fi
+  fi
+else
+  if [ "${AUTO_INJECTION}" == "true" ]; then
+    ISTIO_INJECTION=${AUTO_INJECTION_LABEL}
+  fi
+fi
+
+if [ "${DISTRIBUTE_DEMO}" == "true" ]; then
+    ${CLIENT_EXE} label namespace ${NAMESPACE_ALPHA} ${ISTIO_INJECTION} --context ${CLUSTER1_CONTEXT}
+    if [ "${INSTALL_BETA}" == "true" ]; then
+      ${CLIENT_EXE} label namespace ${NAMESPACE_BETA} ${ISTIO_INJECTION}  --context ${CLUSTER2_CONTEXT}
+    fi
+    if [ "${INSTALL_GAMMA}" == "true" ]; then
+      ${CLIENT_EXE} label namespace ${NAMESPACE_GAMMA} ${ISTIO_INJECTION}  --context ${CLUSTER2_CONTEXT}
+    fi
+  else
+    ${CLIENT_EXE} label namespace ${NAMESPACE_ALPHA} ${ISTIO_INJECTION}
+    if [ "${INSTALL_BETA}" == "true" ]; then
+      ${CLIENT_EXE} label namespace ${NAMESPACE_BETA} ${ISTIO_INJECTION}
+    fi
+    if [ "${INSTALL_GAMMA}" == "true" ]; then
+      ${CLIENT_EXE} label namespace ${NAMESPACE_GAMMA} ${ISTIO_INJECTION}
+    fi
+fi
+
+# For OpenShift 4.11, adds default service account in the current ns to use as a user
+if [ "${IS_OPENSHIFT}" == "true" ]; then
+  $CLIENT_EXE adm policy add-scc-to-user anyuid -z default -n ${NAMESPACE_ALPHA}
+  if [ "${INSTALL_BETA}" == "true" ]; then
+    $CLIENT_EXE adm policy add-scc-to-user anyuid -z default -n ${NAMESPACE_BETA}
+  fi
+  if [ "${INSTALL_GAMMA}" == "true" ]; then
+    $CLIENT_EXE adm policy add-scc-to-user anyuid -z default -n ${NAMESPACE_GAMMA}
+  fi
+fi
+
+if [ "${IS_OPENSHIFT}" == "true" ]; then
+  cat <<NAD | $CLIENT_EXE -n ${NAMESPACE_ALPHA} create -f -
 apiVersion: "k8s.cni.cncf.io/v1"
 kind: NetworkAttachmentDefinition
 metadata:
   name: istio-cni
-EOF
+NAD
+  if [ "${INSTALL_BETA}" == "true" ]; then
+    cat <<NAD | $CLIENT_EXE -n ${NAMESPACE_BETA} create -f -
+apiVersion: "k8s.cni.cncf.io/v1"
+kind: NetworkAttachmentDefinition
+metadata:
+  name: istio-cni
+NAD
   fi
+  if [ "${INSTALL_GAMMA}" == "true" ]; then
+    cat <<NAD | $CLIENT_EXE -n ${NAMESPACE_GAMMA} create -f -
+apiVersion: "k8s.cni.cncf.io/v1"
+kind: NetworkAttachmentDefinition
+metadata:
+  name: istio-cni
+NAD
+  fi
+  SCC_USERS="- \"system:serviceaccount:${NAMESPACE_ALPHA}:default\""
+  if [ "${INSTALL_BETA}" == "true" ]; then
+    SCC_USERS="${SCC_USERS}
+- \"system:serviceaccount:${NAMESPACE_BETA}:default\""
+  fi
+  if [ "${INSTALL_GAMMA}" == "true" ]; then
+    SCC_USERS="${SCC_USERS}
+- \"system:serviceaccount:${NAMESPACE_GAMMA}:default\""
+  fi
+  cat <<SCC | $CLIENT_EXE apply -f -
+apiVersion: security.openshift.io/v1
+kind: SecurityContextConstraints
+metadata:
+  name: error-rates-scc
+runAsUser:
+  type: RunAsAny
+seLinuxContext:
+  type: RunAsAny
+supplementalGroups:
+  type: RunAsAny
+priority: 9
+users:
+${SCC_USERS}
+SCC
 fi
 
 # Deploy the demo
+url_alpha="${SOURCE}/error-rates/alpha.yaml"
+url_beta="${SOURCE}/error-rates/beta.yaml"
+url_gamma="${SOURCE}/error-rates/gamma.yaml"
+sed_client_p="s;kiali/demo_error_rates_client;maistra/demo_error_rates_client-p;g"
+sed_server_p="s;kiali/demo_error_rates_server;maistra/demo_error_rates_server-p;g"
+sed_client_z="s;kiali/demo_error_rates_client;maistra/demo_error_rates_client-z;g"
+sed_server_z="s;kiali/demo_error_rates_server;maistra/demo_error_rates_server-z;g"
 
-${CLIENT_EXE} apply -f <(curl -L "${SOURCE}/error-rates/alpha.yaml") -n ${NAMESPACE_ALPHA}
-${CLIENT_EXE} apply -f <(curl -L "${SOURCE}/error-rates/beta.yaml") -n ${NAMESPACE_BETA}
+if [ "${DISTRIBUTE_DEMO}" == "true" ]; then
+  if [ "${ARCH}" == "ppc64le" ]; then
+    ${CLIENT_EXE} apply -f <(curl -L ${url_alpha} | sed "${sed_client_p}" | sed "${sed_server_p}") -n ${NAMESPACE_ALPHA} --context ${CLUSTER1_CONTEXT}
+    if [ "${INSTALL_BETA}" == "true" ]; then
+      ${CLIENT_EXE} apply -f <(curl -L "${url_beta}" | sed "${sed_client_p}" | sed "${sed_server_p}") -n ${NAMESPACE_BETA} --context ${CLUSTER2_CONTEXT}
+    fi
+    if [ "${INSTALL_GAMMA}" == "true" ]; then
+      ${CLIENT_EXE} apply -f <(curl -L "${url_gamma}" | sed "${sed_client_p}" | sed "${sed_server_p}") -n ${NAMESPACE_GAMMA} --context ${CLUSTER2_CONTEXT}
+    fi
+  elif [ "${ARCH}" == "s390x" ]; then
+    ${CLIENT_EXE} apply -f <(curl -L ${url_alpha} | sed "${sed_client_z}" | sed "${sed_server_z}") -n ${NAMESPACE_ALPHA} --context ${CLUSTER1_CONTEXT}
+    if [ "${INSTALL_BETA}" == "true" ]; then
+      ${CLIENT_EXE} apply -f <(curl -L "${url_beta}" | sed "${sed_client_z}" | sed "${sed_server_z}") -n ${NAMESPACE_BETA} --context ${CLUSTER2_CONTEXT}
+    fi
+    if [ "${INSTALL_GAMMA}" == "true" ]; then
+      ${CLIENT_EXE} apply -f <(curl -L "${url_gamma}" | sed "${sed_client_z}" | sed "${sed_server_z}") -n ${NAMESPACE_GAMMA} --context ${CLUSTER2_CONTEXT}
+    fi
+  else
+    ${CLIENT_EXE} apply -f <(curl -L ${url_alpha}) -n ${NAMESPACE_ALPHA} --context ${CLUSTER1_CONTEXT}
+    if [ "${INSTALL_BETA}" == "true" ]; then
+      ${CLIENT_EXE} apply -f <(curl -L "${url_beta}") -n ${NAMESPACE_BETA} --context ${CLUSTER2_CONTEXT}
+    fi
+    if [ "${INSTALL_GAMMA}" == "true" ]; then
+      ${CLIENT_EXE} apply -f <(curl -L "${url_gamma}") -n ${NAMESPACE_GAMMA} --context ${CLUSTER2_CONTEXT}
+    fi
+  fi
+else
+  if [ "${ARCH}" == "ppc64le" ]; then
+    ${CLIENT_EXE} apply -f <(curl -L ${url_alpha} | sed "${sed_client_p}" | sed "${sed_server_p}") -n ${NAMESPACE_ALPHA}
+    if [ "${INSTALL_BETA}" == "true" ]; then
+      ${CLIENT_EXE} apply -f <(curl -L "${url_beta}" | sed "${sed_client_p}" | sed "${sed_server_p}") -n ${NAMESPACE_BETA}
+    fi
+    if [ "${INSTALL_GAMMA}" == "true" ]; then
+      ${CLIENT_EXE} apply -f <(curl -L "${url_gamma}" | sed "${sed_client_p}" | sed "${sed_server_p}") -n ${NAMESPACE_GAMMA}
+    fi
+  elif [ "${ARCH}" == "s390x" ]; then
+    ${CLIENT_EXE} apply -f <(curl -L ${url_alpha} | sed "${sed_client_z}" | sed "${sed_server_z}") -n ${NAMESPACE_ALPHA}
+    if [ "${INSTALL_BETA}" == "true" ]; then
+      ${CLIENT_EXE} apply -f <(curl -L "${url_beta}" | sed "${sed_client_z}" | sed "${sed_server_z}") -n ${NAMESPACE_BETA}
+    fi
+    if [ "${INSTALL_GAMMA}" == "true" ]; then
+      ${CLIENT_EXE} apply -f <(curl -L "${url_gamma}" | sed "${sed_client_z}" | sed "${sed_server_z}") -n ${NAMESPACE_GAMMA}
+    fi
+  else
+    ${CLIENT_EXE} apply -f <(curl -L ${url_alpha}) -n ${NAMESPACE_ALPHA}
+    if [ "${INSTALL_BETA}" == "true" ]; then
+      ${CLIENT_EXE} apply -f <(curl -L "${url_beta}") -n ${NAMESPACE_BETA}
+    fi
+    if [ "${INSTALL_GAMMA}" == "true" ]; then
+      ${CLIENT_EXE} apply -f <(curl -L "${url_gamma}") -n ${NAMESPACE_GAMMA}
+    fi
+  fi
+fi
 
-
+if [ "${IS_OPENSHIFT}" == "true" ]; then
+  ERROR_RATES_MONITOR_NS="${NAMESPACE_ALPHA}"
+  if [ "${INSTALL_BETA}" == "true" ]; then
+    ERROR_RATES_MONITOR_NS="${ERROR_RATES_MONITOR_NS} ${NAMESPACE_BETA}"
+  fi
+  if [ "${INSTALL_GAMMA}" == "true" ]; then
+    ERROR_RATES_MONITOR_NS="${ERROR_RATES_MONITOR_NS} ${NAMESPACE_GAMMA}"
+  fi
+  "${HACK_SCRIPT_DIR}/ensure-openshift-istio-proxies-podmonitor.sh" -c "${CLIENT_EXE}" -n "${ERROR_RATES_MONITOR_NS}"
+fi

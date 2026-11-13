@@ -3,477 +3,312 @@ package kubernetes
 import (
 	"bytes"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"regexp"
 	"strings"
-	"sync"
 	"time"
 
-	"gopkg.in/yaml.v2"
+	api_networking_v1 "istio.io/api/networking/v1"
+	networking_v1 "istio.io/client-go/pkg/apis/networking/v1"
+	security_v1 "istio.io/client-go/pkg/apis/security/v1"
+	istio "istio.io/client-go/pkg/clientset/versioned"
+	apps_v1 "k8s.io/api/apps/v1"
 	core_v1 "k8s.io/api/core/v1"
 	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/rest"
+	inferenceapiclient "sigs.k8s.io/gateway-api-inference-extension/client-go/clientset/versioned"
+	k8s_networking_v1 "sigs.k8s.io/gateway-api/apis/v1"
+	gatewayapiclient "sigs.k8s.io/gateway-api/pkg/client/clientset/versioned"
 
 	"github.com/kiali/kiali/config"
 	"github.com/kiali/kiali/log"
-	"github.com/kiali/kiali/util/config_dump"
 	"github.com/kiali/kiali/util/httputil"
+)
+
+const (
+	ComponentHealthy     = "Healthy"
+	ComponentNotFound    = "NotFound"
+	ComponentNotReady    = "NotReady"
+	ComponentUnhealthy   = "Unhealthy"
+	ComponentUnreachable = "Unreachable"
+)
+
+type ComponentStatus struct {
+	// Cluster where this component is deployed.
+	// Can be the name of external cluster
+	Cluster string `json:"cluster"`
+
+	// Namespace where the component is deployed.
+	// This field is ignored when marshalling to JSON.
+	Namespace string `json:"-"`
+
+	// The workload name of the Istio component.
+	//
+	// example: istio-ingressgateway
+	// required: true
+	Name string `json:"name"`
+
+	// The status of an Istio component.
+	//
+	// example:  Not Found
+	// required: true
+	Status string `json:"status"`
+
+	// When true, the component is necessary for Istio to function. Otherwise, it is an addon.
+	//
+	// example:  true
+	// required: true
+	IsCore bool `json:"isCore"`
+
+	// Mesh name or ID that this component belongs to.
+	// This is derived from the control plane's MeshId or TrustDomain.
+	// Empty if the mesh information cannot be determined.
+	MeshId string `json:"meshId,omitempty"`
+}
+
+type IstioComponentStatus []ComponentStatus
+
+func (ics *IstioComponentStatus) Merge(cs IstioComponentStatus) IstioComponentStatus {
+	*ics = append(*ics, cs...)
+	return *ics
+}
+
+const (
+	envoyAdminPort = 15000
 )
 
 var (
 	portNameMatcher = regexp.MustCompile(`^[\-].*`)
-	portProtocols   = [...]string{"grpc", "http", "http2", "https", "mongo", "redis", "tcp", "tls", "udp", "mysql"}
+	// UDP protocol is not proxied, but it is functional. keeping it in protocols list not to cause UI issues.
+	portProtocols = [...]string{"grpc", "grpc-web", "http", "http2", "https", "mongo", "redis", "tcp", "tls", "udp", "mysql"}
 )
 
 type IstioClientInterface interface {
-	CreateIstioObject(api, namespace, resourceType, json string) (IstioObject, error)
-	DeleteIstioObject(api, namespace, resourceType, name string) error
-	GetIstioObject(namespace, resourceType, name string) (IstioObject, error)
-	GetIstioObjects(namespace, resourceType, labelSelector string) ([]IstioObject, error)
-	UpdateIstioObject(api, namespace, resourceType, name, jsonPatch string) (IstioObject, error)
-	GetProxyStatus() ([]*ProxyStatus, error)
+	Istio() istio.Interface
+	// GatewayAPI returns the gateway-api kube client.
+	GatewayAPI() gatewayapiclient.Interface
+
+	// InferenceAPI returns the inference-extensions-api kube client.
+	InferenceAPI() inferenceapiclient.Interface
+
 	GetConfigDump(namespace, podName string) (*ConfigDump, error)
 }
 
-// Aux method to fetch proper (RESTClient, APIVersion) per API group
-func (in *K8SClient) getApiClientVersion(apiGroup string) (*rest.RESTClient, string) {
-	if apiGroup == NetworkingGroupVersion.Group {
-		return in.istioNetworkingApi, ApiNetworkingVersion
-	} else if apiGroup == SecurityGroupVersion.Group {
-		return in.istioSecurityApi, ApiSecurityVersion
-	}
-	return nil, ""
+type IstioUserClientInterface interface {
+	IstioClientInterface
+	SetProxyLogLevel(namespace, podName, level string) error
 }
 
-// CreateIstioObject creates an Istio object
-func (in *K8SClient) CreateIstioObject(api, namespace, resourceType, json string) (IstioObject, error) {
-	var result runtime.Object
-	var err error
-
-	typeMeta := meta_v1.TypeMeta{
-		Kind:       "",
-		APIVersion: "",
-	}
-	typeMeta.Kind = PluralType[resourceType]
-	byteJson := []byte(json)
-
-	var apiClient *rest.RESTClient
-	apiClient, typeMeta.APIVersion = in.getApiClientVersion(api)
-	if apiClient == nil {
-		return nil, fmt.Errorf("%s is not supported in CreateIstioObject operation", api)
-	}
-
-	result, err = apiClient.Post().Namespace(namespace).Resource(resourceType).Body(byteJson).Do(in.ctx).Get()
-	if err != nil {
-		return nil, err
-	}
-
-	istioObject, ok := result.(*GenericIstioObject)
-	if !ok {
-		return nil, fmt.Errorf("%s/%s doesn't return an IstioObject object", namespace, resourceType)
-	}
-	istioObject.SetTypeMeta(typeMeta)
-	return istioObject, err
+func (in *K8SClient) Istio() istio.Interface {
+	return in.istioClientset
 }
 
-// DeleteIstioObject deletes an Istio object from either config api or networking api
-func (in *K8SClient) DeleteIstioObject(api, namespace, resourceType, name string) error {
-	log.Debugf("DeleteIstioObject input: %s / %s / %s / %s", api, namespace, resourceType, name)
-	var err error
-	apiClient, _ := in.getApiClientVersion(api)
-	if apiClient == nil {
-		return fmt.Errorf("%s is not supported in DeleteIstioObject operation", api)
-	}
-	_, err = apiClient.Delete().Namespace(namespace).Resource(resourceType).Name(name).Do(in.ctx).Get()
-	return err
+func (in *K8SClient) GatewayAPI() gatewayapiclient.Interface {
+	return in.gatewayapi
 }
 
-// UpdateIstioObject updates an Istio object from either config api or networking api
-func (in *K8SClient) UpdateIstioObject(api, namespace, resourceType, name, jsonPatch string) (IstioObject, error) {
-	log.Debugf("UpdateIstioObject input: %s / %s / %s / %s", api, namespace, resourceType, name)
-	var result runtime.Object
-	var err error
-
-	typeMeta := meta_v1.TypeMeta{
-		Kind:       "",
-		APIVersion: "",
-	}
-	typeMeta.Kind = PluralType[resourceType]
-	bytePatch := []byte(jsonPatch)
-	var apiClient *rest.RESTClient
-	apiClient, typeMeta.APIVersion = in.getApiClientVersion(api)
-	if apiClient == nil {
-		return nil, fmt.Errorf("%s is not supported in UpdateIstioObject operation", api)
-	}
-	result, err = apiClient.Patch(types.MergePatchType).Namespace(namespace).Resource(resourceType).SubResource(name).Body(bytePatch).Do(in.ctx).Get()
-	if err != nil {
-		return nil, err
-	}
-	istioObject, ok := result.(*GenericIstioObject)
-	if !ok {
-		return nil, fmt.Errorf("%s/%s doesn't return an IstioObject object", namespace, name)
-	}
-	istioObject.SetTypeMeta(typeMeta)
-	return istioObject, err
-}
-
-func (in *K8SClient) GetIstioObjects(namespace, resourceType, labelSelector string) ([]IstioObject, error) {
-	var apiClient *rest.RESTClient
-	var apiGroup, apiVersion string
-	var ok bool
-	if apiGroup, ok = ResourceTypesToAPI[resourceType]; ok {
-		apiClient, apiVersion = in.getApiClientVersion(apiGroup)
-	} else {
-		return []IstioObject{}, fmt.Errorf("%s not found in ResourcesTypeToAPI", resourceType)
-	}
-
-	if apiGroup == NetworkingGroupVersion.Group && !in.hasNetworkingResource(resourceType) {
-		return []IstioObject{}, nil
-	}
-
-	if apiGroup == SecurityGroupVersion.Group && !in.hasSecurityResource(resourceType) {
-		return []IstioObject{}, nil
-	}
-
-	var result runtime.Object
-	var err error
-	result, err = apiClient.Get().Namespace(namespace).Resource(resourceType).Param("labelSelector", labelSelector).Do(in.ctx).Get()
-	if err != nil {
-		return nil, err
-	}
-	istioList, ok := result.(*GenericIstioObjectList)
-	if !ok {
-		return nil, fmt.Errorf("%s/%s doesn't return a list", namespace, resourceType)
-	}
-	typeMeta := meta_v1.TypeMeta{
-		Kind:       PluralType[resourceType],
-		APIVersion: apiVersion,
-	}
-	list := make([]IstioObject, 0)
-	for _, item := range istioList.GetItems() {
-		i := item.DeepCopyIstioObject()
-		i.SetTypeMeta(typeMeta)
-		list = append(list, i)
-	}
-	return list, nil
-}
-
-func (in *K8SClient) GetIstioObject(namespace, resourceType, name string) (IstioObject, error) {
-	var apiClient *rest.RESTClient
-	var apiGroup, apiVersion string
-	var ok bool
-	if apiGroup, ok = ResourceTypesToAPI[resourceType]; ok {
-		apiClient, apiVersion = in.getApiClientVersion(apiGroup)
-	} else {
-		return nil, fmt.Errorf("%s not found in ResourcesTypeToAPI", resourceType)
-	}
-
-	var result runtime.Object
-	var err error
-	result, err = apiClient.Get().Namespace(namespace).Resource(resourceType).SubResource(name).Do(in.ctx).Get()
-	if err != nil {
-		return nil, err
-	}
-	typeMeta := meta_v1.TypeMeta{
-		Kind:       PluralType[resourceType],
-		APIVersion: apiVersion,
-	}
-	istioObject, ok := result.(*GenericIstioObject)
-	if !ok {
-		return nil, fmt.Errorf("%s/%s/%s doesn't return an Istio object", namespace, resourceType, name)
-	}
-	io := istioObject.DeepCopyIstioObject()
-	io.SetTypeMeta(typeMeta)
-	return io, nil
-}
-
-type ProxyStatus struct {
-	pilot string
-	SyncStatus
-}
-
-// SyncStatus is the synchronization status between Pilot and a given Envoy
-type SyncStatus struct {
-	ProxyID       string `json:"proxy,omitempty"`
-	ProxyVersion  string `json:"proxy_version,omitempty"`
-	IstioVersion  string `json:"istio_version,omitempty"`
-	ClusterSent   string `json:"cluster_sent,omitempty"`
-	ClusterAcked  string `json:"cluster_acked,omitempty"`
-	ListenerSent  string `json:"listener_sent,omitempty"`
-	ListenerAcked string `json:"listener_acked,omitempty"`
-	RouteSent     string `json:"route_sent,omitempty"`
-	RouteAcked    string `json:"route_acked,omitempty"`
-	EndpointSent  string `json:"endpoint_sent,omitempty"`
-	EndpointAcked string `json:"endpoint_acked,omitempty"`
-}
-
-func (in *K8SClient) GetProxyStatus() ([]*ProxyStatus, error) {
-	c := config.Get()
-	istiods, err := in.GetPods(c.IstioNamespace, labels.Set(map[string]string{
-		"app": "istiod",
-	}).String())
-
-	if err != nil {
-		return nil, err
-	}
-
-	healthyIstiods := make([]*core_v1.Pod, 0, len(istiods))
-	for i, istiod := range istiods {
-		if istiod.Status.Phase == "Running" {
-			healthyIstiods = append(healthyIstiods, &istiods[i])
-		}
-	}
-
-	if len(healthyIstiods) == 0 {
-		return nil, errors.New("unable to find any healthy Pilot instance")
-	}
-
-	// Check if the kube-api has proxy access to pods in the istio-system
-	// https://github.com/kiali/kiali/issues/3494#issuecomment-772486224
-	_, err = in.GetPodProxy(c.IstioNamespace, istiods[0].Name, "/ready")
-	if err != nil {
-		return nil, fmt.Errorf("unable to proxy Istiod pods. " +
-			"Make sure your Kubernetes API server has access to the Istio control plane through 8080 port")
-	}
-
-	wg := sync.WaitGroup{}
-	wg.Add(len(healthyIstiods))
-	errChan := make(chan error, len(healthyIstiods))
-	syncChan := make(chan map[string][]byte, len(healthyIstiods))
-
-	result := map[string][]byte{}
-	for _, istiod := range healthyIstiods {
-		go func(name, namespace string) {
-			defer wg.Done()
-
-			res, err := in.GetPodProxy(namespace, name, "/debug/syncz")
-			if err != nil {
-				errChan <- fmt.Errorf("%s: %s", name, err.Error())
-			} else {
-				syncChan <- map[string][]byte{name: res}
-			}
-		}(istiod.Name, istiod.Namespace)
-	}
-
-	wg.Wait()
-	close(errChan)
-	close(syncChan)
-
-	errs := ""
-	for err := range errChan {
-		if errs != "" {
-			errs = errs + "; "
-		}
-		errs = errs + err.Error()
-	}
-	errs = "Error fetching the proxy-status in the following pods: " + errs
-
-	for status := range syncChan {
-		for pilot, sync := range status {
-			result[pilot] = sync
-		}
-	}
-
-	// If there is one sync, we consider it as valid
-	if len(result) > 0 {
-		return getStatus(result)
-	}
-
-	return nil, errors.New(errs)
-}
-
-func getStatus(statuses map[string][]byte) ([]*ProxyStatus, error) {
-	var fullStatus []*ProxyStatus
-	for pilot, status := range statuses {
-		var ss []*ProxyStatus
-		err := json.Unmarshal(status, &ss)
-		if err != nil {
-			return nil, err
-		}
-		for _, s := range ss {
-			s.pilot = pilot
-		}
-		fullStatus = append(fullStatus, ss...)
-	}
-	return fullStatus, nil
+func (in *K8SClient) InferenceAPI() inferenceapiclient.Interface {
+	return in.inferenceapi
 }
 
 func (in *K8SClient) GetConfigDump(namespace, podName string) (*ConfigDump, error) {
-	// Fetching the config_dump data, raw.
-	resp, err := in.EnvoyForward(namespace, podName, "/config_dump")
+	// Fetching the Config Dump from the pod's Envoy.
+	// The port 15000 is open on each Envoy Sidecar (managed by Istio) to serve the Envoy Admin  interface.
+	// This port can only be accessed by inside the pod.
+	// See the Istio's doc page about its port usage:
+	// https://istio.io/latest/docs/ops/deployment/requirements/#ports-used-by-istio
+	resp, err := in.ForwardGetRequest(namespace, podName, 15000, "/config_dump")
 	if err != nil {
-		log.Errorf("Error fetching config_map: %v", err)
+		log.Errorf("Error forwarding the /config_dump request: %v", err)
 		return nil, err
 	}
 
 	cd := &ConfigDump{}
-	err = json.Unmarshal(resp, cd)
+	err = json.NewDecoder(bytes.NewReader(resp)).Decode(cd)
 	if err != nil {
-		log.Errorf("Error Unmarshalling the config_dump: %v", err)
+		log.Errorf("Error decoding the config_dump: %v", err)
 	}
 
 	return cd, err
 }
 
-func (in *K8SClient) EnvoyForward(namespace, podName, path string) ([]byte, error) {
-	writer := new(bytes.Buffer)
+func (in *K8SClient) SetProxyLogLevel(namespace, pod, level string) error {
+	path := fmt.Sprintf("/logging?level=%s", level)
 
-	clientConfig, err := ConfigClient()
+	localPort := httputil.Pool.GetFreePort()
+	defer httputil.Pool.FreePort(localPort)
+	f, err := in.getPodPortForwarder(namespace, pod, fmt.Sprintf("%d:%d", localPort, envoyAdminPort))
 	if err != nil {
-		log.Errorf("Error getting Kubernetes Client config: %v", err)
-		return nil, err
-	}
-
-	// First try whether the pod exist or not
-	_, err = in.GetPod(namespace, podName)
-	if err != nil {
-		log.Errorf("Couldn't fetch the Pod: %v", err)
-		return nil, err
-	}
-
-	// Building the port mapping local:target port
-	envoyLocalPort := config.Get().ExternalServices.Istio.EnvoyAdminLocalPort
-	portMap := fmt.Sprintf("%d:15000", envoyLocalPort)
-
-	// Create a Port Forwarder
-	f, err := config_dump.NewPortForwarder(in.k8s.CoreV1().RESTClient(), clientConfig,
-		namespace, podName, "localhost", portMap, writer)
-	if err != nil {
-		return nil, err
+		return err
 	}
 
 	// Start the forwarding
 	if err := f.Start(); err != nil {
-		return nil, err
+		return err
 	}
 
 	// Defering the finish of the port-forwarding
 	defer f.Stop()
 
 	// Ready to create a request
-	resp, code, err := httputil.HttpGet(fmt.Sprintf("http://localhost:%d%s", envoyLocalPort, path), nil, 10*time.Second)
+	url := fmt.Sprintf("http://localhost:%d%s", localPort, path)
+	body, code, _, err := httputil.HttpPost(url, nil, nil, time.Second*10, nil, in.conf)
 	if code >= 400 {
-		return resp, fmt.Errorf("error fetching the /config_dump for the Envoy. Response code: %d", code)
+		log.Errorf("Error whilst posting. Error: %s. Body: %s", err, string(body))
+		return fmt.Errorf("error sending post request %s from %s/%s. Response code: %d", path, namespace, pod, code)
 	}
 
-	return resp, err
-}
-
-func (in *K8SClient) hasNetworkingResource(resource string) bool {
-	return in.getNetworkingResources()[resource]
-}
-
-func (in *K8SClient) getNetworkingResources() map[string]bool {
-	if in.networkingResources != nil {
-		return *in.networkingResources
-	}
-
-	networkingResources := map[string]bool{}
-	path := fmt.Sprintf("/apis/%s", ApiNetworkingVersion)
-	resourceListRaw, err := in.k8s.RESTClient().Get().AbsPath(path).Do(in.ctx).Raw()
-	if err == nil {
-		resourceList := meta_v1.APIResourceList{}
-		if errMarshall := json.Unmarshal(resourceListRaw, &resourceList); errMarshall == nil {
-			for _, resource := range resourceList.APIResources {
-				networkingResources[resource.Name] = true
-			}
-		}
-	}
-	in.networkingResources = &networkingResources
-
-	return *in.networkingResources
-}
-
-func (in *K8SClient) hasSecurityResource(resource string) bool {
-	return in.getSecurityResources()[resource]
-}
-
-func (in *K8SClient) getSecurityResources() map[string]bool {
-	if in.securityResources != nil {
-		return *in.securityResources
-	}
-
-	securityResources := map[string]bool{}
-	path := fmt.Sprintf("/apis/%s", ApiSecurityVersion)
-	resourceListRaw, err := in.k8s.RESTClient().Get().AbsPath(path).Do(in.ctx).Raw()
-	if err == nil {
-		resourceList := meta_v1.APIResourceList{}
-		if errMarshall := json.Unmarshal(resourceListRaw, &resourceList); errMarshall == nil {
-			for _, resource := range resourceList.APIResources {
-				securityResources[resource.Name] = true
-			}
-		}
-	}
-	in.securityResources = &securityResources
-
-	return *in.securityResources
-}
-
-func GetIstioConfigMap(istioConfig *core_v1.ConfigMap) (*IstioMeshConfig, error) {
-	meshConfig := &IstioMeshConfig{}
-
-	// Used for test cases
-	if istioConfig == nil || istioConfig.Data == nil {
-		return meshConfig, nil
-	}
-
-	var err error
-	meshConfigYaml, ok := istioConfig.Data["mesh"]
-	log.Tracef("meshConfig: %v", meshConfigYaml)
-	if !ok {
-		errMsg := "GetIstioConfigMap: Cannot find Istio mesh configuration [%v]."
-		log.Warningf(errMsg, istioConfig)
-		return nil, fmt.Errorf(errMsg, istioConfig)
-	}
-
-	err = yaml.Unmarshal([]byte(meshConfigYaml), &meshConfig)
-	if err != nil {
-		log.Warningf("GetIstioConfigMap: Cannot read Istio mesh configuration.")
-		return nil, err
-	}
-
-	return meshConfig, nil
+	return err
 }
 
 // ServiceEntryHostnames returns a list of hostnames defined in the ServiceEntries Specs. Key in the resulting map is the protocol (in lowercase) + hostname
 // exported for test
-func ServiceEntryHostnames(serviceEntries []IstioObject) map[string][]string {
+func ServiceEntryHostnames(serviceEntries []*networking_v1.ServiceEntry) map[string][]string {
 	hostnames := make(map[string][]string)
 
-	for _, v := range serviceEntries {
-		if hostsSpec, found := v.GetSpec()["hosts"]; found {
-			if hosts, ok := hostsSpec.([]interface{}); ok {
-				// Seek the protocol
-				for _, h := range hosts {
-					if hostname, ok := h.(string); ok {
-						hostnames[hostname] = make([]string, 0, 1)
-					}
-				}
+	for _, serviceEntry := range serviceEntries {
+		for _, host := range serviceEntry.Spec.Hosts {
+			protocols := make([]string, 0, len(serviceEntry.Spec.Ports))
+			for _, port := range serviceEntry.Spec.Ports {
+				protocol := mapPortToVirtualServiceProtocol(port.Protocol)
+				protocols = append(protocols, protocol)
 			}
-		}
-		if portsSpec, found := v.GetSpec()["ports"]; found {
-			if portsArray, ok := portsSpec.([]interface{}); ok {
-				for _, portDef := range portsArray {
-					if ports, ok := portDef.(map[string]interface{}); ok {
-						if proto, found := ports["protocol"]; found {
-							if protocol, ok := proto.(string); ok {
-								protocol = mapPortToVirtualServiceProtocol(protocol)
-								for host := range hostnames {
-									hostnames[host] = append(hostnames[host], protocol)
-								}
-							}
-						}
-					}
-				}
-			}
+			hostnames[host] = append(protocols, hostnames[host]...)
 		}
 	}
 
 	return hostnames
+}
+
+const ExportToAnnotation = "networking.istio.io/exportTo"
+
+type kubeServiceEntry struct {
+	exportTo  []string
+	namespace string
+}
+
+// KubeServiceHosts maps K8s Service hostnames to metadata supporting namespace-visibility-aware lookups.
+// Each service is registered under three FQDN key forms so that checkers find a match regardless of
+// which hostname format the Istio resource uses (full FQDN, short FQDN, or two-part).
+//
+// Visibility is determined by a two-level fallback: the networking.istio.io/exportTo annotation on
+// the K8s Service takes precedence; when absent, the mesh-wide DefaultServiceExportTo is applied;
+// when both are absent the service is visible to all namespaces (Istio's default).
+type KubeServiceHosts struct {
+	entries map[string]*kubeServiceEntry
+}
+
+// NewKubeServiceHosts builds a KubeServiceHosts from K8s Services.
+// defaultExportTo is the mesh-wide DefaultServiceExportTo from the Istio MeshConfig;
+// it is applied when a service has no networking.istio.io/exportTo annotation.
+// Pass nil when the mesh config is unavailable (e.g. in unit tests) to treat
+// unannotated services as visible to all namespaces.
+func NewKubeServiceHosts(services []core_v1.Service, identityDomain string, defaultExportTo []string) KubeServiceHosts {
+	var nsMap map[string][]string
+	if defaultExportTo != nil {
+		nsMap = make(map[string][]string)
+		for _, svc := range services {
+			if _, ok := nsMap[svc.Namespace]; !ok {
+				nsMap[svc.Namespace] = defaultExportTo
+			}
+		}
+	}
+	return NewKubeServiceHostsWithNamespaceDefaults(services, identityDomain, nsMap)
+}
+
+// NewKubeServiceHostsWithNamespaceDefaults builds KubeServiceHosts using a precomputed map of
+// namespace -> DefaultServiceExportTo. Use this for multi-primary support: build the map once
+// for unique namespaces (O(namespaces)) instead of resolving per service (O(services)).
+// Pass nil for namespaceToExportTo to treat unannotated services as visible to all namespaces.
+func NewKubeServiceHostsWithNamespaceDefaults(services []core_v1.Service, identityDomain string, namespaceToExportTo map[string][]string) KubeServiceHosts {
+	entries := make(map[string]*kubeServiceEntry, len(services)*3)
+	clusterDomain := identityDomain
+
+	for _, svc := range services {
+		entry := &kubeServiceEntry{
+			namespace: svc.Namespace,
+		}
+		if ann, ok := svc.Annotations[ExportToAnnotation]; ok {
+			entry.exportTo = parseExportToAnnotation(ann)
+		} else if namespaceToExportTo != nil {
+			entry.exportTo = namespaceToExportTo[svc.Namespace]
+		} else {
+			entry.exportTo = nil
+		}
+
+		fqdn := fmt.Sprintf("%s.%s.%s", svc.Name, svc.Namespace, clusterDomain)
+		shortFqdn := fmt.Sprintf("%s.%s.svc", svc.Name, svc.Namespace)
+		twoPart := fmt.Sprintf("%s.%s", svc.Name, svc.Namespace)
+
+		entries[fqdn] = entry
+		entries[shortFqdn] = entry
+		entries[twoPart] = entry
+	}
+
+	return KubeServiceHosts{entries: entries}
+}
+
+// KubeServiceFQDNs builds a KubeServiceHosts without mesh-config defaults.
+// Use this only in unit tests where the mesh config is not available;
+// production code should call NewKubeServiceHosts with the mesh default.
+func KubeServiceFQDNs(services []core_v1.Service, identityDomain string) KubeServiceHosts {
+	return NewKubeServiceHosts(services, identityDomain, nil)
+}
+
+func parseExportToAnnotation(annotation string) []string {
+	parts := strings.Split(annotation, ",")
+	result := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			result = append(result, p)
+		}
+	}
+	return result
+}
+
+// HasHost returns true if the hostname exists in the map, ignoring ExportTo visibility.
+func (h KubeServiceHosts) HasHost(host string) bool {
+	_, found := h.entries[host]
+	return found
+}
+
+// IsValidForNamespace returns true if the hostname exists AND the service is exported to
+// the given namespace. When neither the annotation nor a mesh default is set, the service
+// is visible to all namespaces.
+func (h KubeServiceHosts) IsValidForNamespace(host string, namespace string) bool {
+	entry, found := h.entries[host]
+	if !found {
+		return false
+	}
+	return IsExportedTo(entry.exportTo, entry.namespace, namespace)
+}
+
+// IsExportedTo checks whether a resource with the given exportTo list is visible from
+// viewerNamespace. resourceNamespace is the namespace the resource lives in, needed to
+// evaluate the "." (same-namespace) token. An empty exportTo list means the resource
+// is visible to all namespaces (Istio's default behaviour).
+func IsExportedTo(exportTo []string, resourceNamespace, viewerNamespace string) bool {
+	if len(exportTo) == 0 {
+		return true
+	}
+
+	for _, export := range exportTo {
+		switch export {
+		case "*":
+			return true
+		case ".":
+			if resourceNamespace == viewerNamespace {
+				return true
+			}
+		case "~":
+			continue
+		default:
+			if export == viewerNamespace {
+				return true
+			}
+		}
+	}
+
+	return false
 }
 
 // mapPortToVirtualServiceProtocol transforms Istio's Port-definitions' protocol names to VirtualService's protocol names
@@ -498,33 +333,25 @@ func mapPortToVirtualServiceProtocol(proto string) string {
 	}
 }
 
-// ValidaPort parses the Istio Port definition and validates the naming scheme
-func ValidatePort(portDef interface{}) bool {
-	return MatchPortNameRule(parsePort(portDef))
+// ValidatePort parses the Istio Port definition and validates the naming scheme
+func ValidatePort(portDef *api_networking_v1.Port) bool {
+	if portDef == nil {
+		return false
+	}
+	return MatchPortNameRule(portDef.Name, portDef.Protocol)
 }
 
-func parsePort(portDef interface{}) (string, string) {
-	var name, proto string
-	if port, ok := portDef.(map[string]interface{}); ok {
-		if portNameDef, found := port["name"]; found {
-			if portName, ok := portNameDef.(string); ok {
-				name = portName
-			}
-		}
-		if protocolDef, found := port["protocol"]; found {
-			if protocol, ok := protocolDef.(string); ok {
-				proto = protocol
-			}
-		}
+// ValidateServicePort parses the Istio Port definition and validates the naming scheme
+func ValidateServicePort(portDef *api_networking_v1.ServicePort) bool {
+	if portDef == nil {
+		return false
 	}
-
-	return name, proto
+	return MatchPortNameRule(portDef.Name, portDef.Protocol)
 }
 
 func MatchPortNameRule(portName, protocol string) bool {
 	protocol = strings.ToLower(protocol)
 	// Check that portName begins with the protocol
-
 	if protocol == "tcp" || protocol == "udp" {
 		// TCP and UDP protocols do not care about the name
 		return true
@@ -555,90 +382,148 @@ func MatchPortNameWithValidProtocols(portName string) bool {
 	return false
 }
 
+// kubernetesAppProtocols are Kubernetes-standard appProtocol values that Istio recognizes
+// for protocol selection (see istio pkg/config/kube/conversion.go).
+var kubernetesAppProtocols = [...]string{
+	"kubernetes.io/h2c",
+	"kubernetes.io/ws",
+	"kubernetes.io/wss",
+}
+
+func MatchPortAppProtocolWithValidProtocols(appProtocol *string) bool {
+	if appProtocol == nil || *appProtocol == "" {
+		return false
+	}
+	proto := strings.ToLower(*appProtocol)
+	for _, protocol := range portProtocols {
+		if proto == protocol {
+			return true
+		}
+	}
+	for _, protocol := range kubernetesAppProtocols {
+		if proto == protocol {
+			return true
+		}
+	}
+	return false
+}
+
 // GatewayNames extracts the gateway names for easier matching
-func GatewayNames(gateways [][]IstioObject) map[string]struct{} {
+func GatewayNames(gateways []*networking_v1.Gateway, identityDomain string) map[string]struct{} {
 	var empty struct{}
 	names := make(map[string]struct{})
-	for _, ns := range gateways {
-		for _, gw := range ns {
-			gw := gw
-			clusterName := gw.GetObjectMeta().ClusterName
-			if clusterName == "" {
-				clusterName = config.Get().ExternalServices.Istio.IstioIdentityDomain
-			}
-			names[ParseHost(gw.GetObjectMeta().Name, gw.GetObjectMeta().Namespace, clusterName).String()] = empty
-		}
+	for _, gw := range gateways {
+		names[ParseHost(gw.Name, gw.Namespace, identityDomain).String()] = empty
 	}
 	return names
 }
 
-func PeerAuthnHasStrictMTLS(peerAuthn IstioObject) bool {
+// K8sGatewayNames extracts the gateway names for easier matching
+func K8sGatewayNames(gateways []*k8s_networking_v1.Gateway, identityDomain string) map[string]k8s_networking_v1.Gateway {
+	names := make(map[string]k8s_networking_v1.Gateway)
+	for _, gw := range gateways {
+		names[ParseHost(gw.Name, gw.Namespace, identityDomain).String()] = *gw
+	}
+	return names
+}
+
+func PeerAuthnHasStrictMTLS(peerAuthn *security_v1.PeerAuthentication) bool {
 	_, mode := PeerAuthnHasMTLSEnabled(peerAuthn)
 	return mode == "STRICT"
 }
 
-func PeerAuthnHasMTLSEnabled(peerAuthn IstioObject) (bool, string) {
+func PeerAuthnHasMTLSEnabled(peerAuthn *security_v1.PeerAuthentication) (bool, string) {
 	// It is no globally enabled when has targets
-	if peerAuthn.HasMatchLabelsSelector() {
+	if peerAuthn.Spec.Selector != nil && len(peerAuthn.Spec.Selector.MatchLabels) >= 0 {
 		return false, ""
 	}
 	return PeerAuthnMTLSMode(peerAuthn)
 }
 
-func PeerAuthnMTLSMode(peerAuthn IstioObject) (bool, string) {
+func PeerAuthnMTLSMode(peerAuthn *security_v1.PeerAuthentication) (bool, string) {
 	// It is globally enabled when mtls is in STRICT mode
-	if mtls, mtlsPresent := peerAuthn.GetSpec()["mtls"]; mtlsPresent {
-		if mtlsMap, ok := mtls.(map[string]interface{}); ok {
-			if modeItf, found := mtlsMap["mode"]; found {
-				if mode, ok := modeItf.(string); ok {
-					return mode == "STRICT" || mode == "PERMISSIVE", mode
-				} else {
-					return false, ""
-				}
-			} else {
-				return true, "PERMISSIVE"
-			}
-		}
+	if peerAuthn.Spec.Mtls != nil {
+		mode := peerAuthn.Spec.Mtls.Mode.String()
+		return mode == "STRICT" || mode == "PERMISSIVE", mode
 	}
-
 	return false, ""
 }
 
-func DestinationRuleHasMeshWideMTLSEnabled(destinationRule IstioObject) (bool, string) {
+func DestinationRuleHasMeshWideMTLSEnabled(destinationRule *networking_v1.DestinationRule) (bool, string) {
 	// Following the suggested procedure to enable mesh-wide mTLS, host might be '*.local':
 	// https://istio.io/docs/tasks/security/authn-policy/#globally-enabling-istio-mutual-tls
 	return DestinationRuleHasMTLSEnabledForHost("*.local", destinationRule)
 }
 
-func DestinationRuleHasNamespaceWideMTLSEnabled(namespace string, destinationRule IstioObject) (bool, string) {
+func DestinationRuleHasNamespaceWideMTLSEnabled(namespace string, destinationRule *networking_v1.DestinationRule, identityDomain string) (bool, string) {
 	// Following the suggested procedure to enable namespace-wide mTLS, host might be '*.namespace.svc.cluster.local'
 	// https://istio.io/docs/tasks/security/authn-policy/#namespace-wide-policy
-	nsHost := fmt.Sprintf("*.%s.%s", namespace, config.Get().ExternalServices.Istio.IstioIdentityDomain)
+	nsHost := fmt.Sprintf("*.%s.%s", namespace, identityDomain)
 	return DestinationRuleHasMTLSEnabledForHost(nsHost, destinationRule)
 }
 
-func DestinationRuleHasMTLSEnabledForHost(expectedHost string, destinationRule IstioObject) (bool, string) {
-	host, hostPresent := destinationRule.GetSpec()["host"]
-	if !hostPresent || host != expectedHost {
+func DestinationRuleHasMTLSEnabledForHost(expectedHost string, destinationRule *networking_v1.DestinationRule) (bool, string) {
+	if destinationRule.Spec.Host == "" || destinationRule.Spec.Host != expectedHost {
 		return false, ""
 	}
 	return DestinationRuleHasMTLSEnabled(destinationRule)
 }
 
-func DestinationRuleHasMTLSEnabled(destinationRule IstioObject) (bool, string) {
-	if trafficPolicy, trafficPresent := destinationRule.GetSpec()["trafficPolicy"]; trafficPresent {
-		if trafficCasted, ok := trafficPolicy.(map[string]interface{}); ok {
-			if tls, found := trafficCasted["tls"]; found {
-				if tlsCasted, ok := tls.(map[string]interface{}); ok {
-					if mode, found := tlsCasted["mode"]; found {
-						if modeCasted, ok := mode.(string); ok {
-							return modeCasted == "ISTIO_MUTUAL", modeCasted
-						}
-					}
-				}
+func DestinationRuleHasMTLSEnabled(destinationRule *networking_v1.DestinationRule) (bool, string) {
+	if destinationRule.Spec.TrafficPolicy != nil && destinationRule.Spec.TrafficPolicy.Tls != nil {
+		mode := destinationRule.Spec.TrafficPolicy.Tls.Mode.String()
+		return mode == "ISTIO_MUTUAL", mode
+	}
+	return false, ""
+}
+
+// ClusterNameFromIstiod attempts to resolve the clusterName of the "home" cluster where kiali is running,
+// by inspecting the istiod deployment. Assumes that the istiod deployment is in the same cluster as the kiali pod.
+func ClusterNameFromIstiod(conf *config.Config, k8s ClientInterface) (string, error) {
+	var istiodDeployments []apps_v1.Deployment
+	if conf.AllNamespacesAccessible() {
+		deployments, err := k8s.GetDeployments("", meta_v1.ListOptions{LabelSelector: "app=istiod"})
+		if err != nil {
+			log.Warningf("Failed to get istiod deployments: %v", err)
+		} else {
+			istiodDeployments = deployments
+		}
+	} else {
+		// this should always include the controlplane namespace(s) if the discovery selectors are correctly set up
+		for _, ns := range conf.Deployment.AccessibleNamespaces {
+			deployments, err := k8s.GetDeployments(ns, meta_v1.ListOptions{LabelSelector: "app=istiod"})
+			if err != nil {
+				log.Warningf("Failed to get istiod deployments from namespace %s: %v", ns, err)
+				continue
 			}
+			istiodDeployments = append(istiodDeployments, deployments...)
 		}
 	}
 
-	return false, ""
+	if len(istiodDeployments) == 0 {
+		return "", fmt.Errorf("no istiod deployment found, no clusterName determined")
+	}
+
+	// Just take the first one since they should all have the same clusterID.
+	istiodDeployment := &istiodDeployments[0]
+
+	istiodContainers := istiodDeployment.Spec.Template.Spec.Containers
+	if len(istiodContainers) == 0 {
+		return "", fmt.Errorf("istiod deployment [%s] has no containers", istiodDeployment.Name)
+	}
+
+	clusterName := ""
+	for _, v := range istiodContainers[0].Env {
+		if v.Name == "CLUSTER_ID" {
+			clusterName = v.Value
+			break
+		}
+	}
+
+	if clusterName == "" {
+		// We didn't find it. This may mean that Istio is not setup with multi-cluster enabled.
+		return "", fmt.Errorf("istiod deployment [%s] does not have the CLUSTER_ID environment variable set", istiodDeployment.Name)
+	}
+
+	return clusterName, nil
 }

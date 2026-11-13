@@ -1,0 +1,192 @@
+@graph-toolbar
+# don't change first line of this file - the tag is used for the test scripts to identify the test suite
+
+Feature: Kiali Graph page - Toolbar (various)
+
+  User opens the Graph page and manipulates the "error-rates" demo via Toolbar.
+
+  Background:
+    Given user is at administrator perspective
+
+  # NOTE: Graph Display menu has its own test script
+  #       - tests empty graph as well
+  # NOTE: Graph Find/Hide has its own test script
+  # NOTE: Graph Replay has its own test script
+
+  @core-1
+  @offline
+  Scenario: On the graph page the namespace selector should be sorted alphabetically
+    When user graphs "" namespaces
+    Then the namespace dropdown is sorted alphabetically
+
+  @offline
+  @error-rates-app
+  @core-1
+  Scenario: Graph alpha namespace with query params
+    When user graphs "alpha" namespaces with refresh "900000" and duration "120"
+    Then user sees the "alpha" namespace
+    And user sees selected graph duration "Last 2m"
+    And user sees selected graph refresh "Every 15m"
+
+  @offline
+  @error-rates-app
+  @core-1
+  Scenario: Open graph Tour
+    When user graphs "alpha" namespaces
+    And user clicks graph tour
+    Then user "sees" graph tour
+
+  @offline
+  @error-rates-app
+  @core-1
+  Scenario: Close graph Tour
+    When user graphs "alpha" namespaces
+    And user clicks graph tour
+    And user closes graph tour
+    Then user "does not see" graph tour
+
+  @offline
+  @error-rates-app
+  @core-1
+  Scenario: Open traffic dropdown
+    When user graphs "alpha" namespaces
+    And user "opens" traffic menu
+    Then user sees graph traffic menu
+
+  @offline
+  @error-rates-app
+  @core-1
+  Scenario: Disable all traffic
+    When user graphs "alpha" namespaces
+    And user "opens" traffic menu
+    And user disables all traffic
+    Then user does not see any traffic
+
+  # todo: would be a better test if demos has tcp and/or grpc traffic
+  @offline
+  @error-rates-app
+  @core-1
+  Scenario: Enable http traffic
+    When user graphs "alpha" namespaces
+    And user "opens" traffic menu
+    And user disables all traffic
+    And user "enables" "http" traffic option
+    Then user "sees" "http" traffic
+    And user "does not see" "tcp" traffic
+    And user "does not see" "grpc" traffic
+
+  @offline
+  @error-rates-app
+  @core-1
+  Scenario: Close traffic dropdown
+    When user graphs "alpha" namespaces
+    And user "opens" traffic menu
+    And user "closes" traffic menu
+    Then user does not see graph traffic menu
+
+  @offline
+  @error-rates-app
+  @graph-page-display
+  @core-1
+  Scenario: User resets to factory default
+    When user graphs "alpha" namespaces
+    And user resets to factory default
+    And user "opens" traffic menu
+    Then user sees graph traffic menu
+
+  @offline
+  @error-rates-app
+  @core-1
+  Scenario: Open duration dropdown
+    When user graphs "alpha" namespaces
+    And user clicks graph duration menu
+    Then user sees graph duration menu
+
+  @offline
+  @error-rates-app
+  @core-1
+  Scenario: Close duration dropdown
+    When user graphs "alpha" namespaces
+    And user clicks graph duration menu
+    And user clicks graph duration menu
+    Then user does not see graph duration menu
+
+  @offline
+  @error-rates-app
+  @core-1
+  Scenario: Set duration dropdown
+    When user graphs "alpha" namespaces
+    And user selects graph duration "120"
+    Then user sees selected graph duration "Last 2m"
+
+  @offline
+  @error-rates-app
+  @core-1
+  Scenario: Open refresh dropdown
+    When user graphs "alpha" namespaces
+    And user clicks graph refresh menu
+    Then user sees graph refresh menu
+
+  @offline
+  @error-rates-app
+  @core-1
+  Scenario: Close refresh dropdown
+    When user graphs "alpha" namespaces
+    And user clicks graph refresh menu
+    And user clicks graph refresh menu
+    Then user does not see graph refresh menu
+
+  @offline
+  @error-rates-app
+  @core-1
+  Scenario: Set refresh dropdown
+    When user graphs "alpha" namespaces
+    And user selects graph refresh "0"
+    Then user sees selected graph refresh "Pause"
+
+  @offline
+  @error-rates-app
+  @core-1
+  Scenario: graph type app
+    When user graphs "alpha" namespaces
+    And user selects "APP" graph type
+    Then user sees a "app" graph
+
+  @offline
+  @error-rates-app
+  @core-1
+  Scenario: graph type service
+    When user graphs "alpha" namespaces
+    And user selects "SERVICE" graph type
+    Then user sees a "service" graph
+
+  @offline
+  @error-rates-app
+  @core-1
+  Scenario: graph type versioned app
+    When user graphs "alpha" namespaces
+    And user selects "VERSIONED_APP" graph type
+    Then user sees a "versionedApp" graph
+
+  @offline
+  @error-rates-app
+  @core-1
+  Scenario: graph type workload
+    When user graphs "alpha" namespaces
+    And user selects "WORKLOAD" graph type
+    Then user sees a "workload" graph
+
+  # TODO: offline - ambient support.
+  @ambient
+  Scenario: Open traffic dropdown for ambient
+    When user graphs "" namespaces
+    And user "opens" traffic menu
+    Then user sees graph traffic menu
+
+  # TODO: offline - ambient support.
+  @ambient
+  Scenario: Close traffic dropdown for ambient
+    When user graphs "" namespaces
+    And user "opens" traffic menu
+    And user "closes" traffic menu
+    Then user does not see graph traffic menu

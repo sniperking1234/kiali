@@ -4,14 +4,17 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+
+	"github.com/kiali/kiali/config"
 )
 
 func TestMetricsLabelsBuilderInboundHttp(t *testing.T) {
 	assert := assert.New(t)
+	config.Set(config.NewConfig())
 
-	lb := NewMetricsLabelsBuilder("inbound")
+	lb := NewMetricsLabelsBuilder("inbound", config.Get())
 	lb.App("test", "ns")
-	lb.Reporter("source")
+	lb.Reporters([]string{"source"})
 	lb.Protocol("http")
 	assert.Equal(`{destination_workload_namespace="ns",destination_canonical_service="test",reporter="source",request_protocol="http"}`, lb.Build())
 
@@ -22,10 +25,11 @@ func TestMetricsLabelsBuilderInboundHttp(t *testing.T) {
 
 func TestMetricsLabelsBuilderOutboundGrpc(t *testing.T) {
 	assert := assert.New(t)
+	config.Set(config.NewConfig())
 
-	lb := NewMetricsLabelsBuilder("outbound")
+	lb := NewMetricsLabelsBuilder("outbound", config.Get())
 	lb.Workload("test", "ns")
-	lb.Reporter("destination")
+	lb.Reporters([]string{"destination"})
 	lb.Protocol("grpc")
 	assert.Equal(`{source_workload_namespace="ns",source_workload="test",reporter="destination",request_protocol="grpc"}`, lb.Build())
 
@@ -35,10 +39,21 @@ func TestMetricsLabelsBuilderOutboundGrpc(t *testing.T) {
 	assert.Equal(`{source_workload_namespace="ns",source_workload="test",reporter="destination",request_protocol="grpc",grpc_response_status=~"^[1-9]$|^1[0-6]$",response_code!~"^0$|^[4-5]\\d\\d$"}`, errs[1])
 }
 
+func TestMetricsLabelsBuilderWithWaypoint(t *testing.T) {
+	assert := assert.New(t)
+	config.Set(config.NewConfig())
+
+	lb := NewMetricsLabelsBuilder("inbound", config.Get())
+	lb.App("test", "ns")
+	lb.Reporters([]string{"destination", "waypoint"})
+	lb.Protocol("http")
+	assert.Equal(`{destination_workload_namespace="ns",destination_canonical_service="test",reporter=~"destination|waypoint",request_protocol="http"}`, lb.Build())
+}
+
 func TestMetricsLabelsBuilderInboundPeerLabels(t *testing.T) {
 	assert := assert.New(t)
 
-	lb := NewMetricsLabelsBuilder("inbound")
+	lb := NewMetricsLabelsBuilder("inbound", config.Get())
 	lb.Service("test", "ns")
 	lb.PeerApp("peer", "ns2")
 	assert.Equal(`{destination_service_name="test",destination_service_namespace="ns",source_workload_namespace="ns2",source_canonical_service="peer"}`, lb.Build())
@@ -47,8 +62,22 @@ func TestMetricsLabelsBuilderInboundPeerLabels(t *testing.T) {
 func TestMetricsLabelsBuilderOutboundPeerLabels(t *testing.T) {
 	assert := assert.New(t)
 
-	lb := NewMetricsLabelsBuilder("outbound")
+	lb := NewMetricsLabelsBuilder("outbound", config.Get())
 	lb.Workload("test", "ns")
 	lb.PeerService("peer", "ns2")
 	assert.Equal(`{source_workload_namespace="ns",source_workload="test",destination_service_name="peer",destination_service_namespace="ns2"}`, lb.Build())
+}
+
+func TestMetricsLabelsBuilderQueryScope(t *testing.T) {
+	testConfig := config.NewConfig()
+	testConfig.ExternalServices.Prometheus.QueryScope = map[string]string{"mesh_id": "mesh1"}
+	config.Set(testConfig)
+
+	assert := assert.New(t)
+
+	lb := NewMetricsLabelsBuilder("outbound", config.Get())
+	lb.QueryScope()
+	lb.Workload("test", "ns")
+	lb.PeerService("peer", "ns2")
+	assert.Equal(`{mesh_id="mesh1",source_workload_namespace="ns",source_workload="test",destination_service_name="peer",destination_service_namespace="ns2"}`, lb.Build())
 }

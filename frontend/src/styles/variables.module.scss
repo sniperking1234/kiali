@@ -1,0 +1,10 @@
+@value kialiFontSize: 14px;
+
+.style {
+  /**
+   * Standard font size for the Kiali application.
+   */
+  --kiali-global--font-size: kialiFontSize;
+  --graph-side-panel--font-size: kialiFontSize;
+  --pf-t--global--font--size--md: kialiFontSize;
+}

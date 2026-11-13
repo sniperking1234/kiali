@@ -1,0 +1,272 @@
+import { When, Then } from '@badeball/cypress-cucumber-preprocessor';
+import { getCellsForCol } from './table';
+import { clickSpanFilterOptionWithFallback, clusterParameterExists } from './navigation';
+import { ensureKialiFinishedLoading, openTab } from './transition';
+
+const WAYPOINT_FALLBACK = 'waypoint';
+
+const openEnvoyTab = (tab: string): void => {
+  cy.get('#envoy-details').should('exist').contains(tab).click();
+};
+
+Then('user sees details information for workload', () => {
+  cy.getBySel('workload-resources-card').within(() => {
+    cy.get('#pfbadge-A').closest('li').contains('details'); // App
+    cy.get('#pfbadge-S').closest('li').contains('details'); // Service
+  });
+
+  cy.getBySel('workload-resources-card').within(() => {
+    clusterParameterExists(false);
+  });
+});
+
+Then('user sees workload Resources card', () => {
+  cy.getBySel('workload-resources-card').scrollIntoView().should('be.visible');
+});
+
+Then('user sees workload Pods card', () => {
+  cy.get('#WorkloadPodsCard').scrollIntoView().should('be.visible');
+});
+
+Then('user sees workload Istio Config card', () => {
+  cy.get('#IstioConfigCard').scrollIntoView().should('be.visible');
+});
+
+Then('user sees workload Labels card', () => {
+  cy.getBySel('workload-labels-card').scrollIntoView().should('be.visible');
+});
+
+Then('user sees workload Annotations card', () => {
+  cy.getBySel('workload-annotations-card').scrollIntoView().should('be.visible');
+});
+
+Then('user sees workload inbound and outbound traffic information', () => {
+  openTab('Traffic');
+
+  cy.contains('Inbound Traffic');
+  cy.contains('No Inbound Traffic').should('not.exist');
+  cy.contains('No Outbound Traffic');
+});
+
+Then('user sees workload inbound metrics information', () => {
+  cy.intercept(`**/api/namespaces/bookinfo/workloads/details-v1/dashboard*`).as('fetchMetrics');
+
+  openTab('Inbound Metrics');
+  cy.wait('@fetchMetrics');
+
+  // Charts render only when dashboard data is loaded. The metrics component does not forward
+  // data-test to the DOM; with unmountOnExit only this tab's content is mounted.
+  cy.get('[data-test="metrics-chart"]').should('have.length.greaterThan', 0);
+});
+
+Then('user sees workload outbound metrics information', () => {
+  cy.intercept(`**/api/namespaces/bookinfo/workloads/details-v1/dashboard*`).as('fetchMetrics');
+
+  openTab('Outbound Metrics');
+  cy.wait('@fetchMetrics');
+
+  // Charts render only when dashboard data is loaded. The metrics component does not forward
+  // data-test to the DOM; with unmountOnExit only this tab's content is mounted.
+  cy.get('[data-test="metrics-chart"]').should('have.length.greaterThan', 0);
+});
+
+Then('user sees Perses dashboards in the Dashboards dropdown', () => {
+  cy.getBySel('istio-dashboards-toggle').should('be.visible').click();
+  cy.get('[data-test^="istio-dashboard-link-perses-"]').should('have.length.greaterThan', 0);
+
+  cy.getBySel('istio-dashboard-link-perses-0').then($el => {
+    const href = $el.attr('href') || $el.closest('a').attr('href') || $el.find('a').attr('href');
+    expect(href, 'Perses dashboard href').to.be.a('string').and.not.be.empty;
+    cy.request({ url: href as string, failOnStatusCode: false })
+      .its('status')
+      .should('eq', 200);
+  });
+});
+
+When('user can filter spans by workload {string}', (workload: string) => {
+  cy.get('button#filter_select_type-toggle').click();
+  cy.get('button#Workload').click();
+  cy.get('input[placeholder="Filter by Workload"]').click();
+
+  clickSpanFilterOptionWithFallback(workload, WAYPOINT_FALLBACK);
+
+  getCellsForCol('App / Workload').each($cell => {
+    const cellText = $cell.text().toLowerCase();
+    const workloadMatches = cellText.includes(workload.toLowerCase());
+    const waypointMatches = cellText.includes(WAYPOINT_FALLBACK);
+    expect(
+      workloadMatches || waypointMatches,
+      `Expected "${cellText}" to contain "${workload}" or "${WAYPOINT_FALLBACK}"`
+    ).to.equal(true);
+  });
+
+  getCellsForCol(4).first().click();
+
+  // Check that kebab menu is opened
+  cy.get('ul[role="menu"]').should('be.visible');
+});
+
+When(
+  'the user filters by {string} with value {string} on the {string} tab',
+  (filter: string, value: string, tab: string) => {
+    openTab('Envoy');
+    openEnvoyTab(tab);
+
+    cy.waitForReact();
+
+    cy.get('button#filter_select_type-toggle').click();
+    cy.contains('div#filter_select_type button', filter).click();
+
+    cy.get('input#filter_input_value').type(`${value}{enter}`);
+  }
+);
+
+Then('the user sees clusters expected information', () => {
+  cy.get('tbody').within(() => {
+    cy.contains('td', 'BlackHoleCluster').should('not.exist');
+    cy.contains('td', 'details.bookinfo.svc.cluster.local');
+  });
+});
+
+Then('the user sees listeners expected information', () => {
+  cy.get('tbody').within(() => {
+    cy.contains('td', 'PassthroughCluster').should('not.exist');
+    cy.contains('td', /Route:.*9090/);
+  });
+});
+
+Then('the user sees routes expected information', () => {
+  cy.get('tbody').within(() => {
+    cy.contains('td', '15010').should('not.exist');
+    cy.contains('td', '9080');
+  });
+});
+
+When('the user looks for the bootstrap tab', () => {
+  openTab('Envoy');
+  openEnvoyTab('Bootstrap');
+});
+
+Then('the user sees bootstrap expected information', () => {
+  cy.get('[data-test="envoy-editor"] .monaco-editor').should('exist');
+  cy.get('[data-test="envoy-editor"] .view-lines').should('contain.text', 'bootstrap');
+});
+
+When('the user looks for the config tab', () => {
+  openTab('Envoy');
+  openEnvoyTab('Config');
+});
+
+Then('the user sees config expected information', () => {
+  cy.get('[data-test="envoy-editor"] .monaco-editor').should('exist');
+  cy.get('[data-test="envoy-editor"] .view-lines').should('contain.text', 'config_dump');
+});
+
+Then('the user sees the metrics tab', () => {
+  cy.intercept(`**/api/namespaces/bookinfo/customdashboard/envoy*`).as('fetchEnvoyMetrics');
+
+  openTab('Envoy');
+  openEnvoyTab('Metrics');
+
+  cy.wait('@fetchEnvoyMetrics');
+
+  cy.contains('Loading metrics').should('not.exist');
+
+  // Charts render only when dashboard data is loaded. CustomMetrics does not forward data-test
+  // to the DOM; with unmountOnExit only this tab's content is mounted.
+  cy.get('[data-test="metrics-chart"]').should('have.length.greaterThan', 0);
+});
+
+Then('the user sees healthy Envoy status on workload details', () => {
+  ensureKialiFinishedLoading();
+  cy.getBySel('details-envoy-status', { timeout: 60000 }).should('be.visible');
+  cy.getBySel('details-envoy-status').within(() => {
+    cy.getBySel('envoy-memory-status', { timeout: 60000 }).should('be.visible').and('contain.text', 'Healthy');
+  });
+});
+
+When('the user opens the Envoy memory overview', () => {
+  cy.intercept('**/api/namespaces/bookinfo/customdashboard/envoy-memory**').as('fetchEnvoyMemoryDashboard');
+
+  openTab('Envoy');
+  openEnvoyTab('Overview');
+
+  // envoymemory is often fetched on the workload Overview tab (Envoy status row) and reused from the
+  // 5s client cache — do not cy.wait() for it here or the test flakes when no second request is sent.
+  cy.wait('@fetchEnvoyMemoryDashboard', { timeout: 60000 });
+  ensureKialiFinishedLoading();
+
+  cy.getBySel('envoy-memory-tab').should('be.visible');
+});
+
+Then('the user sees healthy Envoy memory overview', () => {
+  cy.getBySel('envoy-memory-status-alert').should('have.class', 'pf-m-success');
+  cy.getBySel('envoy-memory-status-alert').contains('Within normal range');
+});
+
+Then('the user sees Envoy memory summary metrics with data', () => {
+  cy.getBySel('envoy-memory-summary-metrics').within(() => {
+    cy.getBySel('envoy-overview-clusters-link')
+      .invoke('text')
+      .then(text => {
+        expect(Number.parseInt(text.trim(), 10), `expected active clusters > 0, got "${text}"`).to.be.greaterThan(0);
+      });
+    cy.contains(/[1-9][0-9]*(\.[0-9]+)?\s*(B|KiB|MiB|GiB)/);
+  });
+});
+
+Then('the user sees Envoy memory chart statistics', () => {
+  cy.getBySel('envoy-memory-overlay-chart', { timeout: 60000 }).should('be.visible');
+  cy.getBySel('envoy-memory-overlay-chart').within(() => {
+    cy.contains('Loading metrics', { timeout: 120000 }).should('not.exist');
+  });
+  cy.getBySel('envoy-memory-overlay-chart')
+    .find('[data-test="metrics-chart"]', { timeout: 120000 })
+    .should('have.length.greaterThan', 0);
+});
+
+Then('the user sees the ztunnel services table', () => {
+  openTab('Ztunnel');
+  cy.get('#ztunnel-details').should('be.visible').contains('Services').click();
+  cy.get('table[aria-label="Ztunnel services config"]').should('be.visible');
+  cy.get('table[aria-label="Ztunnel services config"]').find('th[data-label="Service VIP"]').should('be.visible');
+});
+
+Then('the user can see the {string} link', (link: string) => {
+  cy.getBySel('view-in-tracing').contains(link);
+});
+
+Then('the user can see the {string} trace link', (link: string) => {
+  cy.getBySel('trace-details-tabs').should('be.visible');
+  cy.getBySel('trace-details-kebab').click();
+  cy.getBySel('trace-details-dropdown').contains(link);
+});
+
+Then('the user can see the {string} span link', (link: string) => {
+  cy.get('table')
+    .should('be.visible')
+    .find('tbody tr') // ignore thead rows
+    .should('have.length.above', 1) // retries above cy.find() until we have a non head-row
+    .eq(1) // take 1st  row
+    .find('td')
+    .eq(4) // take 5th cell (Kebab)
+    .find('button')
+    .click();
+
+  cy.get('ul[role=menu]').contains(link);
+});
+
+Then('user sees {string} badge', (badge: string) => {
+  cy.getBySel('workload-details-card').within(() => {
+    cy.get('.pf-v6-c-label__content').contains(badge);
+  });
+});
+
+Then(
+  'the user cannot see the {string} badge for {string} workload in {string} namespace',
+  (badge: string, workload: string, ns: string) => {
+    cy.getBySel('workload-details-card').within(() => {
+      cy.get(`[data-test="${badge}-badge-for-${workload}-workload-in-${ns}-namespace"]`).should('not.exist');
+    });
+  }
+);

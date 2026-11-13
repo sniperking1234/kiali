@@ -1,0 +1,69 @@
+import * as React from 'react';
+import { Paths } from '../../config';
+import { FilterSelected } from '../Filters/StatefulFilters';
+import { KialiLink } from './KialiLink';
+import { pluralize } from '@patternfly/react-core';
+
+interface Props {
+  children: React.ReactNode;
+  errors?: boolean;
+  issues?: number;
+  namespaces: string[];
+  warnings?: boolean;
+}
+
+export const IstioConfigListLink: React.FC<Props> = (props: Props) => {
+  const namespacesToParams = (): string => {
+    let param = '';
+
+    if (props.namespaces.length > 0) {
+      param = `namespaces=${props.namespaces.join(',')}`;
+    }
+
+    return param;
+  };
+
+  const validationToParams = (): string => {
+    let params = '';
+
+    if (props.warnings) {
+      params += 'config=Warning';
+    }
+
+    let errorParams = '';
+
+    if (props.errors) {
+      errorParams += 'config=Not+Valid';
+    }
+
+    if (params !== '' && errorParams !== '') {
+      params += '&';
+    }
+
+    params += errorParams;
+
+    return params;
+  };
+
+  const cleanFilters = (): void => {
+    FilterSelected.resetFilters();
+  };
+
+  let params: string = namespacesToParams();
+
+  const validationParams: string = validationToParams();
+
+  if (params !== '' && validationParams !== '') {
+    params += '&';
+  }
+
+  params += validationParams;
+  return (
+    <>
+      {props.children}
+      <KialiLink to={`/${Paths.ISTIO}?${params}`} onClick={cleanFilters}>
+        {props.issues && <> {pluralize(props.issues, 'issue')}</>}
+      </KialiLink>
+    </>
+  );
+};

@@ -1,28 +1,83 @@
 package models
 
 import (
+	"context"
+	"fmt"
 	"strconv"
+	"strings"
 
 	osapps_v1 "github.com/openshift/api/apps/v1"
+	networking_v1 "istio.io/client-go/pkg/apis/networking/v1"
 	apps_v1 "k8s.io/api/apps/v1"
 	batch_v1 "k8s.io/api/batch/v1"
-	batch_v1beta1 "k8s.io/api/batch/v1beta1"
 	core_v1 "k8s.io/api/core/v1"
 	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 
 	"github.com/kiali/kiali/config"
+	"github.com/kiali/kiali/kubernetes"
+	"github.com/kiali/kiali/log"
+	"github.com/kiali/kiali/util/healthutil"
 )
+
+type ClusterWorkloads struct {
+	// Cluster where the apps live in
+	// required: true
+	// example: east
+	Cluster string `json:"cluster"`
+
+	// Workloads list for namespaces of a single cluster
+	// required: true
+	Workloads []WorkloadListItem `json:"workloads"`
+
+	Validations IstioValidations `json:"validations"`
+}
 
 type WorkloadList struct {
 	// Namespace where the workloads live in
 	// required: true
 	// example: bookinfo
-	Namespace Namespace `json:"namespace"`
+	Namespace string `json:"namespace"`
 
 	// Workloads for a given namespace
 	// required: true
 	Workloads []WorkloadListItem `json:"workloads"`
+
+	Validations IstioValidations `json:"validations"`
+}
+
+type LogType string
+
+const (
+	LogTypeApp      LogType = "app"
+	LogTypeProxy    LogType = "proxy"
+	LogTypeWaypoint LogType = "waypoint"
+	LogTypeZtunnel  LogType = "ztunnel"
+)
+
+// IsValid reports whether the log type is a known value (or empty, which
+// means the default application logs).
+func (t LogType) IsValid() bool {
+	switch t {
+	case "", LogTypeApp, LogTypeProxy, LogTypeWaypoint, LogTypeZtunnel:
+		return true
+	}
+	return false
+}
+
+// UsesKialiSA reports whether this log type is streamed with the Kiali
+// ServiceAccount client rather than the user's own credentials. It is the
+// single predicate for both the client selection in the business layer and
+// the namespace access gate in the handler: the two must stay structurally
+// identical, or the SA-backed path ends up ungated.
+//
+// Note that the ztunnel gate is load-bearing beyond ztunnel pods: when the
+// cache holds no ztunnel pods, the ztunnel branch still streams the
+// requested pod with the SA client, so the gate must not be narrowed to
+// "ztunnel pods exist".
+func (t LogType) UsesKialiSA() bool {
+	return t == LogTypeZtunnel
 }
 
 // WorkloadListItem has the necessary information to display the console workload list
@@ -32,10 +87,16 @@ type WorkloadListItem struct {
 	// example: reviews-v1
 	Name string `json:"name"`
 
-	// Type of the workload
+	// Namespace of the workload
+	Namespace string `json:"namespace"`
+
+	// The kube cluster where this workload is located.
+	Cluster string `json:"cluster"`
+
+	// Group Version Kind of the workload
 	// required: true
-	// example: deployment
-	Type string `json:"type"`
+	// example: 'apps/v1, Kind=Deployment'
+	WorkloadGVK schema.GroupVersionKind `json:"gvk"`
 
 	// Creation timestamp (in RFC3339 format)
 	// required: true
@@ -48,6 +109,8 @@ type WorkloadListItem struct {
 	ResourceVersion string `json:"resourceVersion"`
 
 	// Define if Workload has an explicit Istio policy annotation
+	// Istio supports this as a label as well - this will be defined if the label is set, too.
+	// If both annotation and label are set, if any is false, injection is disabled.
 	// It's mapped as a pointer to show three values nil, true, false
 	IstioInjectionAnnotation *bool `json:"istioInjectionAnnotation,omitempty"`
 
@@ -55,6 +118,29 @@ type WorkloadListItem struct {
 	// required: true
 	// example: true
 	IstioSidecar bool `json:"istioSidecar"`
+
+	// Define if Pods related to this Workload has an IsAmbient deployed
+	// required: true
+	// example: true
+	IsAmbient bool `json:"isAmbient"`
+
+	// Define if this Workload is a gateway (but not a waypoint)
+	// required: true
+	// example: true
+	IsGateway bool `json:"isGateway"`
+
+	// SPIRE information for SPIRE-managed workloads
+	SpireInfo *SpireInfo `json:"spireInfo,omitempty"`
+
+	// Define if this Workload is an ambient waypoint
+	// required: true
+	// example: true
+	IsWaypoint bool `json:"isWaypoint"`
+
+	// Define if this Workload is an ambient ztunnel
+	// required: true
+	// example: true
+	IsZtunnel bool `json:"isZtunnel"`
 
 	// Additional item sample, such as type of api being served (graphql, grpc, rest)
 	// example: rest
@@ -79,105 +165,307 @@ type WorkloadListItem struct {
 	// example: 1
 	PodCount int `json:"podCount"`
 
+	// Annotations of Deployment
+	// required: false
+	Annotations map[string]string `json:"annotations"`
+
 	// HealthAnnotations
 	// required: false
 	HealthAnnotations map[string]string `json:"healthAnnotations"`
+
+	// Istio References
+	IstioReferences []*IstioValidationKey `json:"istioReferences"`
+
+	// Dashboard annotations
+	// required: false
+	DashboardAnnotations map[string]string `json:"dashboardAnnotations"`
+
+	// Names of the workload service accounts
+	ServiceAccountNames []string `json:"serviceAccountNames"`
+
+	// TemplateAnnotations are the annotations on the pod template if the workload
+	// has a pod template.
+	TemplateAnnotations map[string]string `json:"templateAnnotations,omitempty"`
+
+	// TemplateLabels are the labels on the pod template if the workload
+	// has a pod template.
+	TemplateLabels map[string]string `json:"templateLabels,omitempty"`
+
+	// Health
+	Health WorkloadHealth `json:"health,omitempty"`
+
+	// ValidationKey is a pre-calculated key string: "cluster:namespace:name"
+	ValidationKey string
+
+	// ValidationVersion is a pre-calculated string representing the workload "version", basically
+	// the workload information that, if changed, requires re-validation (including per-object ignore
+	// rules and resolved waypoint references used by ambient checkers such as KIA1313).
+	ValidationVersion string
 }
 
 type WorkloadOverviews []*WorkloadListItem
 
+// WorkloadReferenceInfo holds the service information needed to create links to another workload.
+// Used, for example, to link services to Ambient waypoint proxies
+type WorkloadReferenceInfo struct {
+	// CanaryWeight is set when WaypointRole is canary (0-100).
+	CanaryWeight int `json:"canaryWeight,omitempty"`
+
+	// Cluster
+	Cluster string `json:"cluster"`
+
+	// LabelType in case of waypoint workloads,
+	// Where the label comes from (namespace, workload or service)
+	// required: false
+	// example: namespace
+	LabelType string `json:"labelType"`
+
+	// Workload labels
+	Labels map[string]string `json:"labels"`
+
+	// Name for the workload
+	// required: true
+	Name string `json:"name"`
+
+	// Namespace where the workload live in
+	// required: true
+	// example: bookinfo
+	Namespace string `json:"namespace"`
+
+	// RoleWeight is nil without a canary split; zero is a valid configured share.
+	RoleWeight *int `json:"roleWeight,omitempty"`
+
+	// In case of waypoints it can be service/workload
+	// required: false
+	// example: workload/service
+	Type string `json:"type"`
+
+	// WaypointRole is primary or canary when this reference is waypoint enrollment.
+	WaypointRole string `json:"waypointRole,omitempty"`
+}
+
 // Workload has the details of a workload
 type Workload struct {
-	WorkloadListItem
-
-	// Number of desired replicas defined by the user in the controller Spec
-	// required: true
-	// example: 2
-	DesiredReplicas int32 `json:"desiredReplicas"`
-
-	// Number of current replicas pods that matches controller selector labels
-	// required: true
-	// example: 2
-	CurrentReplicas int32 `json:"currentReplicas"`
+	// Additional details to display, such as configured annotations
+	AdditionalDetails []AdditionalItem `json:"additionalDetails"`
 
 	// Number of available replicas
 	// required: true
 	// example: 1
 	AvailableReplicas int32 `json:"availableReplicas"`
 
+	// Number of current replicas pods that matches controller selector labels
+	// required: true
+	// example: 2
+	CurrentReplicas int32 `json:"currentReplicas"`
+
+	// Number of desired replicas defined by the user in the controller Spec
+	// required: true
+	// example: 2
+	DesiredReplicas int32 `json:"desiredReplicas"`
+
 	// Pods bound to the workload
 	Pods Pods `json:"pods"`
-
-	// Services that match workload selector
-	Services Services `json:"services"`
 
 	// Runtimes and associated dashboards
 	Runtimes []Runtime `json:"runtimes"`
 
-	// Additional details to display, such as configured annotations
-	AdditionalDetails []AdditionalItem `json:"additionalDetails"`
+	// Services that match workload selector
+	Services []ServiceOverview `json:"services"`
+
+	Validations IstioValidations `json:"validations"`
+
+	// Ambient waypoint services
+	WaypointServices []ServiceReferenceInfo `json:"waypointServices"`
+
+	// WaypointTrafficSplitConfigs lists effective split(s): one for enrolled workloads, many for shared gateways.
+	WaypointTrafficSplitConfigs []GatewayWaypointTrafficSplitConfig `json:"waypointTrafficSplitConfigs,omitempty"`
+
+	// Ambient waypoint workloads
+	WaypointWorkloads []WorkloadReferenceInfo `json:"waypointWorkloads"`
+
+	// WorkloadEntries bound to the workload
+	WorkloadEntries WorkloadEntries `json:"workloadEntries"`
+
+	WorkloadListItem
+}
+
+// HasHTTPTraffic returns true if the workload can report HTTP traffic metrics.
+// This is true if the workload has a sidecar, is a gateway, or is associated with an ambient waypoint.
+func (w *Workload) HasHTTPTraffic() bool {
+	return w.IstioSidecar || w.IsGatewayWorkload() || len(w.WaypointWorkloads) > 0
+}
+
+// SpireManagedIdentityMatch represents a single match that indicates SPIRE-managed identity
+type SpireManagedIdentityMatch struct {
+	// Match type: "Annotations", "Labels", "PodLabels"
+	MatchType string `json:"matchType"`
+	// Key-value pair string (e.g., "inject.istio.io/templates: spire")
+	MatchValue string `json:"matchValue"`
+}
+
+// SpireInfo contains SPIRE-related information for a workload
+type SpireInfo struct {
+	// Indicates if the workload is SPIRE-managed
+	IsSpireManaged bool `json:"isSpireManaged"`
+
+	// Indicates if the workload is a SPIRE Server/Agent (Server, Agent, Driver, Provider)
+	IsSpireServer bool `json:"isSpireServer"`
+
+	// Ordered list of match types and their key-value pairs that indicate SPIRE-managed identity
+	// Preserves the order of detection (priority: Annotations, TemplateLabels/Labels, PodLabels)
+	ManagedIdentityMatches []SpireManagedIdentityMatch `json:"managedIdentityMatches,omitempty"`
+}
+
+// WorkloadEntry describes networking_v1.WorkloadEntry for Kiali, used in WorkloadGroups
+type WorkloadEntry struct {
+	Name               string            `json:"name"`
+	Labels             map[string]string `json:"labels"`
+	CreatedAt          string            `json:"createdAt"`
+	Status             string            `json:"status"`
+	StatusReason       string            `json:"statusReason"`
+	AppLabel           bool              `json:"appLabel"`
+	VersionLabel       bool              `json:"versionLabel"`
+	Annotations        map[string]string `json:"annotations"`
+	ServiceAccountName string            `json:"serviceAccountName"`
+}
+
+// TracingName describes all the needed data for tracing
+type TracingName struct {
+	App               string `json:"app"`
+	Lookup            string `json:"lookup"`
+	WaypointName      string `json:"waypointName"`
+	WaypointNamespace string `json:"waypointNamespace"`
+	Workload          string `json:"workload"`
 }
 
 type Workloads []*Workload
 
-func (workload *WorkloadListItem) ParseWorkload(w *Workload) {
-	conf := config.Get()
+type WorkloadEntries []*WorkloadEntry
+
+func (workload *WorkloadListItem) ParseWorkload(w *Workload, conf *config.Config) {
 	workload.Name = w.Name
-	workload.Type = w.Type
+	workload.Namespace = w.Namespace
+	workload.WorkloadGVK = w.WorkloadGVK
 	workload.CreatedAt = w.CreatedAt
 	workload.ResourceVersion = w.ResourceVersion
-	workload.IstioSidecar = w.HasIstioSidecar()
+	if w.WorkloadGVK == kubernetes.WorkloadGroups {
+		// For WorkloadGroups IstioSidecar is already calculated while fetching
+		workload.IstioSidecar = w.IstioSidecar
+	} else {
+		workload.IstioSidecar = w.HasIstioSidecar()
+	}
+	workload.IsGateway = w.IsGatewayWorkload()
+	workload.IsWaypoint = w.IsWaypointWorkload()
+	workload.IsZtunnel = w.IsZtunnelWorkload()
+	workload.IsAmbient = workload.IsWaypoint || workload.IsZtunnel || w.HasIstioAmbient()
 	workload.Labels = w.Labels
 	workload.PodCount = len(w.Pods)
+	workload.ServiceAccountNames = w.Pods.ServiceAccounts()
 	workload.AdditionalDetailSample = w.AdditionalDetailSample
+	if len(w.Annotations) > 0 {
+		workload.Annotations = w.Annotations
+	} else {
+		workload.Annotations = map[string]string{}
+	}
 	workload.HealthAnnotations = w.HealthAnnotations
-
+	workload.IstioReferences = []*IstioValidationKey{}
 	/** Check the labels app and version required by Istio in template Pods*/
-	_, workload.AppLabel = w.Labels[conf.IstioLabels.AppLabelName]
-	_, workload.VersionLabel = w.Labels[conf.IstioLabels.VersionLabelName]
+	if appLabelName, found := conf.GetAppLabelName(w.Labels); found {
+		_, workload.AppLabel = w.Labels[appLabelName]
+	}
+	if verLabelName, found := conf.GetVersionLabelName(w.Labels); found {
+		_, workload.VersionLabel = w.Labels[verLabelName]
+	}
+
+	// Copy SpireInfo from Workload to WorkloadListItem
+	if w.SpireInfo != nil {
+		workload.SpireInfo = w.SpireInfo
+	}
 }
 
-func (workload *Workload) parseObjectMeta(meta *meta_v1.ObjectMeta, tplMeta *meta_v1.ObjectMeta) {
-	conf := config.Get()
+func (workload *Workload) parseObjectMeta(meta *meta_v1.ObjectMeta, tplMeta *meta_v1.ObjectMeta, conf *config.Config) {
 	workload.Name = meta.Name
+	workload.Namespace = meta.Namespace
 	if tplMeta != nil && tplMeta.Labels != nil {
+		workload.TemplateLabels = tplMeta.Labels
+		// TODO: workload.Labels exposes only the pod template labels, not the controller's own
+		// metadata.labels. If they differ (e.g. via external edit), Kiali won't show the controller labels.
 		workload.Labels = tplMeta.Labels
 		/** Check the labels app and version required by Istio in template Pods*/
-		_, workload.AppLabel = tplMeta.Labels[conf.IstioLabels.AppLabelName]
-		_, workload.VersionLabel = tplMeta.Labels[conf.IstioLabels.VersionLabelName]
+		if appLabelName, found := conf.GetAppLabelName(tplMeta.Labels); found {
+			_, workload.AppLabel = tplMeta.Labels[appLabelName]
+		}
+		if verLabelName, found := conf.GetVersionLabelName(tplMeta.Labels); found {
+			_, workload.VersionLabel = tplMeta.Labels[verLabelName]
+		}
 	} else {
 		workload.Labels = map[string]string{}
 	}
-	var annotation string
-	exist := false
-	if tplMeta != nil && tplMeta.Annotations != nil {
-		annotation, exist = tplMeta.Annotations[conf.ExternalServices.Istio.IstioInjectionAnnotation]
-	} else {
-		annotation, exist = meta.Annotations[conf.ExternalServices.Istio.IstioInjectionAnnotation]
+	annotations := meta.Annotations
+	// TODO: Same as labels above — only template annotations are exposed via workload.Annotations
+	// (except for Deployments which override this in ParseDeployment with the controller annotations).
+	if tplMeta.Annotations != nil {
+		workload.TemplateAnnotations = tplMeta.Annotations
+		annotations = tplMeta.Annotations
 	}
-	if value, err := strconv.ParseBool(annotation); exist && err == nil {
-		workload.IstioInjectionAnnotation = &value
+
+	// Check for automatic sidecar injection config at the workload level. This can be defined via label or annotation.
+	// This code ignores any namespace injection label - this determines auto-injection config as defined by workload-only label or annotation.
+	// If both are defined, label always overrides annotation (see https://github.com/kiali/kiali/issues/5713)
+	// If none are defined, assume injection is disabled (again, we ignore the possibility of a namespace label enabling injection)
+	labelExplicitlySet := false // true means the label is defined
+	label, exist := workload.Labels[config.IstioInjectionAnnotation]
+	if exist {
+		if value, err := strconv.ParseBool(label); err == nil {
+			workload.IstioInjectionAnnotation = &value
+			labelExplicitlySet = true
+		}
 	}
+
+	// do not bother to check the annotation if the label is explicitly set - label always overrides the annotation
+	if !labelExplicitlySet {
+		annotation, annotationExists := annotations[config.IstioInjectionAnnotation]
+		if annotationExists {
+			if value, err := strconv.ParseBool(annotation); err == nil {
+				if !value {
+					workload.IstioInjectionAnnotation = &value
+				}
+			}
+		}
+	}
+
 	workload.CreatedAt = formatTime(meta.CreationTimestamp.Time)
 	workload.ResourceVersion = meta.ResourceVersion
-	workload.AdditionalDetails = GetAdditionalDetails(conf, meta.Annotations)
-	workload.AdditionalDetailSample = GetFirstAdditionalIcon(conf, meta.Annotations)
+	if len(meta.Annotations) > 0 {
+		workload.Annotations = meta.Annotations
+	} else {
+		workload.Annotations = map[string]string{}
+	}
+	workload.AdditionalDetails = GetAdditionalDetails(conf, annotations)
+	workload.AdditionalDetailSample = GetFirstAdditionalIcon(conf, annotations)
+	workload.DashboardAnnotations = GetDashboardAnnotation(annotations)
+	workload.HealthAnnotations = GetHealthAnnotation(annotations, GetHealthConfigAnnotation())
 }
 
-func (workload *Workload) ParseDeployment(d *apps_v1.Deployment) {
-	workload.Type = "Deployment"
-	workload.parseObjectMeta(&d.ObjectMeta, &d.Spec.Template.ObjectMeta)
+func (workload *Workload) ParseDeployment(d *apps_v1.Deployment, conf *config.Config) {
+	workload.WorkloadGVK = kubernetes.Deployments
+	workload.parseObjectMeta(&d.ObjectMeta, &d.Spec.Template.ObjectMeta, conf)
 	if d.Spec.Replicas != nil {
 		workload.DesiredReplicas = *d.Spec.Replicas
 	}
+	if len(d.Annotations) > 0 {
+		workload.Annotations = d.Annotations
+	} else {
+		workload.Annotations = map[string]string{}
+	}
 	workload.CurrentReplicas = d.Status.Replicas
 	workload.AvailableReplicas = d.Status.AvailableReplicas
-	workload.HealthAnnotations = GetHealthAnnotation(d.Annotations, GetHealthConfigAnnotation())
 }
 
-func (workload *Workload) ParseReplicaSet(r *apps_v1.ReplicaSet) {
-	workload.Type = "ReplicaSet"
-	workload.parseObjectMeta(&r.ObjectMeta, &r.Spec.Template.ObjectMeta)
+func (workload *Workload) ParseReplicaSet(r *apps_v1.ReplicaSet, conf *config.Config) {
+	workload.WorkloadGVK = kubernetes.ReplicaSets
+	workload.parseObjectMeta(&r.ObjectMeta, &r.Spec.Template.ObjectMeta, conf)
 	if r.Spec.Replicas != nil {
 		workload.DesiredReplicas = *r.Spec.Replicas
 	}
@@ -185,55 +473,51 @@ func (workload *Workload) ParseReplicaSet(r *apps_v1.ReplicaSet) {
 	workload.AvailableReplicas = r.Status.AvailableReplicas
 }
 
-func (workload *Workload) ParseReplicaSetParent(r *apps_v1.ReplicaSet, workloadName string, workloadType string) {
+func (workload *Workload) ParseReplicaSetParent(r *apps_v1.ReplicaSet, workloadName string, workloadGVK schema.GroupVersionKind, conf *config.Config) {
 	// Some properties are taken from the ReplicaSet
-	workload.parseObjectMeta(&r.ObjectMeta, &r.Spec.Template.ObjectMeta)
+	workload.parseObjectMeta(&r.ObjectMeta, &r.Spec.Template.ObjectMeta, conf)
 	// But name and type are coming from the parent
 	// Custom properties from parent controller are not processed by Kiali
-	workload.Type = workloadType
+	workload.WorkloadGVK = workloadGVK
 	workload.Name = workloadName
 	if r.Spec.Replicas != nil {
 		workload.DesiredReplicas = *r.Spec.Replicas
 	}
 	workload.CurrentReplicas = r.Status.Replicas
 	workload.AvailableReplicas = r.Status.AvailableReplicas
-	workload.HealthAnnotations = GetHealthAnnotation(r.Annotations, GetHealthConfigAnnotation())
 }
 
-func (workload *Workload) ParseReplicationController(r *core_v1.ReplicationController) {
-	workload.Type = "ReplicationController"
-	workload.parseObjectMeta(&r.ObjectMeta, &r.Spec.Template.ObjectMeta)
+func (workload *Workload) ParseReplicationController(r *core_v1.ReplicationController, conf *config.Config) {
+	workload.WorkloadGVK = kubernetes.ReplicationControllers
+	workload.parseObjectMeta(&r.ObjectMeta, &r.Spec.Template.ObjectMeta, conf)
 	if r.Spec.Replicas != nil {
 		workload.DesiredReplicas = *r.Spec.Replicas
 	}
 	workload.CurrentReplicas = r.Status.Replicas
 	workload.AvailableReplicas = r.Status.AvailableReplicas
-	workload.HealthAnnotations = GetHealthAnnotation(r.Annotations, GetHealthConfigAnnotation())
 }
 
-func (workload *Workload) ParseDeploymentConfig(dc *osapps_v1.DeploymentConfig) {
-	workload.Type = "DeploymentConfig"
-	workload.parseObjectMeta(&dc.ObjectMeta, &dc.Spec.Template.ObjectMeta)
+func (workload *Workload) ParseDeploymentConfig(dc *osapps_v1.DeploymentConfig, conf *config.Config) {
+	workload.WorkloadGVK = kubernetes.DeploymentConfigs
+	workload.parseObjectMeta(&dc.ObjectMeta, &dc.Spec.Template.ObjectMeta, conf)
 	workload.DesiredReplicas = dc.Spec.Replicas
 	workload.CurrentReplicas = dc.Status.Replicas
 	workload.AvailableReplicas = dc.Status.AvailableReplicas
-	workload.HealthAnnotations = GetHealthAnnotation(dc.Annotations, GetHealthConfigAnnotation())
 }
 
-func (workload *Workload) ParseStatefulSet(s *apps_v1.StatefulSet) {
-	workload.Type = "StatefulSet"
-	workload.parseObjectMeta(&s.ObjectMeta, &s.Spec.Template.ObjectMeta)
+func (workload *Workload) ParseStatefulSet(s *apps_v1.StatefulSet, conf *config.Config) {
+	workload.WorkloadGVK = kubernetes.StatefulSets
+	workload.parseObjectMeta(&s.ObjectMeta, &s.Spec.Template.ObjectMeta, conf)
 	if s.Spec.Replicas != nil {
 		workload.DesiredReplicas = *s.Spec.Replicas
 	}
 	workload.CurrentReplicas = s.Status.Replicas
 	workload.AvailableReplicas = s.Status.ReadyReplicas
-	workload.HealthAnnotations = GetHealthAnnotation(s.Annotations, GetHealthConfigAnnotation())
 }
 
-func (workload *Workload) ParsePod(pod *core_v1.Pod) {
-	workload.Type = "Pod"
-	workload.parseObjectMeta(&pod.ObjectMeta, &pod.ObjectMeta)
+func (workload *Workload) ParsePod(pod *core_v1.Pod, conf *config.Config) {
+	workload.WorkloadGVK = kubernetes.Pods
+	workload.parseObjectMeta(&pod.ObjectMeta, &pod.ObjectMeta, conf)
 
 	var podReplicas, podAvailableReplicas int32
 	podReplicas = 1
@@ -253,23 +537,21 @@ func (workload *Workload) ParsePod(pod *core_v1.Pod) {
 	// Pod has not concept of replica
 	workload.CurrentReplicas = workload.DesiredReplicas
 	workload.AvailableReplicas = podAvailableReplicas
-	workload.HealthAnnotations = GetHealthAnnotation(pod.Annotations, GetHealthConfigAnnotation())
 }
 
-func (workload *Workload) ParseJob(job *batch_v1.Job) {
-	workload.Type = "Job"
-	workload.parseObjectMeta(&job.ObjectMeta, &job.ObjectMeta)
+func (workload *Workload) ParseJob(job *batch_v1.Job, conf *config.Config) {
+	workload.WorkloadGVK = kubernetes.Jobs
+	workload.parseObjectMeta(&job.ObjectMeta, &job.ObjectMeta, conf)
 	// Job controller does not use replica parameters as other controllers
 	// this is a workaround to use same values from Workload perspective
 	workload.DesiredReplicas = job.Status.Active + job.Status.Succeeded + job.Status.Failed
 	workload.CurrentReplicas = workload.DesiredReplicas
 	workload.AvailableReplicas = job.Status.Active + job.Status.Succeeded
-	workload.HealthAnnotations = GetHealthAnnotation(job.Annotations, GetHealthConfigAnnotation())
 }
 
-func (workload *Workload) ParseCronJob(cnjb *batch_v1beta1.CronJob) {
-	workload.Type = "CronJob"
-	workload.parseObjectMeta(&cnjb.ObjectMeta, &cnjb.ObjectMeta)
+func (workload *Workload) ParseCronJob(cnjb *batch_v1.CronJob, conf *config.Config) {
+	workload.WorkloadGVK = kubernetes.CronJobs
+	workload.parseObjectMeta(&cnjb.ObjectMeta, &cnjb.ObjectMeta, conf)
 
 	// We don't have the information of this controller
 	// We will infer the number of replicas as the number of pods without succeed state
@@ -292,9 +574,9 @@ func (workload *Workload) ParseCronJob(cnjb *batch_v1beta1.CronJob) {
 	workload.HealthAnnotations = GetHealthAnnotation(cnjb.Annotations, GetHealthConfigAnnotation())
 }
 
-func (workload *Workload) ParseDaemonSet(ds *apps_v1.DaemonSet) {
-	workload.Type = "DaemonSet"
-	workload.parseObjectMeta(&ds.ObjectMeta, &ds.Spec.Template.ObjectMeta)
+func (workload *Workload) ParseDaemonSet(ds *apps_v1.DaemonSet, conf *config.Config) {
+	workload.WorkloadGVK = kubernetes.DaemonSets
+	workload.parseObjectMeta(&ds.ObjectMeta, &ds.Spec.Template.ObjectMeta, conf)
 	// This is a cornercase for DaemonSet controllers
 	// Desired is the number of desired nodes in a cluster that are running a DaemonSet Pod
 	// We are not going to change that terminology in the backend model yet, but probably add a note in the UI in the future
@@ -304,10 +586,59 @@ func (workload *Workload) ParseDaemonSet(ds *apps_v1.DaemonSet) {
 	workload.HealthAnnotations = GetHealthAnnotation(ds.Annotations, GetHealthConfigAnnotation())
 }
 
-func (workload *Workload) ParsePods(controllerName string, controllerType string, pods []core_v1.Pod) {
-	conf := config.Get()
+func (workload *Workload) ParseWorkloadGroup(wg *networking_v1.WorkloadGroup, wentries []*networking_v1.WorkloadEntry, sidecars []*networking_v1.Sidecar, conf *config.Config) {
+	workload.WorkloadGVK = kubernetes.WorkloadGroups
+	workload.parseObjectMeta(&wg.ObjectMeta, &wg.ObjectMeta, conf)
+	workload.DesiredReplicas = int32(len(wentries))
+	workload.CurrentReplicas = int32(len(wentries))
+	workload.Labels = map[string]string{}
+	// when there are Sidecars matching the WorkloadGroup Template Labels
+	if len(sidecars) > 0 {
+		workload.IstioSidecar = true
+	}
+	// We fetch one WorkloadEntry as template, similar to Pods
+	// WorkloadEntry is generated based on Spec.Template
+	if len(wentries) > 0 {
+		workload.CreatedAt = formatTime(wentries[0].CreationTimestamp.Time)
+		workload.ResourceVersion = wentries[0].ResourceVersion
+		workload.Labels = wentries[0].Spec.Labels
+	} else {
+		// Labels can be nillable, this should be handled
+		// when Metadata does not have labels, the no Applications will be recognised
+		if wg.Spec.Metadata != nil && wg.Spec.Metadata.Labels != nil {
+			workload.Labels = wg.Spec.Metadata.Labels
+		}
+	}
+	/** Check the labels app and version required by Istio in template Pods*/
+	if appLabelName, found := conf.GetAppLabelName(workload.Labels); found {
+		_, workload.AppLabel = workload.Labels[appLabelName]
+	}
+	if verLabelName, found := conf.GetVersionLabelName(workload.Labels); found {
+		_, workload.VersionLabel = workload.Labels[verLabelName]
+	}
+
+	for _, entry := range wentries {
+		podStatus := core_v1.PodFailed
+		if healthutil.IsWorkloadEntryHealthy(entry) {
+			podStatus = core_v1.PodRunning
+			workload.AvailableReplicas = workload.AvailableReplicas + 1
+		}
+		workload.WorkloadEntries = append(workload.WorkloadEntries, &WorkloadEntry{
+			Name:               entry.Name,
+			Labels:             entry.Spec.Labels,
+			CreatedAt:          formatTime(entry.CreationTimestamp.Time),
+			Status:             string(podStatus),
+			AppLabel:           workload.AppLabel,
+			VersionLabel:       workload.VersionLabel,
+			Annotations:        entry.Annotations,
+			ServiceAccountName: entry.Spec.ServiceAccount,
+		})
+	}
+}
+
+func (workload *Workload) ParsePods(controllerName string, controllerGVK schema.GroupVersionKind, pods []core_v1.Pod, conf *config.Config) {
 	workload.Name = controllerName
-	workload.Type = controllerType
+	workload.WorkloadGVK = controllerGVK
 	// We don't have the information of this controller
 	// We will infer the number of replicas as the number of pods without succeed state
 	// We will infer the number of available as the number of pods with running state
@@ -338,17 +669,33 @@ func (workload *Workload) ParsePods(controllerName string, controllerType string
 	}
 
 	/** Check the labels app and version required by Istio in template Pods*/
-	_, workload.AppLabel = workload.Labels[conf.IstioLabels.AppLabelName]
-	_, workload.VersionLabel = workload.Labels[conf.IstioLabels.VersionLabelName]
+	if appLabelName, found := conf.GetAppLabelName(workload.Labels); found {
+		_, workload.AppLabel = workload.Labels[appLabelName]
+	}
+	if verLabelName, found := conf.GetVersionLabelName(workload.Labels); found {
+		_, workload.VersionLabel = workload.Labels[verLabelName]
+	}
 }
 
-func (workload *Workload) SetPods(pods []core_v1.Pod) {
-	workload.Pods.Parse(pods)
+func (workload *Workload) SetPods(pods []core_v1.Pod, isControlPlane func(ctx context.Context, cluster, namespace string) bool) {
+	workload.Pods.Parse(pods, isControlPlane)
 	workload.IstioSidecar = workload.HasIstioSidecar()
+	workload.IsAmbient = workload.HasIstioAmbient()
 }
 
-func (workload *Workload) SetServices(svcs []core_v1.Service) {
-	workload.Services.Parse(svcs)
+func (workload *Workload) AddPodsProtocol(ztunnelConfig kubernetes.ZtunnelConfigDump) {
+	for _, pod := range workload.Pods {
+		for _, wk := range ztunnelConfig.Workloads {
+			if wk.Name == pod.Name {
+				pod.Protocol = wk.Protocol
+				break
+			}
+		}
+	}
+}
+
+func (workload *Workload) SetServices(svcs *ServiceList) {
+	workload.Services = svcs.Services
 }
 
 // HasIstioSidecar return true if there is at least one pod and all pods have sidecars
@@ -358,16 +705,160 @@ func (workload *Workload) HasIstioSidecar() bool {
 		return true
 	}
 	// All pods in a deployment should be the same
-	if workload.Type == "Deployment" {
+	if workload.WorkloadGVK == kubernetes.Deployments {
 		return workload.Pods[0].HasIstioSidecar()
 	}
 	// Need to check each pod
 	return workload.Pods.HasIstioSidecar()
 }
 
-func (wl WorkloadList) GetLabels() []labels.Set {
-	wLabels := make([]labels.Set, 0, len(wl.Workloads))
-	for _, w := range wl.Workloads {
+// IsGatewayWorkload detects Ingress, Egress, or K8s gateways from workload metadata.
+// Waypoint proxies are not included. Use IsWaypointWorkload instead.
+func (workload *Workload) IsGatewayWorkload() bool {
+	return config.IsGateway(workload.Labels, workload.TemplateAnnotations)
+}
+
+// IsInfra return true if the workload is a waypoint proxy or ztunnel (Based in labels)
+func (workload *Workload) IsInfra() bool {
+	return workload.IsWaypointWorkload() || workload.IsZtunnelWorkload()
+}
+
+// IsWaypointWorkload detects waypoint proxies from workload labels.
+func (workload *Workload) IsWaypointWorkload() bool {
+	return config.IsWaypoint(workload.Labels)
+}
+
+// WaypointFor returns the waypoint type (workload/service)
+func (workload *Workload) WaypointFor() string {
+	if !workload.IsWaypointWorkload() {
+		return ""
+	}
+	wpLabel, found := workload.Labels[config.WaypointFor]
+	if !found {
+		return config.WaypointForService
+	}
+
+	switch wpLabel {
+	case config.WaypointForWorkload:
+		return config.WaypointForWorkload
+	case config.WaypointForService:
+		return config.WaypointForService
+	case config.WaypointForAll:
+		return config.WaypointForAll
+	case config.WaypointForNone:
+		return config.WaypointForNone
+	default:
+		log.Errorf("Invalid waypoint for label: %s", workload.Labels[config.WaypointFor])
+		return ""
+	}
+}
+
+// IsSpireServer return true if the workload is a SPIRE Server/Agent (Based in labels)
+func (workload *Workload) IsSpireServer() bool {
+	// Check template labels first (more reliable for identifying the workload type)
+	if workload.TemplateLabels != nil {
+		if workload.TemplateLabels[config.SpireComponentLabel] == config.SpireComponentValue {
+			return true
+		}
+	}
+	// Fallback to pod labels
+	for _, pod := range workload.Pods {
+		if pod.Labels[config.SpireComponentLabel] == config.SpireComponentValue {
+			return true
+		}
+	}
+	return false
+}
+
+// IsZtunnelWorkload detects ztunnel workloads from pod labels.
+func (workload *Workload) IsZtunnelWorkload() bool {
+	for _, pod := range workload.Pods {
+		if pod.Labels[config.IstioAppLabel] == config.Ztunnel {
+			return true
+		}
+	}
+	return false
+}
+
+// SpireManagedIdentity returns an ordered slice of match types and their key-value pairs if the workload has SPIRE-managed identity
+// Returns empty slice if no SPIRE-managed identity is found
+// The order is preserved: Annotations, TemplateLabels (for controllers) or Labels (for Pods), PodLabels
+func (workload *Workload) SpireManagedIdentity() []SpireManagedIdentityMatch {
+	var result []SpireManagedIdentityMatch
+
+	// Top priority: Check template annotations for SPIRE injection annotation
+	if workload.TemplateAnnotations != nil {
+		if annotationValue, exists := workload.TemplateAnnotations[config.SpireInjectionAnnotation]; exists {
+			if strings.Contains(annotationValue, config.SpireInjectionAnnotationValue) {
+				result = append(result, SpireManagedIdentityMatch{
+					MatchType:  "Annotations",
+					MatchValue: fmt.Sprintf("%s: %s", config.SpireInjectionAnnotation, annotationValue),
+				})
+			}
+		}
+	}
+
+	// Check template labels (for deployments, statefulsets, etc.)
+	if workload.TemplateLabels != nil {
+		if labelValue, exists := workload.TemplateLabels[config.SpireManagedIdentityLabel]; exists && labelValue == config.SpireManagedIdentityValue {
+			result = append(result, SpireManagedIdentityMatch{
+				MatchType:  "Labels",
+				MatchValue: fmt.Sprintf("%s: %s", config.SpireManagedIdentityLabel, labelValue),
+			})
+		}
+	} else if workload.Labels != nil { // or check Labels
+		// For standalone Pods, TemplateLabels is nil, so check Labels directly
+		if labelValue, exists := workload.Labels[config.SpireManagedIdentityLabel]; exists && labelValue == config.SpireManagedIdentityValue {
+			result = append(result, SpireManagedIdentityMatch{
+				MatchType:  "Labels",
+				MatchValue: fmt.Sprintf("%s: %s", config.SpireManagedIdentityLabel, labelValue),
+			})
+		}
+	}
+	// Check pod labels as fallback
+	for _, pod := range workload.Pods {
+		if pod.Labels != nil {
+			if labelValue, exists := pod.Labels[config.SpireManagedIdentityLabel]; exists && labelValue == config.SpireManagedIdentityValue {
+				result = append(result, SpireManagedIdentityMatch{
+					MatchType:  "PodLabels",
+					MatchValue: fmt.Sprintf("%s: %s", config.SpireManagedIdentityLabel, labelValue),
+				})
+				break
+			}
+		}
+	}
+	return result
+}
+
+// HasIstioAmbient returns true if the workload has any pod with Ambient mesh annotations
+func (workload *Workload) HasIstioAmbient() bool {
+	// if no pods we can't prove that ambient is enabled, so return false (Default)
+	if len(workload.Pods) == 0 {
+		return false
+	}
+	// All pods in a deployment should be the same
+	if workload.WorkloadGVK == kubernetes.Deployments {
+		return workload.Pods[0].AmbientEnabled()
+	}
+	// Need to check each pod
+	return workload.Pods.HasAnyAmbient()
+}
+
+// HasIstioSidecar returns true if there is at least one workload which has a sidecar
+func (workloads WorkloadOverviews) HasIstioSidecar() bool {
+	if len(workloads) > 0 {
+		for _, w := range workloads {
+			if w.IstioSidecar {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func GetLabels(workloads []*Workload) []labels.Set {
+	wLabels := make([]labels.Set, 0, len(workloads))
+	for _, w := range workloads {
 		wLabels = append(wLabels, labels.Set(w.Labels))
 	}
 	return wLabels

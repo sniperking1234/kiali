@@ -1,0 +1,291 @@
+import { Given, When, Then } from '@badeball/cypress-cucumber-preprocessor';
+import { detailPageQueryParams } from './graph';
+import { ensureKialiFinishedLoading } from './transition';
+
+const CLUSTER1_CONTEXT = Cypress.env('CLUSTER1_CONTEXT');
+const CLUSTER2_CONTEXT = Cypress.env('CLUSTER2_CONTEXT');
+
+Given('user opens the namespace {string} and {string} service details page', (namespace: string, service: string) => {
+  cy.visit({
+    url: `/console/namespaces/${namespace}/services/${service}`,
+    qs: detailPageQueryParams()
+  });
+});
+
+Given(
+  'user opens the namespace {string} and the {string} {string} service details page',
+  (namespace: string, cluster: string, service: string) => {
+    cy.visit({
+      url: `/console/namespaces/${namespace}/services/${service}`,
+      qs: detailPageQueryParams({ clusterName: cluster })
+    });
+  }
+);
+
+When(
+  'user deletes Request Routing named {string} and the resource is no longer available in any cluster',
+  (name: string) => {
+    cy.exec(`kubectl delete destinationrules.networking.istio.io ${name} -n bookinfo --context ${CLUSTER1_CONTEXT}`, {
+      failOnNonZeroExit: false
+    });
+
+    cy.exec(`kubectl delete destinationrules.networking.istio.io ${name} -n bookinfo --context ${CLUSTER2_CONTEXT}`, {
+      failOnNonZeroExit: false
+    });
+
+    cy.exec(`kubectl delete virtualservices.networking.istio.io ${name} -n bookinfo --context ${CLUSTER1_CONTEXT}`, {
+      failOnNonZeroExit: false
+    });
+
+    cy.exec(`kubectl delete virtualservices.networking.istio.io ${name} -n bookinfo --context ${CLUSTER2_CONTEXT}`, {
+      failOnNonZeroExit: false
+    });
+
+    ensureKialiFinishedLoading();
+  }
+);
+
+When('user deletes gateway named {string} and the resource is no longer available in any cluster', (name: string) => {
+  cy.exec(`kubectl delete gateway.networking.istio.io ${name} -n bookinfo --context ${CLUSTER1_CONTEXT}`, {
+    failOnNonZeroExit: false
+  });
+
+  cy.exec(`kubectl delete gateway.networking.istio.io ${name} -n bookinfo --context ${CLUSTER2_CONTEXT}`, {
+    failOnNonZeroExit: false
+  });
+
+  ensureKialiFinishedLoading();
+});
+
+When('user clicks in the {string} actions', (action: string) => {
+  let actionId: string;
+
+  switch (action) {
+    case 'Request Routing':
+      actionId = 'request_routing';
+      break;
+    case 'K8s HTTP Routing':
+      actionId = 'k8s_request_routing';
+      break;
+    case 'K8s GRPC Routing':
+      actionId = 'k8s_grpc_request_routing';
+      break;
+    case 'Delete Traffic Routing':
+      actionId = 'delete_traffic_routing';
+      break;
+    default:
+      throw new Error(`Unknown action: ${action}`);
+  }
+
+  it('spinner should disappear', { retries: 3 }, () => {
+    cy.get('#loading_kiali_spinner').should('not.exist');
+  });
+
+  if (Cypress.env('OSSMC')) {
+    cy.intercept('**/api/**/services/**/graph*').as('serviceMinigraph');
+    cy.wait('@serviceMinigraph');
+    cy.waitForReact();
+    cy.get('button#minigraph-toggle').should('be.visible').click();
+  } else {
+    cy.get('button[data-test="service-actions-toggle"]')
+      .should('exist')
+      .click()
+      .get('#loading_kiali_spinner')
+      .should('not.exist');
+  }
+
+  cy.get(`li[data-test="${actionId}"]`)
+    .find('button')
+    .should('exist')
+    .click()
+    .get('#loading_kiali_spinner')
+    .should('not.exist');
+});
+
+Then('user sees the generated {string} objects located in the {string} cluster', (svc: string, cluster: string) => {
+  cy.getBySel(`VirtualItem_Cluster${cluster}_Nsbookinfo_DestinationRule_${svc}`)
+    .find('[data-label="Cluster"]')
+    .contains(cluster);
+
+  cy.getBySel(`VirtualItem_Cluster${cluster}_Nsbookinfo_VirtualService_${svc}`)
+    .find('[data-label="Cluster"]')
+    .contains(cluster);
+});
+
+Then(
+  'user does not see the generated {string} objects located in the {string} cluster',
+  (svc: string, cluster: string) => {
+    cy.getBySel(`VirtualItem_Cluster${cluster}_Nsbookinfo_DestinationRule_${svc}`).should('not.exist');
+    cy.getBySel(`VirtualItem_Cluster${cluster}_Nsbookinfo_VirtualService_${svc}`).should('not.exist');
+  }
+);
+
+Then(
+  'the {string} {string} should be listed in {string} {string} namespace',
+  (type: string, svc: string, cluster: string, ns: string) => {
+    cy.getBySel(`VirtualItem_Cluster${cluster}_Ns${ns}_${type}_${svc}`)
+      .find('[data-label="Cluster"]')
+      .contains(cluster);
+  }
+);
+
+When('user sees the {string} wizard', (title: string) => {
+  cy.get('.pf-v6-c-modal-box')
+    .should('be.visible')
+    .find('.pf-v6-c-modal-box__title-text')
+    .should('contain.text', title);
+});
+
+When('user clicks in the {string} tab', (tab: string) => {
+  cy.get(`button[data-test="${tab}"]`).click();
+});
+
+When('user clicks in the {string} request matching dropdown', (select: string) => {
+  cy.get('button[data-test="requestmatching-header-toggle"]').click();
+
+  cy.get(`li[data-test="requestmatching-header-${select}"]`).find('button').click();
+});
+
+When('user clicks in the {string} request filtering dropdown', (select: string) => {
+  cy.get('button[data-test="filtering-type-toggle"]').click();
+
+  cy.get(`li[data-test="filtering-type-${select}"]`).find('button').click();
+});
+
+When('user types {string} in the matching header input', (header: string) => {
+  cy.get('input[id="header-name-id"]').type(header);
+});
+
+When('user types {string} in the filtering header input', (header: string) => {
+  cy.get('input[id="filter-header-name-id"]').type(header);
+});
+
+When('user clicks in the {string} match value dropdown', (value: string) => {
+  cy.get('button[data-test="requestmatching-match-toggle"]').click();
+
+  cy.get(`li[data-test="requestmatching-match-${value}"]`).find('button').click();
+});
+
+When('user types {string} in the match value input', (value: string) => {
+  cy.get('input[id="match-value-id"]').type(value);
+});
+
+When('user adds a match', () => {
+  cy.get('button[data-test="add-match"]').click();
+});
+
+When('user adds a filter', () => {
+  cy.get('button[data-test="add-filter"]').click();
+});
+
+When('user types {string} traffic weight in the {string} workload', (weight: string, workload: string) => {
+  cy.get(`input[data-test="input-slider-${workload}"]`).type(weight, { force: true });
+});
+
+When('user adds a route', () => {
+  cy.get('button[data-test="add-route"]').click();
+});
+
+When('user clicks in {string} matching selected', (match: string) => {
+  cy.get(`span[data-test="${match}"]`)
+    .children()
+    .first() // div wrapper
+    .children()
+    .first() // button
+    .click();
+});
+
+When('user previews the configuration', () => {
+  cy.get('button[data-test="preview"]').click();
+});
+
+When('user creates the configuration', () => {
+  cy.get('button[data-test="create"]').click();
+
+  cy.get('button[data-test="confirm-create"]').click();
+
+  it('spinner should disappear', { retries: 3 }, () => {
+    cy.get('#loading_kiali_spinner').should('not.exist');
+  });
+});
+
+When('user updates the configuration', () => {
+  cy.get('button[data-test="update"]').click();
+
+  cy.get('button[data-test="confirm-update"]').click();
+
+  it('spinner should disappear', { retries: 3 }, () => {
+    cy.get('#loading_kiali_spinner').should('not.exist');
+  });
+});
+
+When('user confirms delete the configuration', () => {
+  cy.get('button[data-test="confirm-delete"]').click();
+
+  it('spinner should disappear', { retries: 3 }, () => {
+    cy.get('#loading_kiali_spinner').should('not.exist');
+  });
+});
+
+Then('user sees the {string} {string} {string} reference', (namespace: string, name: string, type: string) => {
+  cy.get(`[data-test="${type}-${namespace}-${name}"]`);
+});
+
+When('user clicks in the {string} {string} {string} reference', (namespace: string, name: string, type: string) => {
+  cy.get(`[data-test="${type}-${namespace}-${name}"]`).click();
+
+  let expectedURl = '';
+
+  switch (type) {
+    case 'destinationrule':
+      expectedURl = `/namespaces/${namespace}/istio/networking.istio.io/v1/DestinationRule/${name}`;
+      break;
+    case 'service':
+      expectedURl = `/namespaces/${namespace}/services/${name}`;
+      break;
+    case 'virtualservice':
+      expectedURl = `/namespaces/${namespace}/istio/networking.istio.io/v1/VirtualService/${name}`;
+      break;
+  }
+
+  cy.location('pathname').should('include', expectedURl);
+});
+
+Then('user sees the {string} regex in the editor', (regexContent: string) => {
+  const re = new RegExp(regexContent);
+
+  cy.get('[data-test="editor-preview"], [data-test="istio-config-editor"]', { timeout: 60000 }).should('exist');
+
+  cy.window({ timeout: 60000 }).should(win => {
+    const monaco = (win as any).monaco;
+    expect(monaco, 'Monaco global should be available').to.exist;
+
+    const editors = monaco.editor.getEditors();
+    expect(editors.length, 'Monaco should have at least one editor').to.be.greaterThan(0);
+
+    const text = editors
+      .map((ed: any) => {
+        try {
+          return ed.getValue();
+        } catch {
+          return '';
+        }
+      })
+      .find((v: string) => re.test(v));
+    expect(text, `An editor should match regex "${regexContent}"`).to.exist;
+  });
+});
+
+When('user clicks on Advanced Options', () => {
+  // In PatternFly 6, ExpandableSection doesn't use toggleId as button ID anymore
+  // Find the button by its text content instead
+  cy.contains('button', 'Show advanced options').should('be.visible').click();
+});
+
+When('user clicks on Add Gateway', () => {
+  cy.get('input[id="advanced-gwSwitch"]').next().click();
+});
+
+When('user selects Create Gateway', () => {
+  cy.get('input[id="createGateway"]').click();
+});

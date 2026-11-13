@@ -1,0 +1,37 @@
+package references
+
+import (
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+
+	"github.com/kiali/kiali/config"
+	"github.com/kiali/kiali/kubernetes"
+	"github.com/kiali/kiali/models"
+	"github.com/kiali/kiali/tests/data"
+)
+
+func prepareTestForWorkloadEntry(name string) models.IstioReferences {
+	weReferences := WorkloadEntryReferences{
+		WorkloadGroups:  data.CreateWorkloadGroups(*config.Get()),
+		WorkloadEntries: data.CreateWorkloadEntries(*config.Get()),
+	}
+	return *weReferences.References()[models.IstioReferenceKey{ObjectGVK: kubernetes.WorkloadEntries, Namespace: "Namespace", Name: name}]
+}
+
+func TestWorkloadEntryReferences(t *testing.T) {
+	assert := assert.New(t)
+	conf := config.NewConfig()
+	conf.IstioLabels.AppLabelName = "app"
+	conf.IstioLabels.VersionLabelName = "version"
+	config.Set(conf)
+
+	// Setup mocks
+	references := prepareTestForWorkloadEntry("ratings-vm")
+
+	// Check WG references
+	assert.Len(references.ObjectReferences, 1)
+	assert.Equal(references.ObjectReferences[0].Name, "ratings-vm")
+	assert.Equal(references.ObjectReferences[0].Namespace, "Namespace")
+	assert.Equal(references.ObjectReferences[0].ObjectGVK.String(), kubernetes.WorkloadGroups.String())
+}

@@ -1,0 +1,82 @@
+import * as React from 'react';
+import type { WorkloadWizardProps, WorkloadWizardState } from './WizardActions';
+import { WIZARD_TITLES } from './WizardActions';
+import { Button, ButtonVariant, Modal, ModalBody, ModalFooter, ModalHeader } from '@patternfly/react-core';
+import { t } from 'utils/I18nUtils';
+
+const workloadWizardModalTitleId = 'workload-wizard-modal-title';
+
+// NOTE: This class is not used but I will keep it in the repo as skeleton as we'll add again WorkloadWizards for other
+export class WorkloadWizard extends React.Component<WorkloadWizardProps, WorkloadWizardState> {
+  constructor(props: WorkloadWizardProps) {
+    super(props);
+    this.state = {
+      showWizard: false,
+      valid: {}
+    };
+  }
+
+  componentDidUpdate(prevProps: WorkloadWizardProps): void {
+    if (prevProps.show !== this.props.show) {
+      this.setState({
+        showWizard: this.props.show
+      });
+    }
+  }
+
+  onClose = (changed: boolean): void => {
+    this.setState(
+      {
+        showWizard: false,
+        valid: {}
+      },
+      () => this.props.onClose(changed)
+    );
+  };
+
+  onCreateUpdate = (): void => {
+    switch (this.props.type) {
+      // No wizard types implemented yet — this class is kept as a skeleton (see comment at top of file)
+      default:
+        break;
+    }
+  };
+
+  isValid = (_state: WorkloadWizardState): boolean => {
+    return true;
+  };
+
+  render(): React.ReactElement {
+    return (
+      <>
+        <Modal
+          aria-labelledby={workloadWizardModalTitleId}
+          width={'75%'}
+          isOpen={this.state.showWizard}
+          onClose={() => this.onClose(false)}
+        >
+          <ModalHeader
+            labelId={workloadWizardModalTitleId}
+            title={this.props.type.length > 0 ? WIZARD_TITLES[this.props.type].modalTitle : ''}
+          />
+          <ModalBody>
+            <>{t('Workload Wizard Skeleton')}</>
+          </ModalBody>
+          <ModalFooter>
+            <Button
+              isDisabled={!this.isValid(this.state)}
+              key="confirm"
+              variant={ButtonVariant.primary}
+              onClick={this.onCreateUpdate}
+            >
+              {t('Create')}
+            </Button>
+            <Button key="cancel" variant={ButtonVariant.secondary} onClick={() => this.onClose(false)}>
+              {t('Cancel')}
+            </Button>
+          </ModalFooter>
+        </Modal>
+      </>
+    );
+  }
+}

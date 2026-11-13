@@ -1,18 +1,23 @@
 package checkers
 
 import (
-	"github.com/kiali/kiali/business/checkers/virtual_services"
+	networking_v1 "istio.io/client-go/pkg/apis/networking/v1"
+
+	"github.com/kiali/kiali/business/checkers/common"
+	"github.com/kiali/kiali/business/checkers/virtualservices"
+	"github.com/kiali/kiali/config"
 	"github.com/kiali/kiali/kubernetes"
 	"github.com/kiali/kiali/models"
 )
 
-const VirtualCheckerType = "virtualservice"
-
 type VirtualServiceChecker struct {
-	Namespace        string
+	Cluster          string
+	Conf             *config.Config
+	DestinationRules []*networking_v1.DestinationRule
+	IdentityDomain   string
+	ImportScope      common.ImportScope
 	Namespaces       models.Namespaces
-	DestinationRules []kubernetes.IstioObject
-	VirtualServices  []kubernetes.IstioObject
+	VirtualServices  []*networking_v1.VirtualService
 }
 
 // An Object Checker runs all checkers for an specific object type (i.e.: pod, route rule,...)
@@ -32,8 +37,12 @@ func (in VirtualServiceChecker) Check() models.IstioValidations {
 func (in VirtualServiceChecker) runIndividualChecks() models.IstioValidations {
 	validations := models.IstioValidations{}
 
+	nsNames := in.Namespaces.GetNames()
+	// Subset presence (KIA1107) only considers Sidecar-imported DestinationRules.
+	conflictDRs := common.FilterDestinationRulesByImport(in.DestinationRules, in.ImportScope)
+	drSubsets := in.prepareSubsetMap(conflictDRs, nsNames)
 	for _, virtualService := range in.VirtualServices {
-		validations.MergeValidations(in.runChecks(virtualService))
+		validations.MergeValidations(in.runChecks(virtualService, nsNames, drSubsets))
 	}
 
 	return validations
@@ -43,8 +52,10 @@ func (in VirtualServiceChecker) runIndividualChecks() models.IstioValidations {
 func (in VirtualServiceChecker) runGroupChecks() models.IstioValidations {
 	validations := models.IstioValidations{}
 
+	// Multi-match (KIA1106) only considers Sidecar-imported VirtualServices.
+	conflictVSs := common.FilterVirtualServicesByImport(in.VirtualServices, in.ImportScope)
 	enabledCheckers := []GroupChecker{
-		virtual_services.SingleHostChecker{Namespace: in.Namespace, Namespaces: in.Namespaces, VirtualServices: in.VirtualServices},
+		virtualservices.SingleHostChecker{Cluster: in.Cluster, IdentityDomain: in.IdentityDomain, Namespaces: in.Namespaces.GetNames(), VirtualServices: conflictVSs},
 	}
 
 	for _, checker := range enabledCheckers {
@@ -55,13 +66,19 @@ func (in VirtualServiceChecker) runGroupChecks() models.IstioValidations {
 }
 
 // runChecks runs all the individual checks for a single virtual service and appends the result into validations.
-func (in VirtualServiceChecker) runChecks(virtualService kubernetes.IstioObject) models.IstioValidations {
-	virtualServiceName := virtualService.GetObjectMeta().Name
-	key, rrValidation := EmptyValidValidation(virtualServiceName, virtualService.GetObjectMeta().Namespace, VirtualCheckerType)
+func (in VirtualServiceChecker) runChecks(virtualService *networking_v1.VirtualService, nsNames []string, drSubsets models.DestinationRuleSubsets) models.IstioValidations {
+	virtualServiceName := virtualService.Name
+	key, rrValidation := EmptyValidValidation(virtualServiceName, virtualService.Namespace, kubernetes.VirtualServices, in.Cluster)
 
 	enabledCheckers := []Checker{
-		virtual_services.RouteChecker{Route: virtualService},
-		virtual_services.SubsetPresenceChecker{Namespace: in.Namespace, Namespaces: in.Namespaces.GetNames(), DestinationRules: in.DestinationRules, VirtualService: virtualService},
+		virtualservices.RouteChecker{IdentityDomain: in.IdentityDomain, VirtualService: virtualService, Namespaces: nsNames},
+	}
+	// Subset presence only applies when at least one VS host is imported by Sidecar.
+	if virtualServiceImported(virtualService, in.ImportScope) {
+		enabledCheckers = append(enabledCheckers, virtualservices.SubsetPresenceChecker{DRSubsets: drSubsets, IdentityDomain: in.IdentityDomain, Namespaces: nsNames, VirtualService: virtualService})
+	}
+	if !in.Namespaces.IsNamespaceAmbient(virtualService.Namespace, in.Cluster) {
+		enabledCheckers = append(enabledCheckers, common.ExportToNamespaceChecker{ExportTo: virtualService.Spec.ExportTo, Namespaces: nsNames})
 	}
 
 	for _, checker := range enabledCheckers {
@@ -71,4 +88,37 @@ func (in VirtualServiceChecker) runChecks(virtualService kubernetes.IstioObject)
 	}
 
 	return models.IstioValidations{key: rrValidation}
+}
+
+func virtualServiceImported(vs *networking_v1.VirtualService, scope common.ImportScope) bool {
+	if !scope.IsLimited() {
+		return true
+	}
+	for _, h := range vs.Spec.Hosts {
+		if scope.ImportsHost(h, vs.Namespace) {
+			return true
+		}
+	}
+	return false
+}
+
+func (in VirtualServiceChecker) prepareSubsetMap(destinationRules []*networking_v1.DestinationRule, namespaces []string) models.DestinationRuleSubsets {
+	subsetMap := make(models.DestinationRuleSubsets)
+
+	for _, dr := range destinationRules {
+		host := dr.Spec.Host
+		drHost := kubernetes.GetHost(host, dr.Namespace, namespaces, in.IdentityDomain)
+
+		if _, exists := subsetMap[drHost.String()]; !exists {
+			subsetMap[drHost.String()] = make(map[string]kubernetes.Host)
+		}
+
+		for _, subset := range dr.Spec.Subsets {
+			if subset != nil {
+				subsetMap[drHost.String()][subset.Name] = drHost
+			}
+		}
+	}
+
+	return subsetMap
 }

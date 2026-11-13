@@ -1,438 +1,282 @@
 package kubernetes
 
 import (
-	apps_v1 "k8s.io/api/apps/v1"
-	core_v1 "k8s.io/api/core/v1"
-	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
+	networking_v1 "istio.io/client-go/pkg/apis/networking/v1"
+	security_v1 "istio.io/client-go/pkg/apis/security/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 )
 
 const (
+	// Networking
+	DestinationRuleType  = "DestinationRule"
+	EnvoyFilterType      = "EnvoyFilter"
+	GatewayType          = "Gateway"
+	ServiceEntryType     = "ServiceEntry"
+	SidecarType          = "Sidecar"
+	TelemetryType        = "Telemetry"
+	TrafficExtensionType = "TrafficExtension"
+	VirtualServiceType   = "VirtualService"
+	WasmPluginType       = "WasmPlugin"
+	WorkloadEntryType    = "WorkloadEntry"
+	WorkloadGroupType    = "WorkloadGroup"
+
+	// K8s Networking
+	K8sGatewayType        = "Gateway"
+	K8sGatewayClassType   = "GatewayClass"
+	K8sGRPCRouteType      = "GRPCRoute"
+	K8sHTTPRouteType      = "HTTPRoute"
+	K8sInferencePoolsType = "InferencePool"
+	K8sReferenceGrantType = "ReferenceGrant"
+	K8sTCPRouteType       = "TCPRoute"
+	K8sTLSRouteType       = "TLSRoute"
+	K8sUDPRouteType       = "UDPRoute"
+
+	// Authorization PeerAuthentications
+	AuthorizationPoliciesType = "AuthorizationPolicy"
+
+	// Peer Authentications
+	PeerAuthenticationsType = "PeerAuthentication"
+
+	// Request Authentications
+	RequestAuthenticationsType = "RequestAuthentication"
+
 	// Kubernetes Controllers
 	ConfigMapType             = "ConfigMap"
 	CronJobType               = "CronJob"
 	DaemonSetType             = "DaemonSet"
 	DeploymentType            = "Deployment"
 	DeploymentConfigType      = "DeploymentConfig"
-	EndpointsType             = "Endpoints"
 	JobType                   = "Job"
 	PodType                   = "Pod"
 	ReplicationControllerType = "ReplicationController"
 	ReplicaSetType            = "ReplicaSet"
 	ServiceType               = "Service"
 	StatefulSetType           = "StatefulSet"
-
-	// Networking
-
-	DestinationRules        = "destinationrules"
-	DestinationRuleType     = "DestinationRule"
-	DestinationRuleTypeList = "DestinationRuleList"
-
-	Gateways        = "gateways"
-	GatewayType     = "Gateway"
-	GatewayTypeList = "GatewayList"
-
-	EnvoyFilters        = "envoyfilters"
-	EnvoyFilterType     = "EnvoyFilter"
-	EnvoyFilterTypeList = "EnvoyFilterList"
-
-	Sidecars        = "sidecars"
-	SidecarType     = "Sidecar"
-	SidecarTypeList = "SidecarList"
-
-	ServiceEntries       = "serviceentries"
-	ServiceEntryType     = "ServiceEntry"
-	ServiceentryTypeList = "ServiceEntryList"
-
-	VirtualServices        = "virtualservices"
-	VirtualServiceType     = "VirtualService"
-	VirtualServiceTypeList = "VirtualServiceList"
-
-	WorkloadEntries       = "workloadentries"
-	WorkloadEntryType     = "WorkloadEntry"
-	WorkloadEntryTypeList = "WorkloadEntryList"
-
-	// Authorization PeerAuthentications
-	AuthorizationPolicies         = "authorizationpolicies"
-	AuthorizationPoliciesType     = "AuthorizationPolicy"
-	AuthorizationPoliciesTypeList = "AuthorizationPolicyList"
-
-	// Peer Authentications
-	PeerAuthentications         = "peerauthentications"
-	PeerAuthenticationsType     = "PeerAuthentication"
-	PeerAuthenticationsTypeList = "PeerAuthenticationList"
-
-	// Request Authentications
-	RequestAuthentications         = "requestauthentications"
-	RequestAuthenticationsType     = "RequestAuthentication"
-	RequestAuthenticationsTypeList = "RequestAuthenticationList"
-
-	// Iter8 types
-
-	Iter8Experiments        = "experiments"
-	Iter8ExperimentType     = "Experiment"
-	Iter8ExperimentTypeList = "ExperimentList"
-	Iter8ConfigMap          = "iter8config-metrics"
 )
 
 var (
-	NetworkingGroupVersion = schema.GroupVersion{
+	// Networking
+	DestinationRules  = NetworkingGroupVersionV1.WithKind(DestinationRuleType)
+	EnvoyFilters      = NetworkingGroupVersionV1Alpha3.WithKind(EnvoyFilterType)
+	Gateways          = NetworkingGroupVersionV1.WithKind(GatewayType)
+	ServiceEntries    = NetworkingGroupVersionV1.WithKind(ServiceEntryType)
+	Sidecars          = NetworkingGroupVersionV1.WithKind(SidecarType)
+	Telemetries       = TelemetryGroupV1.WithKind(TelemetryType)
+	TrafficExtensions = ExtensionGroupVersionV1Alpha1.WithKind(TrafficExtensionType)
+	VirtualServices   = NetworkingGroupVersionV1.WithKind(VirtualServiceType)
+	WasmPlugins       = ExtensionGroupVersionV1Alpha1.WithKind(WasmPluginType)
+	WorkloadEntries   = NetworkingGroupVersionV1.WithKind(WorkloadEntryType)
+	WorkloadGroups    = NetworkingGroupVersionV1.WithKind(WorkloadGroupType)
+
+	// K8s Networking
+	K8sGateways        = K8sNetworkingGroupVersionV1.WithKind(K8sGatewayType)
+	K8sGatewayClasses  = K8sNetworkingGroupVersionV1.WithKind(K8sGatewayClassType)
+	K8sGRPCRoutes      = K8sNetworkingGroupVersionV1.WithKind(K8sGRPCRouteType)
+	K8sHTTPRoutes      = K8sNetworkingGroupVersionV1.WithKind(K8sHTTPRouteType)
+	K8sInferencePools  = K8sInferenceGroupVersionV1.WithKind(K8sInferencePoolsType)
+	K8sReferenceGrants = K8sNetworkingGroupVersionV1Beta1.WithKind(K8sReferenceGrantType)
+	K8sTCPRoutes       = K8sNetworkingGroupVersionV1.WithKind(K8sTCPRouteType)
+	K8sTLSRoutes       = K8sNetworkingGroupVersionV1.WithKind(K8sTLSRouteType)
+	K8sUDPRoutes       = K8sNetworkingGroupVersionV1.WithKind(K8sUDPRouteType)
+
+	// Authorization PeerAuthentications
+	AuthorizationPolicies = SecurityGroupVersionV1.WithKind(AuthorizationPoliciesType)
+
+	// Peer Authentications
+	PeerAuthentications = SecurityGroupVersionV1.WithKind(PeerAuthenticationsType)
+
+	// Request Authentications
+	RequestAuthentications = SecurityGroupVersionV1.WithKind(RequestAuthenticationsType)
+
+	// Kubernetes Controllers
+	ConfigMaps             = CoreGroupVersionV1.WithKind(ConfigMapType)
+	CronJobs               = BatchGroupVersionV1.WithKind(CronJobType)
+	DaemonSets             = AppsGroupVersionV1.WithKind(DaemonSetType)
+	Deployments            = AppsGroupVersionV1.WithKind(DeploymentType)
+	DeploymentConfigs      = AppsOpenShiftGroupVersionV1.WithKind(DeploymentConfigType)
+	Jobs                   = BatchGroupVersionV1.WithKind(JobType)
+	Pods                   = CoreGroupVersionV1.WithKind(PodType)
+	ReplicationControllers = CoreGroupVersionV1.WithKind(ReplicationControllerType)
+	ReplicaSets            = AppsGroupVersionV1.WithKind(ReplicaSetType)
+	Services               = CoreGroupVersionV1.WithKind(ServiceType)
+	StatefulSets           = AppsGroupVersionV1.WithKind(StatefulSetType)
+
+	// Group Versions
+	CoreGroupVersionV1 = schema.GroupVersion{
+		Group:   "",
+		Version: "v1",
+	}
+
+	BatchGroupVersionV1 = schema.GroupVersion{
+		Group:   "batch",
+		Version: "v1",
+	}
+
+	AppsGroupVersionV1 = schema.GroupVersion{
+		Group:   "apps",
+		Version: "v1",
+	}
+
+	AppsOpenShiftGroupVersionV1 = schema.GroupVersion{
+		Group:   "apps.openshift.io",
+		Version: "v1",
+	}
+
+	NetworkingGroupVersionV1Alpha3 = schema.GroupVersion{
 		Group:   "networking.istio.io",
 		Version: "v1alpha3",
 	}
-	ApiNetworkingVersion = NetworkingGroupVersion.Group + "/" + NetworkingGroupVersion.Version
 
-	SecurityGroupVersion = schema.GroupVersion{
-		Group:   "security.istio.io",
+	NetworkingGroupVersionV1 = schema.GroupVersion{
+		Group:   "networking.istio.io",
+		Version: "v1",
+	}
+
+	K8sInferenceGroupVersionV1 = schema.GroupVersion{
+		Group:   "inference.networking.k8s.io",
+		Version: "v1",
+	}
+
+	K8sNetworkingGroupVersionV1Beta1 = schema.GroupVersion{
+		Group:   "gateway.networking.k8s.io",
 		Version: "v1beta1",
 	}
-	ApiSecurityVersion = SecurityGroupVersion.Group + "/" + SecurityGroupVersion.Version
 
-	// We will add a new extesion API in a similar way as we added the Kubernetes + Istio APIs
-	Iter8GroupVersion = schema.GroupVersion{
-		Group:   "iter8.tools",
-		Version: "v1alpha2",
-	}
-	ApiIter8Version = Iter8GroupVersion.Group + "/" + Iter8GroupVersion.Version
-
-	networkingTypes = []struct {
-		objectKind     string
-		collectionKind string
-	}{
-		{
-			objectKind:     GatewayType,
-			collectionKind: GatewayTypeList,
-		},
-		{
-			objectKind:     VirtualServiceType,
-			collectionKind: VirtualServiceTypeList,
-		},
-		{
-			objectKind:     DestinationRuleType,
-			collectionKind: DestinationRuleTypeList,
-		},
-		{
-			objectKind:     ServiceEntryType,
-			collectionKind: ServiceentryTypeList,
-		},
-		{
-			objectKind:     SidecarType,
-			collectionKind: SidecarTypeList,
-		},
-		{
-			objectKind:     WorkloadEntryType,
-			collectionKind: WorkloadEntryTypeList,
-		},
-		{
-			objectKind:     EnvoyFilterType,
-			collectionKind: EnvoyFilterTypeList,
-		},
+	K8sNetworkingGroupVersionV1 = schema.GroupVersion{
+		Group:   "gateway.networking.k8s.io",
+		Version: "v1",
 	}
 
-	securityTypes = []struct {
-		objectKind     string
-		collectionKind string
-	}{
-		{
-			objectKind:     PeerAuthenticationsType,
-			collectionKind: PeerAuthenticationsTypeList,
-		},
-		{
-			objectKind:     AuthorizationPoliciesType,
-			collectionKind: AuthorizationPoliciesTypeList,
-		},
-		{
-			objectKind:     RequestAuthenticationsType,
-			collectionKind: RequestAuthenticationsTypeList,
-		},
+	SecurityGroupVersionV1 = schema.GroupVersion{
+		Group:   "security.istio.io",
+		Version: "v1",
 	}
 
-	iter8Types = []struct {
-		objectKind     string
-		collectionKind string
-	}{
-		{
-			objectKind:     Iter8ExperimentType,
-			collectionKind: Iter8ExperimentTypeList,
-		},
+	ExtensionGroupVersionV1Alpha1 = schema.GroupVersion{
+		Group:   "extensions.istio.io",
+		Version: "v1alpha1",
 	}
 
-	// A map to get the plural for a Istio type using the singlar type
-	PluralType = map[string]string{
-		// Networking
-		Gateways:         GatewayType,
-		VirtualServices:  VirtualServiceType,
-		DestinationRules: DestinationRuleType,
-		ServiceEntries:   ServiceEntryType,
-		Sidecars:         SidecarType,
-		WorkloadEntries:  WorkloadEntryType,
-		EnvoyFilters:     EnvoyFilterType,
-
-		// Security
-		AuthorizationPolicies:  AuthorizationPoliciesType,
-		PeerAuthentications:    PeerAuthenticationsType,
-		RequestAuthentications: RequestAuthenticationsType,
-
-		// Iter8
-		Iter8Experiments: Iter8ExperimentType,
+	TelemetryGroupV1 = schema.GroupVersion{
+		Group:   "telemetry.istio.io",
+		Version: "v1",
 	}
 
-	ResourceTypesToAPI = map[string]string{
-		DestinationRules:       NetworkingGroupVersion.Group,
-		VirtualServices:        NetworkingGroupVersion.Group,
-		ServiceEntries:         NetworkingGroupVersion.Group,
-		Gateways:               NetworkingGroupVersion.Group,
-		Sidecars:               NetworkingGroupVersion.Group,
-		WorkloadEntries:        NetworkingGroupVersion.Group,
-		EnvoyFilters:           NetworkingGroupVersion.Group,
-		AuthorizationPolicies:  SecurityGroupVersion.Group,
-		PeerAuthentications:    SecurityGroupVersion.Group,
-		RequestAuthentications: SecurityGroupVersion.Group,
-		// Extensions
-		Iter8Experiments: Iter8GroupVersion.Group,
+	// PluralNames maps Kind to the lowercase plural resource name used in RBAC.
+	// Kubernetes SSAR ResourceAttributes.Resource requires the plural form.
+	// Roles may name individual resources (e.g. the OLM-generated ClusterRoles
+	// aggregated into OpenShift's admin/edit), so every Kind that Kiali checks
+	// permissions for must map to the plural name its RBAC rules use.
+	PluralNames = map[string]string{
+		AuthorizationPoliciesType:  "authorizationpolicies",
+		DestinationRuleType:        "destinationrules",
+		EnvoyFilterType:            "envoyfilters",
+		K8sGatewayType:             "gateways", // also covers the Istio Gateway kind (same Kind string)
+		K8sGatewayClassType:        "gatewayclasses",
+		K8sGRPCRouteType:           "grpcroutes",
+		K8sHTTPRouteType:           "httproutes",
+		K8sInferencePoolsType:      "inferencepools",
+		K8sReferenceGrantType:      "referencegrants",
+		K8sTCPRouteType:            "tcproutes",
+		K8sTLSRouteType:            "tlsroutes",
+		K8sUDPRouteType:            "udproutes",
+		PeerAuthenticationsType:    "peerauthentications",
+		RequestAuthenticationsType: "requestauthentications",
+		ServiceEntryType:           "serviceentries",
+		SidecarType:                "sidecars",
+		TelemetryType:              "telemetries",
+		TrafficExtensionType:       "trafficextensions",
+		VirtualServiceType:         "virtualservices",
+		WasmPluginType:             "wasmplugins",
+		WorkloadEntryType:          "workloadentries",
+		WorkloadGroupType:          "workloadgroups",
 	}
 
-	ApiToVersion = map[string]string{
-		NetworkingGroupVersion.Group: ApiNetworkingVersion,
-		SecurityGroupVersion.Group:   ApiSecurityVersion,
+	// Resources
+	ResourceTypesToAPI = map[string]schema.GroupVersionKind{
+		DestinationRules.String():  DestinationRules,
+		EnvoyFilters.String():      EnvoyFilters,
+		Gateways.String():          Gateways,
+		ServiceEntries.String():    ServiceEntries,
+		Sidecars.String():          Sidecars,
+		Telemetries.String():       Telemetries,
+		TrafficExtensions.String(): TrafficExtensions,
+		VirtualServices.String():   VirtualServices,
+		WasmPlugins.String():       WasmPlugins,
+		WorkloadEntries.String():   WorkloadEntries,
+		WorkloadGroups.String():    WorkloadGroups,
+
+		K8sGateways.String():        K8sGateways,
+		K8sGRPCRoutes.String():      K8sGRPCRoutes,
+		K8sHTTPRoutes.String():      K8sHTTPRoutes,
+		K8sInferencePools.String():  K8sInferencePools,
+		K8sReferenceGrants.String(): K8sReferenceGrants,
+		K8sTCPRoutes.String():       K8sTCPRoutes,
+		K8sTLSRoutes.String():       K8sTLSRoutes,
+		K8sUDPRoutes.String():       K8sUDPRoutes,
+
+		AuthorizationPolicies.String():  AuthorizationPolicies,
+		PeerAuthentications.String():    PeerAuthentications,
+		RequestAuthentications.String(): RequestAuthentications,
 	}
 )
 
-// IstioObject is a k8s wrapper interface for config objects.
-// Taken from istio.io
-type IstioObject interface {
-	runtime.Object
-	GetSpec() map[string]interface{}
-	SetSpec(map[string]interface{})
-	GetStatus() map[string]interface{}
-	SetStatus(map[string]interface{})
-	GetTypeMeta() meta_v1.TypeMeta
-	SetTypeMeta(meta_v1.TypeMeta)
-	GetObjectMeta() meta_v1.ObjectMeta
-	SetObjectMeta(meta_v1.ObjectMeta)
-	DeepCopyIstioObject() IstioObject
-	HasWorkloadSelectorLabels() bool
-	HasMatchLabelsSelector() bool
-}
-
-// IstioObjectList is a k8s wrapper interface for list config objects.
-// Taken from istio.io
-type IstioObjectList interface {
-	runtime.Object
-	GetItems() []IstioObject
-}
-
-type IstioMeshConfig struct {
-	DisableMixerHttpReports bool  `yaml:"disableMixerHttpReports,omitempty"`
-	EnableAutoMtls          *bool `yaml:"enableAutoMtls,omitempty"`
-}
-
-// ServiceList holds list of services, pods and deployments
-type ServiceList struct {
-	Services    *core_v1.ServiceList
-	Pods        *core_v1.PodList
-	Deployments *apps_v1.DeploymentList
-}
-
-// ServiceDetails is a wrapper to group full Service description, Endpoints and Pods.
-// Used to fetch all details in a single operation instead to invoke individual APIs per each group.
-type ServiceDetails struct {
-	Service     *core_v1.Service        `json:"service"`
-	Endpoints   *core_v1.Endpoints      `json:"endpoints"`
-	Deployments *apps_v1.DeploymentList `json:"deployments"`
-	Pods        []core_v1.Pod           `json:"pods"`
-}
-
-// IstioDetails is a wrapper to group all Istio objects related to a Service.
-// Used to fetch all Istio information in a single operation instead to invoke individual APIs per each group.
-type IstioDetails struct {
-	VirtualServices        []IstioObject `json:"virtualservices"`
-	DestinationRules       []IstioObject `json:"destinationrules"`
-	ServiceEntries         []IstioObject `json:"serviceentries"`
-	Gateways               []IstioObject `json:"gateways"`
-	Sidecars               []IstioObject `json:"sidecars"`
-	RequestAuthentications []IstioObject `json:"requestauthentications"`
+// PluralResourceName returns the RBAC plural resource name for a Kind.
+// Uses the PluralNames map; falls back to the Kind itself for unlisted types,
+// which only matches RBAC rules granting resources: ["*"].
+func PluralResourceName(kind string) string {
+	if plural, ok := PluralNames[kind]; ok {
+		return plural
+	}
+	return kind
 }
 
 // MTLSDetails is a wrapper to group all Istio objects related to non-local mTLS configurations
 type MTLSDetails struct {
-	DestinationRules        []IstioObject `json:"destinationrules"`
-	MeshPeerAuthentications []IstioObject `json:"meshpeerauthentications"`
-	PeerAuthentications     []IstioObject `json:"peerauthentications"`
-	EnabledAutoMtls         bool          `json:"enabledautomtls"`
+	DestinationRules        []*networking_v1.DestinationRule  `json:"destinationrules"`
+	MeshPeerAuthentications []*security_v1.PeerAuthentication `json:"meshpeerauthentications"`
+	PeerAuthentications     []*security_v1.PeerAuthentication `json:"peerauthentications"`
+	EnabledAutoMtls         bool                              `json:"enabledautomtls"`
 }
 
 // RBACDetails is a wrapper for objects related to Istio RBAC (Role Based Access Control)
 type RBACDetails struct {
-	AuthorizationPolicies []IstioObject `json:"authorizationpolicies"`
+	AuthorizationPolicies []*security_v1.AuthorizationPolicy `json:"authorizationpolicies"`
 }
 
-// GenericIstioObject is a type to test Istio types defined by Istio as a Kubernetes extension.
-type GenericIstioObject struct {
-	meta_v1.TypeMeta   `json:",inline" yaml:",inline"`
-	meta_v1.ObjectMeta `json:"metadata" yaml:"metadata"`
-	Spec               map[string]interface{} `json:"spec"`
-	Status             map[string]interface{} `json:"status"`
+type ProxyStatus struct {
+	Pilot string
+	SyncStatus
 }
 
-// GenericIstioObjectList is the generic Kubernetes API list wrapper
-type GenericIstioObjectList struct {
-	meta_v1.TypeMeta `json:",inline"`
-	meta_v1.ListMeta `json:"metadata"`
-	Items            []GenericIstioObject `json:"items"`
+// SyncStatus is the synchronization status between Pilot and a given Envoy
+type SyncStatus struct {
+	ClusterID     string `json:"cluster_id,omitempty"`
+	ProxyID       string `json:"proxy,omitempty"`
+	ProxyVersion  string `json:"proxy_version,omitempty"`
+	IstioVersion  string `json:"istio_version,omitempty"`
+	ClusterSent   string `json:"cluster_sent,omitempty"`
+	ClusterAcked  string `json:"cluster_acked,omitempty"`
+	ListenerSent  string `json:"listener_sent,omitempty"`
+	ListenerAcked string `json:"listener_acked,omitempty"`
+	RouteSent     string `json:"route_sent,omitempty"`
+	RouteAcked    string `json:"route_acked,omitempty"`
+	EndpointSent  string `json:"endpoint_sent,omitempty"`
+	EndpointAcked string `json:"endpoint_acked,omitempty"`
 }
 
-// GetSpec from a wrapper
-func (in *GenericIstioObject) GetSpec() map[string]interface{} {
-	return in.Spec
-}
-
-// SetSpec for a wrapper
-func (in *GenericIstioObject) SetSpec(spec map[string]interface{}) {
-	in.Spec = spec
-}
-
-// GetTypeMeta from a wrapper
-func (in *GenericIstioObject) GetTypeMeta() meta_v1.TypeMeta {
-	return in.TypeMeta
-}
-
-// SetObjectMeta for a wrapper
-func (in *GenericIstioObject) SetTypeMeta(typemeta meta_v1.TypeMeta) {
-	in.TypeMeta = typemeta
-}
-
-// GetObjectMeta from a wrapper
-func (in *GenericIstioObject) GetObjectMeta() meta_v1.ObjectMeta {
-	return in.ObjectMeta
-}
-
-// SetObjectMeta for a wrapper
-func (in *GenericIstioObject) SetObjectMeta(metadata meta_v1.ObjectMeta) {
-	in.ObjectMeta = metadata
-}
-
-// GetStatus from a wrapper
-func (in *GenericIstioObject) GetStatus() map[string]interface{} {
-	return in.Status
-}
-
-// SetStatus for a wrapper
-func (in *GenericIstioObject) SetStatus(status map[string]interface{}) {
-	in.Status = status
-}
-
-func (in *GenericIstioObject) HasWorkloadSelectorLabels() bool {
-	hwsl := false
-
-	if ws, found := in.GetSpec()["workloadSelector"]; found {
-		if wsCasted, ok := ws.(map[string]interface{}); ok {
-			if _, found := wsCasted["labels"]; found {
-				hwsl = true
-			}
-		}
+func GetPatchType(patchType string) types.PatchType {
+	switch patchType {
+	case "json":
+		return types.JSONPatchType
+	case "strategic":
+		return types.StrategicMergePatchType
+	case "apply":
+		return types.ApplyPatchType
+	case "merge":
+		return types.MergePatchType
+	default:
+		return types.MergePatchType
 	}
-
-	return hwsl
-}
-
-func (in *GenericIstioObject) HasMatchLabelsSelector() bool {
-	hwsl := false
-
-	if s, found := in.GetSpec()["selector"]; found {
-		if sCasted, ok := s.(map[string]interface{}); ok {
-			if ml, found := sCasted["matchLabels"]; found {
-				if mlCasted, ok := ml.(map[string]interface{}); ok {
-					if len(mlCasted) > 0 {
-						hwsl = true
-					}
-				}
-			}
-		}
-	}
-
-	return hwsl
-}
-
-// GetItems from a wrapper
-func (in *GenericIstioObjectList) GetItems() []IstioObject {
-	out := make([]IstioObject, len(in.Items))
-	for i := range in.Items {
-		out[i] = &in.Items[i]
-	}
-	return out
-}
-
-// DeepCopyInto is an autogenerated deepcopy function, copying the receiver, writing into out. in must be non-nil.
-func (in *GenericIstioObject) DeepCopyInto(out *GenericIstioObject) {
-	*out = *in
-	out.TypeMeta = in.TypeMeta
-	in.ObjectMeta.DeepCopyInto(&out.ObjectMeta)
-	out.Spec = in.Spec
-}
-
-// DeepCopy is an autogenerated deepcopy function, copying the receiver, creating a new GenericIstioObject.
-func (in *GenericIstioObject) DeepCopy() *GenericIstioObject {
-	if in == nil {
-		return nil
-	}
-	out := new(GenericIstioObject)
-	in.DeepCopyInto(out)
-	return out
-}
-
-// DeepCopyObject is an autogenerated deepcopy function, copying the receiver, creating a new runtime.Object.
-func (in *GenericIstioObject) DeepCopyObject() runtime.Object {
-	if c := in.DeepCopy(); c != nil {
-		return c
-	}
-	return nil
-}
-
-// DeepCopyIstioObject is an autogenerated deepcopy function, copying the receiver, creating a new IstioObject.
-func (in *GenericIstioObject) DeepCopyIstioObject() IstioObject {
-	if c := in.DeepCopy(); c != nil {
-		return c
-	}
-	return nil
-}
-
-// DeepCopyInto is an autogenerated deepcopy function, copying the receiver, writing into out. in must be non-nil.
-func (in *GenericIstioObjectList) DeepCopyInto(out *GenericIstioObjectList) {
-	*out = *in
-	out.TypeMeta = in.TypeMeta
-	out.ListMeta = in.ListMeta
-	if in.Items != nil {
-		in, out := &in.Items, &out.Items
-		*out = make([]GenericIstioObject, len(*in))
-		for i := range *in {
-			(*in)[i].DeepCopyInto(&(*out)[i])
-		}
-	}
-}
-
-// DeepCopy is an autogenerated deepcopy function, copying the receiver, creating a new GenericIstioObjectList.
-func (in *GenericIstioObjectList) DeepCopy() *GenericIstioObjectList {
-	if in == nil {
-		return nil
-	}
-	out := new(GenericIstioObjectList)
-	in.DeepCopyInto(out)
-	return out
-}
-
-// DeepCopyObject is an autogenerated deepcopy function, copying the receiver, creating a new runtime.Object.
-func (in *GenericIstioObjectList) DeepCopyObject() runtime.Object {
-	if c := in.DeepCopy(); c != nil {
-		return c
-	}
-	return nil
-}
-
-func (imc IstioMeshConfig) GetEnableAutoMtls() bool {
-	if imc.EnableAutoMtls == nil {
-		return true
-	}
-	return *imc.EnableAutoMtls
 }

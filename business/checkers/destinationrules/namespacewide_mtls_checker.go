@@ -1,12 +1,17 @@
 package destinationrules
 
 import (
+	networking_v1 "istio.io/client-go/pkg/apis/networking/v1"
+
+	"github.com/kiali/kiali/config"
 	"github.com/kiali/kiali/kubernetes"
 	"github.com/kiali/kiali/models"
 )
 
 type NamespaceWideMTLSChecker struct {
-	DestinationRule kubernetes.IstioObject
+	Conf            *config.Config
+	DestinationRule *networking_v1.DestinationRule
+	IdentityDomain  string
 	MTLSDetails     kubernetes.MTLSDetails
 }
 
@@ -14,7 +19,13 @@ func (m NamespaceWideMTLSChecker) Check() ([]*models.IstioCheck, bool) {
 	validations := make([]*models.IstioCheck, 0)
 
 	// if DestinationRule doesn't enable mTLS, stop validation with any check
-	if enabled, _ := kubernetes.DestinationRuleHasNamespaceWideMTLSEnabled(m.DestinationRule.GetObjectMeta().Namespace, m.DestinationRule); !enabled {
+	if enabled, _ := kubernetes.DestinationRuleHasNamespaceWideMTLSEnabled(m.DestinationRule.Namespace, m.DestinationRule, m.IdentityDomain); !enabled {
+		return validations, true
+	}
+
+	// With auto-mTLS, Istio encrypts without requiring an explicit PeerAuthentication
+	// (same escape hatch as KIA0501 / NamespaceMtlsChecker).
+	if m.MTLSDetails.EnabledAutoMtls {
 		return validations, true
 	}
 

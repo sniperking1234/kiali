@@ -1,0 +1,503 @@
+package tests
+
+import (
+	"context"
+	"path"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/wait"
+
+	"github.com/kiali/kiali/kubernetes"
+	"github.com/kiali/kiali/log"
+	"github.com/kiali/kiali/models"
+	"github.com/kiali/kiali/tests/integration/utils"
+	"github.com/kiali/kiali/tests/integration/utils/kiali"
+	"github.com/kiali/kiali/tools/cmd"
+)
+
+func TestDestinationRuleMultimatch(t *testing.T) {
+	require := require.New(t)
+	filePath := path.Join(cmd.KialiProjectRoot, kiali.ASSETS+"/bookinfo-destination-rule-multimatch.yaml")
+	defer utils.DeleteFile(filePath, kiali.BOOKINFO)
+	require.True(utils.ApplyFile(filePath, kiali.BOOKINFO))
+
+	config, err := getConfigDetails(kiali.BOOKINFO, "all.googleapis.com", kubernetes.DestinationRules, false, require)
+	require.NoError(err)
+	require.NotNil(config)
+	assertConfigDetailsValidations(*config, kiali.BOOKINFO, kubernetes.DestinationRules, "all.googleapis.com", "KIA0201", true, require)
+
+	config, err = getConfigDetails(kiali.BOOKINFO, "all.googleapis.com2", kubernetes.DestinationRules, false, require)
+	require.NoError(err)
+	require.NotNil(config)
+	assertConfigDetailsValidations(*config, kiali.BOOKINFO, kubernetes.DestinationRules, "all.googleapis.com2", "KIA0201", true, require)
+
+	configList, err := kiali.IstioConfigsList(kiali.BOOKINFO)
+
+	require.NoError(err)
+	assertConfigListValidations(*configList, kiali.BOOKINFO, kubernetes.DestinationRules, "all.googleapis.com", "KIA0201", true, require)
+	assertConfigListValidations(*configList, kiali.BOOKINFO, kubernetes.DestinationRules, "all.googleapis.com2", "KIA0201", true, require)
+}
+
+// TestDestinationRuleSidecarImportSkipsForeignMultimatch verifies issue #10124:
+// with Sidecar egress limited to ./* (+ control plane), DestinationRules for a
+// foreign host are not co-applied by local proxies, so KIA0201 must not fire.
+func TestDestinationRuleSidecarImportSkipsForeignMultimatch(t *testing.T) {
+	require := require.New(t)
+	filePath := path.Join(cmd.KialiProjectRoot, kiali.ASSETS+"/bookinfo-dr-sidecar-foreign-multimatch.yaml")
+	require.True(utils.ApplyFileWithCleanup(t, filePath, kiali.BOOKINFO))
+
+	config, err := getConfigDetails(kiali.BOOKINFO, "kiali-test-foreign-dr-a", kubernetes.DestinationRules, true, require)
+	require.NoError(err)
+	require.NotNil(config)
+	assertConfigDetailsHasNoCode(*config, "KIA0201", require)
+
+	config, err = getConfigDetails(kiali.BOOKINFO, "kiali-test-foreign-dr-b", kubernetes.DestinationRules, true, require)
+	require.NoError(err)
+	require.NotNil(config)
+	assertConfigDetailsHasNoCode(*config, "KIA0201", require)
+
+	configList, err := kiali.IstioConfigsList(kiali.BOOKINFO)
+	require.NoError(err)
+	assertConfigListHasNoCode(*configList, kiali.BOOKINFO, "kiali-test-foreign-dr-a", "KIA0201", require)
+	assertConfigListHasNoCode(*configList, kiali.BOOKINFO, "kiali-test-foreign-dr-b", "KIA0201", require)
+}
+
+// TestDestinationRuleSidecarImportKeepsImportedForeignMultimatch: when Sidecar
+// imports the foreign namespace (default/*), same-host DRs still get KIA0201.
+func TestDestinationRuleSidecarImportKeepsImportedForeignMultimatch(t *testing.T) {
+	require := require.New(t)
+	filePath := path.Join(cmd.KialiProjectRoot, kiali.ASSETS+"/bookinfo-dr-sidecar-imported-multimatch.yaml")
+	require.True(utils.ApplyFileWithCleanup(t, filePath, kiali.BOOKINFO))
+
+	// Assert code presence (not Valid/Checks[0]): other DR checks may also appear.
+	config, err := getConfigDetails(kiali.BOOKINFO, "kiali-test-imported-dr-a", kubernetes.DestinationRules, true, require)
+	require.NoError(err)
+	require.NotNil(config)
+	assertConfigDetailsHasCode(*config, "KIA0201", require)
+
+	config, err = getConfigDetails(kiali.BOOKINFO, "kiali-test-imported-dr-b", kubernetes.DestinationRules, true, require)
+	require.NoError(err)
+	require.NotNil(config)
+	assertConfigDetailsHasCode(*config, "KIA0201", require)
+}
+
+// TestVirtualServiceSidecarImportSkipsForeignMultimatch: Sidecar ./* means foreign-host
+// VirtualServices are not co-applied, so KIA1106 must not fire.
+func TestVirtualServiceSidecarImportSkipsForeignMultimatch(t *testing.T) {
+	require := require.New(t)
+	filePath := path.Join(cmd.KialiProjectRoot, kiali.ASSETS+"/bookinfo-vs-sidecar-foreign-multimatch.yaml")
+	require.True(utils.ApplyFileWithCleanup(t, filePath, kiali.BOOKINFO))
+
+	config, err := getConfigDetails(kiali.BOOKINFO, "kiali-test-foreign-vs-a", kubernetes.VirtualServices, true, require)
+	require.NoError(err)
+	require.NotNil(config)
+	assertConfigDetailsHasNoCode(*config, "KIA1106", require)
+
+	config, err = getConfigDetails(kiali.BOOKINFO, "kiali-test-foreign-vs-b", kubernetes.VirtualServices, true, require)
+	require.NoError(err)
+	require.NotNil(config)
+	assertConfigDetailsHasNoCode(*config, "KIA1106", require)
+}
+
+// TestServiceEntrySidecarImportSkipsForeignMultimatch: Sidecar ./* means foreign-host
+// ServiceEntries are not co-applied, so KIA1211 must not fire.
+func TestServiceEntrySidecarImportSkipsForeignMultimatch(t *testing.T) {
+	require := require.New(t)
+	filePath := path.Join(cmd.KialiProjectRoot, kiali.ASSETS+"/bookinfo-se-sidecar-foreign-multimatch.yaml")
+	require.True(utils.ApplyFileWithCleanup(t, filePath, kiali.BOOKINFO))
+
+	config, err := getConfigDetails(kiali.BOOKINFO, "kiali-test-foreign-se-a", kubernetes.ServiceEntries, true, require)
+	require.NoError(err)
+	require.NotNil(config)
+	assertConfigDetailsHasNoCode(*config, "KIA1211", require)
+
+	config, err = getConfigDetails(kiali.BOOKINFO, "kiali-test-foreign-se-b", kubernetes.ServiceEntries, true, require)
+	require.NoError(err)
+	require.NotNil(config)
+	assertConfigDetailsHasNoCode(*config, "KIA1211", require)
+}
+
+func TestDestinationRuleExportMultimatch(t *testing.T) {
+	require := require.New(t)
+	filePath := path.Join(cmd.KialiProjectRoot, kiali.ASSETS+"/bookinfo-destination-rule-export-multimatch.yaml")
+	defer utils.DeleteFile(filePath, kiali.BOOKINFO)
+	require.True(utils.ApplyFile(filePath, kiali.BOOKINFO))
+
+	config, err := getConfigDetails(kiali.BOOKINFO, "all.googleapis.com", kubernetes.DestinationRules, false, require)
+	require.NoError(err)
+	require.NotNil(config)
+	assertConfigDetailsValidations(*config, kiali.BOOKINFO, kubernetes.DestinationRules, "all.googleapis.com", "KIA0201", true, require)
+
+	config, err = getConfigDetails(kiali.BOOKINFO, "all.googleapis.com2", kubernetes.DestinationRules, false, require)
+	require.NoError(err)
+	require.NotNil(config)
+	assertConfigDetailsValidations(*config, kiali.BOOKINFO, kubernetes.DestinationRules, "all.googleapis.com2", "KIA0201", true, require)
+
+	// load configs for all namespaces, single namespace config load will not return export to validations
+	// anyway Kiali UI does not load configs for a single namespace to avoid validation inconsistency and performance issues
+	configList, err := kiali.IstioConfigs()
+
+	require.NoError(err)
+	assertConfigListValidations(*configList, kiali.BOOKINFO, kubernetes.DestinationRules, "all.googleapis.com", "KIA0201", true, require)
+	assertConfigListValidations(*configList, kiali.BOOKINFO, kubernetes.DestinationRules, "all.googleapis.com2", "KIA0201", true, require)
+}
+
+func TestAuthPolicyPrincipalsError(t *testing.T) {
+	name := "ratings-policy"
+	require := require.New(t)
+	filePath := path.Join(cmd.KialiProjectRoot, kiali.ASSETS+"/bookinfo-auth-policy-principals.yaml")
+	defer utils.DeleteFile(filePath, kiali.BOOKINFO)
+	require.True(utils.ApplyFile(filePath, kiali.BOOKINFO))
+
+	config, err := getConfigDetails(kiali.BOOKINFO, name, kubernetes.AuthorizationPolicies, false, require)
+
+	require.NoError(err)
+	require.NotNil(config)
+	require.Equal(kubernetes.AuthorizationPolicies.String(), config.ObjectGVK.String())
+	require.Equal(kiali.BOOKINFO, config.Namespace.Name)
+	require.NotNil(config.AuthorizationPolicy)
+	require.Equal(name, config.AuthorizationPolicy.Name)
+	require.Equal(kiali.BOOKINFO, config.AuthorizationPolicy.Namespace)
+	require.NotNil(config.IstioReferences)
+	require.NotNil(config.IstioValidation)
+	require.Equal(name, config.IstioValidation.Name)
+	require.Equal(kubernetes.AuthorizationPolicies.String(), config.IstioValidation.ObjectGVK.String())
+	require.False(config.IstioValidation.Valid)
+	require.Empty(config.IstioValidation.References)
+	require.NotEmpty(config.IstioValidation.Checks)
+	require.Len(config.IstioValidation.Checks, 1)
+	require.Equal(models.ErrorSeverity, config.IstioValidation.Checks[0].Severity)
+	require.Equal("Service Account not found for this principal", config.IstioValidation.Checks[0].Message)
+}
+
+func TestServiceEntryLabels(t *testing.T) {
+	require := require.New(t)
+	filePath := path.Join(cmd.KialiProjectRoot, kiali.ASSETS+"/bookinfo-service-entry-labels.yaml")
+	defer utils.DeleteFile(filePath, kiali.BOOKINFO)
+	require.True(utils.ApplyFile(filePath, kiali.BOOKINFO))
+
+	// the DR with matching labels with SE
+	name := "dest-rule-labels"
+	config, err := getConfigDetails(kiali.BOOKINFO, name, kubernetes.DestinationRules, false, require)
+	require.NoError(err)
+	require.NotNil(config)
+	require.True(config.IstioValidation.Valid)
+	require.Empty(config.IstioValidation.Checks)
+}
+
+func TestServiceEntryLabelsNotMatch(t *testing.T) {
+	require := require.New(t)
+	filePath := path.Join(cmd.KialiProjectRoot, kiali.ASSETS+"/bookinfo-service-entry-wrong-labels.yaml")
+	require.True(utils.ApplyFileWithCleanup(t, filePath, kiali.BOOKINFO))
+
+	// There's multiple objects in the file, so we need to ensure that Kiali has seen both the destination rules
+	// and the service entries get created before we can check the validation. There's some delay between when
+	// the object gets created with Apply here in the tests and when the Kiali API's kubernetes cache is updated to have the
+	// object in it.
+	_, err := getConfigDetails(kiali.BOOKINFO, "service-entry-labels", kubernetes.ServiceEntries, false, require)
+	require.NoError(err)
+
+	// the DR with error, labels not match with SE
+	name := "dest-rule-labels-wrong"
+	config, err := getConfigDetails(kiali.BOOKINFO, name, kubernetes.DestinationRules, false, require)
+	require.NoError(err)
+	require.NotNil(config)
+	require.False(config.IstioValidation.Valid)
+	require.NotEmpty(config.IstioValidation.Checks)
+	require.Len(config.IstioValidation.Checks, 1)
+	require.Equal("This subset's labels are not found in any matching host", config.IstioValidation.Checks[0].Message)
+}
+
+func TestK8sGatewaysAddressesError(t *testing.T) {
+	name := "gatewayapiaddr"
+	require := require.New(t)
+	filePath := path.Join(cmd.KialiProjectRoot, kiali.ASSETS+"/bookinfo-k8sgateways-addresses.yaml")
+	defer utils.DeleteFile(filePath, kiali.BOOKINFO)
+	require.True(utils.ApplyFile(filePath, kiali.BOOKINFO))
+
+	// flaky test fix, make sure that K8sGateway is created and available
+	config, err := getConfigDetails(kiali.BOOKINFO, "gatewayapiaddr2", kubernetes.K8sGateways, true, require)
+	require.NoError(err)
+	require.NotNil(config)
+
+	config, err = getConfigDetails(kiali.BOOKINFO, name, kubernetes.K8sGateways, true, require)
+
+	require.NoError(err)
+	require.NotNil(config)
+	require.Equal(kubernetes.K8sGateways.String(), config.ObjectGVK.String())
+	require.Equal(kiali.BOOKINFO, config.Namespace.Name)
+	require.NotNil(config.K8sGateway)
+	require.Equal(name, config.K8sGateway.Name)
+	require.Equal(kiali.BOOKINFO, config.K8sGateway.Namespace)
+	require.NotNil(config.IstioValidation)
+	require.Equal(name, config.IstioValidation.Name)
+	require.Equal(kubernetes.K8sGateways.String(), config.IstioValidation.ObjectGVK.String())
+	require.NotEmpty(config.IstioValidation.Checks)
+	require.Equal(models.WarningSeverity, config.IstioValidation.Checks[0].Severity)
+	require.Equal("More than one K8s Gateway for the same address and type combination", config.IstioValidation.Checks[0].Message)
+}
+
+func TestK8sGatewaysListenersError(t *testing.T) {
+	name := "gatewayapilnr"
+	require := require.New(t)
+	filePath := path.Join(cmd.KialiProjectRoot, kiali.ASSETS+"/bookinfo-k8sgateways-listeners.yaml")
+	defer utils.DeleteFile(filePath, kiali.BOOKINFO)
+	require.True(utils.ApplyFile(filePath, kiali.BOOKINFO))
+
+	// flaky test fix, make sure that K8sGateway is created and available
+	config, err := getConfigDetails(kiali.BOOKINFO, "gatewayapilnr2", kubernetes.K8sGateways, true, require)
+	require.NoError(err)
+	require.NotNil(config)
+
+	config, err = getConfigDetails(kiali.BOOKINFO, name, kubernetes.K8sGateways, true, require)
+
+	require.NoError(err)
+	require.NotNil(config)
+	require.Equal(kubernetes.K8sGateways.String(), config.ObjectGVK.String())
+	require.Equal(kiali.BOOKINFO, config.Namespace.Name)
+	require.NotNil(config.K8sGateway)
+	require.Equal(name, config.K8sGateway.Name)
+	require.Equal(kiali.BOOKINFO, config.K8sGateway.Namespace)
+	require.NotNil(config.IstioValidation)
+	require.Equal(name, config.IstioValidation.Name)
+	require.Equal(kubernetes.K8sGateways.String(), config.IstioValidation.ObjectGVK.String())
+	require.NotEmpty(config.IstioValidation.Checks)
+	require.Equal(models.WarningSeverity, config.IstioValidation.Checks[0].Severity)
+	require.Equal("More than one K8s Gateway for the same host port combination", config.IstioValidation.Checks[0].Message)
+}
+
+func TestK8sHTTPRoutesGatewaysError(t *testing.T) {
+	name := "httproute"
+	require := require.New(t)
+	filePath := path.Join(cmd.KialiProjectRoot, kiali.ASSETS+"/bookinfo-k8shttproutes-gateways.yaml")
+	defer utils.DeleteFile(filePath, kiali.BOOKINFO)
+	require.True(utils.ApplyFile(filePath, kiali.BOOKINFO))
+
+	config, err := getConfigDetails(kiali.BOOKINFO, name, kubernetes.K8sHTTPRoutes, true, require)
+
+	require.NoError(err)
+	require.NotNil(config)
+	require.Equal(kubernetes.K8sHTTPRoutes.String(), config.ObjectGVK.String())
+	require.Equal(kiali.BOOKINFO, config.Namespace.Name)
+	require.NotNil(config.K8sHTTPRoute)
+	require.Equal(name, config.K8sHTTPRoute.Name)
+	require.Equal(kiali.BOOKINFO, config.K8sHTTPRoute.Namespace)
+	require.NotNil(config.IstioValidation)
+	require.False(config.IstioValidation.Valid)
+	require.Equal(name, config.IstioValidation.Name)
+	require.Equal(kubernetes.K8sHTTPRoutes.String(), config.IstioValidation.ObjectGVK.String())
+	require.NotEmpty(config.IstioValidation.Checks)
+	require.Equal(models.ErrorSeverity, config.IstioValidation.Checks[0].Severity)
+	require.Equal("Route is pointing to a non-existent or inaccessible K8s gateway", config.IstioValidation.Checks[0].Message)
+}
+
+func TestK8sHTTPRoutesServicesError(t *testing.T) {
+	name := "httprouteservices"
+	require := require.New(t)
+	filePath := path.Join(cmd.KialiProjectRoot, kiali.ASSETS+"/bookinfo-k8shttproutes-services.yaml")
+	defer utils.DeleteFile(filePath, kiali.BOOKINFO)
+	require.True(utils.ApplyFile(filePath, kiali.BOOKINFO))
+
+	// flaky test fix, make sure that K8sGateway is created and available
+	config, err := getConfigDetails(kiali.BOOKINFO, "gatewayapiservices", kubernetes.K8sGateways, true, require)
+	require.NoError(err)
+	require.NotNil(config)
+
+	config, err = getConfigDetails(kiali.BOOKINFO, name, kubernetes.K8sHTTPRoutes, true, require)
+
+	require.NoError(err)
+	require.NotNil(config)
+	require.Equal(kubernetes.K8sHTTPRoutes.String(), config.ObjectGVK.String())
+	require.Equal(kiali.BOOKINFO, config.Namespace.Name)
+	require.NotNil(config.K8sHTTPRoute)
+	require.Equal(name, config.K8sHTTPRoute.Name)
+	require.Equal(kiali.BOOKINFO, config.K8sHTTPRoute.Namespace)
+	require.NotNil(config.IstioValidation)
+	require.False(config.IstioValidation.Valid)
+	require.Equal(name, config.IstioValidation.Name)
+	require.Equal(kubernetes.K8sHTTPRoutes.String(), config.IstioValidation.ObjectGVK.String())
+	require.NotEmpty(config.IstioValidation.Checks)
+	require.Equal(models.ErrorSeverity, config.IstioValidation.Checks[0].Severity)
+	require.Equal("Reference doesn't have a valid service (Service name not found)", config.IstioValidation.Checks[0].Message)
+}
+
+func TestK8sGRPCRoutesGatewaysError(t *testing.T) {
+	name := "grpcroute"
+	require := require.New(t)
+	filePath := path.Join(cmd.KialiProjectRoot, kiali.ASSETS+"/bookinfo-k8sgrpcroutes-gateways.yaml")
+	defer utils.DeleteFile(filePath, kiali.BOOKINFO)
+	require.True(utils.ApplyFile(filePath, kiali.BOOKINFO))
+
+	config, err := getConfigDetails(kiali.BOOKINFO, name, kubernetes.K8sGRPCRoutes, true, require)
+
+	require.NoError(err)
+	require.NotNil(config)
+	require.Equal(kubernetes.K8sGRPCRoutes.String(), config.ObjectGVK.String())
+	require.Equal(kiali.BOOKINFO, config.Namespace.Name)
+	require.NotNil(config.K8sGRPCRoute)
+	require.Equal(name, config.K8sGRPCRoute.Name)
+	require.Equal(kiali.BOOKINFO, config.K8sGRPCRoute.Namespace)
+	require.NotNil(config.IstioValidation)
+	require.False(config.IstioValidation.Valid)
+	require.Equal(name, config.IstioValidation.Name)
+	require.Equal(kubernetes.K8sGRPCRoutes.String(), config.IstioValidation.ObjectGVK.String())
+	require.NotEmpty(config.IstioValidation.Checks)
+	require.Equal(models.ErrorSeverity, config.IstioValidation.Checks[0].Severity)
+	require.Equal("Route is pointing to a non-existent or inaccessible K8s gateway", config.IstioValidation.Checks[0].Message)
+}
+
+func TestK8sGRPCRoutesServicesError(t *testing.T) {
+	name := "grpcrouteservices"
+	require := require.New(t)
+	filePath := path.Join(cmd.KialiProjectRoot, kiali.ASSETS+"/bookinfo-k8sgrpcroutes-services.yaml")
+	defer utils.DeleteFile(filePath, kiali.BOOKINFO)
+	require.True(utils.ApplyFile(filePath, kiali.BOOKINFO))
+
+	// flaky test fix, make sure that K8sGateway is created and available
+	config, err := getConfigDetails(kiali.BOOKINFO, "gatewayapiservices", kubernetes.K8sGateways, true, require)
+	require.NoError(err)
+	require.NotNil(config)
+
+	config, err = getConfigDetails(kiali.BOOKINFO, name, kubernetes.K8sGRPCRoutes, true, require)
+
+	require.NoError(err)
+	require.NotNil(config)
+	require.Equal(kubernetes.K8sGRPCRoutes.String(), config.ObjectGVK.String())
+	require.Equal(kiali.BOOKINFO, config.Namespace.Name)
+	require.NotNil(config.K8sGRPCRoute)
+	require.Equal(name, config.K8sGRPCRoute.Name)
+	require.Equal(kiali.BOOKINFO, config.K8sGRPCRoute.Namespace)
+	require.NotNil(config.IstioValidation)
+	require.False(config.IstioValidation.Valid)
+	require.Equal(name, config.IstioValidation.Name)
+	require.Equal(kubernetes.K8sGRPCRoutes.String(), config.IstioValidation.ObjectGVK.String())
+	require.NotEmpty(config.IstioValidation.Checks)
+	require.Equal(models.ErrorSeverity, config.IstioValidation.Checks[0].Severity)
+	require.Equal("Reference doesn't have a valid service (Service name not found)", config.IstioValidation.Checks[0].Message)
+}
+
+func TestK8sReferenceGrantsFromNamespaceError(t *testing.T) {
+	name := "referencegrantfromns"
+	require := require.New(t)
+	filePath := path.Join(cmd.KialiProjectRoot, kiali.ASSETS+"/bookinfo-k8sreferencegrants-from-namespaces.yaml")
+	defer utils.DeleteFile(filePath, kiali.BOOKINFO)
+	require.True(utils.ApplyFile(filePath, kiali.BOOKINFO))
+
+	// potential flaky test fix, make sure that K8sReferenceGrants is created and available
+	config, err := getConfigDetails(kiali.BOOKINFO, name, kubernetes.K8sReferenceGrants, true, require)
+	require.NoError(err)
+	require.NotNil(config)
+
+	config, err = getConfigDetails(kiali.BOOKINFO, name, kubernetes.K8sReferenceGrants, true, require)
+
+	require.NoError(err)
+	require.NotNil(config)
+	require.Equal(kubernetes.K8sReferenceGrants.String(), config.ObjectGVK.String())
+	require.Equal(kiali.BOOKINFO, config.Namespace.Name)
+	require.NotNil(config.K8sReferenceGrant)
+	require.Equal(name, config.K8sReferenceGrant.Name)
+	require.Equal(kiali.BOOKINFO, config.K8sReferenceGrant.Namespace)
+	require.NotNil(config.IstioValidation)
+	require.False(config.IstioValidation.Valid)
+	require.Equal(name, config.IstioValidation.Name)
+	require.Equal(kubernetes.K8sReferenceGrants.String(), config.IstioValidation.ObjectGVK.String())
+	require.NotEmpty(config.IstioValidation.Checks)
+	require.Equal(models.ErrorSeverity, config.IstioValidation.Checks[0].Severity)
+	require.Equal("Namespace is not found or is not accessible", config.IstioValidation.Checks[0].Message)
+}
+
+func getConfigDetails(namespace, name string, configType schema.GroupVersionKind, skipReferences bool, require *require.Assertions) (*models.IstioConfigDetails, error) {
+	ctx := context.TODO()
+	config, _, err := kiali.IstioConfigDetails(namespace, name, configType)
+	if err == nil && config != nil && config.IstioValidation != nil && config.IstioReferences != nil {
+		return config, nil
+	}
+
+	pollErr := wait.PollUntilContextTimeout(ctx, time.Second, time.Minute*5, false, func(ctx context.Context) (bool, error) {
+		config, _, err = kiali.IstioConfigDetails(namespace, name, configType)
+		if err == nil && config != nil && config.IstioValidation != nil {
+			if !skipReferences && config.IstioReferences != nil {
+				return true, nil
+			} else if skipReferences {
+				return true, nil
+			}
+		}
+		return false, nil
+	})
+	require.Nil(pollErr)
+	return config, nil
+}
+
+func getConfigForNamespace(namespace, name string, configType schema.GroupVersionKind) (*models.IstioConfigDetails, error) {
+	config, _, err := kiali.IstioConfigDetails(namespace, name, configType)
+	log.Debugf("Config response returned: %+v", config)
+	return config, err
+}
+
+func assertConfigListValidations(configList models.IstioConfigList, namespace string, objGVK schema.GroupVersionKind, objName, code string, valid bool, require *require.Assertions) {
+	require.NotEmpty(configList)
+	require.NotNil(configList.IstioValidations)
+	found := false
+	for key, validation := range configList.IstioValidations {
+		if key.Name == objName && key.Namespace == namespace {
+			found = true
+			require.NotNil(validation)
+			require.Equal(valid, validation.Valid)
+			require.NotEmpty(validation.Checks)
+			require.Equal(code, validation.Checks[0].Code)
+			break
+		}
+	}
+	require.True(found)
+}
+
+func assertConfigDetailsValidations(configDetails models.IstioConfigDetails, namespace string, objGVK schema.GroupVersionKind, objName, code string, valid bool, require *require.Assertions) {
+	require.NotEmpty(configDetails)
+	require.NotNil(configDetails.IstioValidation)
+	require.Equal(namespace, configDetails.IstioValidation.Namespace)
+	require.Equal(objGVK.String(), configDetails.IstioValidation.ObjectGVK.String())
+	require.Equal(objName, configDetails.IstioValidation.Name)
+	require.Equal(valid, configDetails.IstioValidation.Valid)
+	require.NotEmpty(configDetails.IstioValidation.Checks)
+	require.Equal(code, configDetails.IstioValidation.Checks[0].Code)
+}
+
+func assertConfigDetailsHasCode(configDetails models.IstioConfigDetails, code string, require *require.Assertions) {
+	require.NotNil(configDetails.IstioValidation)
+	found := false
+	for _, check := range configDetails.IstioValidation.Checks {
+		if check.Code == code {
+			found = true
+			break
+		}
+	}
+	require.True(found, "expected validation code %s on %s/%s, got %+v",
+		code, configDetails.IstioValidation.Namespace, configDetails.IstioValidation.Name, configDetails.IstioValidation.Checks)
+}
+
+func assertConfigDetailsHasNoCode(configDetails models.IstioConfigDetails, code string, require *require.Assertions) {
+	require.NotNil(configDetails.IstioValidation)
+	for _, check := range configDetails.IstioValidation.Checks {
+		require.NotEqual(code, check.Code, "unexpected validation code %s on %s/%s", code, configDetails.IstioValidation.Namespace, configDetails.IstioValidation.Name)
+	}
+}
+
+func assertConfigListHasNoCode(configList models.IstioConfigList, namespace, objName, code string, require *require.Assertions) {
+	require.NotNil(configList.IstioValidations)
+	found := false
+	for key, validation := range configList.IstioValidations {
+		if key.Name != objName || key.Namespace != namespace {
+			continue
+		}
+		found = true
+		require.NotNil(validation)
+		for _, check := range validation.Checks {
+			require.NotEqual(code, check.Code, "unexpected validation code %s on %s/%s", code, namespace, objName)
+		}
+		break
+	}
+	require.True(found, "expected config %s/%s to appear in validations list", namespace, objName)
+}

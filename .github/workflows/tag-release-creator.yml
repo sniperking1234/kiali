@@ -1,0 +1,96 @@
+name: Release Tag Creator
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag_branches:
+        description: Branches to tag (Separate branches by commas)
+        required: true
+        default: v2.11,v2.17,v2.22,v2.27,v2.33
+        type: string
+
+permissions: read-all
+
+jobs:
+  initialize:
+    permissions:
+      contents: read
+    name: Initialize
+    runs-on: ubuntu-latest
+    outputs:
+      branches: ${{ env.branches }}
+    steps:
+    - name: Prepare script to var
+      id: script_convert
+      run: |
+        cat <<-EOF > conversor.py
+        import sys, json
+
+        branch_arg = sys.argv[1]
+        branches = branch_arg.split(',')
+
+        print(json.dumps(branches))
+        EOF
+
+    - name: Set Branch
+      id: branches
+      env:
+        TAG_BRANCHES: ${{ github.event.inputs.tag_branches }}
+      run: |
+        BRANCHES=$(python conversor.py $TAG_BRANCHES)
+        echo "branches=$BRANCHES" >> $GITHUB_ENV
+
+  release_tag:
+    permissions:
+      contents: write
+    needs: [initialize]
+    runs-on: ubuntu-latest
+    strategy:
+      # Allow other branches to continue even if one of the branches failed
+      fail-fast: false
+      matrix:
+        branch: ${{fromJson(needs.initialize.outputs.branches)}}
+    steps:
+    - name: Checkout branch
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        ref: ${{matrix.branch}}
+        # We need to fetch the full history to determine the latest tag
+        fetch-depth: 0
+
+    - name: Configure git
+      run: |
+        git config user.email 'kiali-dev@googlegroups.com'
+        git config user.name 'kiali-bot'
+
+    - name: Create Release Tag in kiali/kiali
+      run: |
+        RELEASE_VERSION=$(sed -rn 's/^VERSION \?= (.*)/\1/p' Makefile)
+
+        LATEST_TAG=$(git describe --tags --abbrev=0)
+
+        # Check if the latest tag is the current ossm version tag
+        if [[ "$LATEST_TAG" == "$RELEASE_VERSION-ossm" ]]; then
+          # Delete the ossm version tag
+          echo "Deleting existing ossm version tag: $RELEASE_VERSION-ossm"
+          git push origin --delete refs/tags/$RELEASE_VERSION-ossm
+
+          # Create the release tag
+          echo "Creating release tag $RELEASE_VERSION"
+          git push origin $(git rev-parse HEAD):refs/tags/$RELEASE_VERSION
+        else
+          echo "Error: Latest tag $LATEST_TAG does not match expected $RELEASE_VERSION-ossm tag"
+          exit 1
+        fi
+
+  bump_version:
+    permissions:
+      contents: write
+    name: Bump to Next Version
+    needs: [initialize, release_tag]
+    # Allow other branches to bump to the next version even if one of the branches failed to create the release tag
+    if: ${{ always() }}
+    uses: ./.github/workflows/bump-release-version.yml
+    with:
+      tag_branches: ${{ inputs.tag_branches }}
+    secrets: inherit

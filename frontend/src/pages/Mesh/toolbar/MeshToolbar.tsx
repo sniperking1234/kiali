@@ -1,0 +1,71 @@
+import * as React from 'react';
+import { Button, ButtonVariant, Toolbar, ToolbarGroup, ToolbarItem } from '@patternfly/react-core';
+import { connect } from 'react-redux';
+import { KialiAppState } from '../../../store/Store';
+import { TourStop } from 'components/Tour/TourStop';
+import { KialiIcon } from 'config/KialiIcon';
+import { MeshTarget } from 'types/Mesh';
+import { Controller } from '@patternfly/react-topology';
+import { MeshFind } from './MeshFind';
+import { MeshTourStops } from '../MeshHelpTour';
+import { MeshReset } from './MeshReset';
+import { TimeDurationComponent } from 'components/Time/TimeDurationComponent';
+import { useKialiTranslation } from 'utils/I18nUtils';
+import { MeshSettings } from './MeshSettings';
+
+type ReduxProps = {
+  target: MeshTarget | null;
+};
+
+type MeshToolbarProps = ReduxProps & {
+  controller?: Controller;
+  disabled: boolean;
+  onToggleHelp: () => void;
+};
+
+export const MeshToolbarComponent: React.FC<MeshToolbarProps> = (props: MeshToolbarProps) => {
+  const { t } = useKialiTranslation();
+
+  return (
+    <>
+      <Toolbar style={{ width: '100%' }}>
+        <ToolbarGroup aria-label={t('mesh settings')} style={{ margin: 0, alignItems: 'flex-start' }}>
+          <ToolbarItem style={{ margin: 0 }}>
+            <TourStop info={MeshTourStops.Display}>
+              <MeshSettings disabled={props.disabled} />
+            </TourStop>
+          </ToolbarItem>
+
+          <ToolbarItem>
+            <MeshFind controller={props.controller} />
+          </ToolbarItem>
+
+          <ToolbarItem style={{ marginLeft: 'auto', alignSelf: 'center' }}>
+            <TourStop info={MeshTourStops.Shortcuts}>
+              <Button
+                id="mesh-tour"
+                icon={<KialiIcon.Help />}
+                variant={ButtonVariant.link}
+                onClick={props.onToggleHelp}
+              >
+                <span>{t('Help')}</span>
+              </Button>
+            </TourStop>
+            <MeshReset />
+          </ToolbarItem>
+          <ToolbarItem>
+            <TourStop info={MeshTourStops.TimeRange}>
+              <TimeDurationComponent id="mesh_time_range" disabled={props.disabled} supportsReplay={false} />
+            </TourStop>
+          </ToolbarItem>
+        </ToolbarGroup>
+      </Toolbar>
+    </>
+  );
+};
+
+const mapStateToProps = (state: KialiAppState): ReduxProps => ({
+  target: state.mesh.target
+});
+
+export const MeshToolbar = connect(mapStateToProps)(MeshToolbarComponent);

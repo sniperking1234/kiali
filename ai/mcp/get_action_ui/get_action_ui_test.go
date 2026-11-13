@@ -1,0 +1,657 @@
+package get_action_ui
+
+import (
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	apps_v1 "k8s.io/api/apps/v1"
+	core_v1 "k8s.io/api/core/v1"
+	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"github.com/kiali/kiali/ai/mcputil"
+	"github.com/kiali/kiali/business"
+	"github.com/kiali/kiali/config"
+	"github.com/kiali/kiali/kubernetes/kubetest"
+)
+
+func TestExecute(t *testing.T) {
+	conf := config.NewConfig()
+	conf.KubernetesConfig.ClusterName = "east"
+	config.Set(conf)
+
+	k8s := kubetest.NewFakeK8sClient(
+		kubetest.FakeNamespace("bookinfo"),
+		kubetest.FakeNamespace("istio-system"),
+		&apps_v1.Deployment{
+			ObjectMeta: meta_v1.ObjectMeta{
+				Name:      "details-v1",
+				Namespace: "bookinfo",
+				Labels:    map[string]string{"app": "details", "version": "v1"},
+			},
+			Spec: apps_v1.DeploymentSpec{
+				Selector: &meta_v1.LabelSelector{
+					MatchLabels: map[string]string{"app": "details", "version": "v1"},
+				},
+				Template: core_v1.PodTemplateSpec{
+					ObjectMeta: meta_v1.ObjectMeta{
+						Labels: map[string]string{"app": "details", "version": "v1"},
+					},
+				},
+			},
+		},
+		&apps_v1.Deployment{
+			ObjectMeta: meta_v1.ObjectMeta{
+				Name:      "ratings-v1",
+				Namespace: "bookinfo",
+				Labels:    map[string]string{"app": "ratings", "version": "v1"},
+			},
+			Spec: apps_v1.DeploymentSpec{
+				Selector: &meta_v1.LabelSelector{
+					MatchLabels: map[string]string{"app": "ratings", "version": "v1"},
+				},
+				Template: core_v1.PodTemplateSpec{
+					ObjectMeta: meta_v1.ObjectMeta{
+						Labels: map[string]string{"app": "ratings", "version": "v1"},
+					},
+				},
+			},
+		},
+		&core_v1.Service{
+			ObjectMeta: meta_v1.ObjectMeta{
+				Name:      "productpage",
+				Namespace: "bookinfo",
+				Labels:    map[string]string{"app": "productpage"},
+			},
+		},
+	)
+	businessLayer := business.NewLayerBuilder(t, conf).WithClient(k8s).Build()
+
+	t.Run("Overview Action", func(t *testing.T) {
+		args := map[string]interface{}{
+			"resourceType": "overview",
+		}
+		req := httptest.NewRequest("GET", "http://kiali/api/ai/mcp/get_action_ui", nil)
+		res, status := Execute(&mcputil.KialiInterface{Request: req, BusinessLayer: businessLayer, Conf: conf}, args)
+		assert.Equal(t, http.StatusOK, status)
+		resp := res.(GetActionUIResponse)
+		require.Len(t, resp.Actions, 1)
+		assert.Equal(t, "View Overview", resp.Actions[0].Title)
+		assert.Equal(t, "/overview", resp.Actions[0].Payload)
+	})
+
+	t.Run("Graph Action - Mesh", func(t *testing.T) {
+		args := map[string]interface{}{
+			"resourceType": "graph",
+			"graph":        "mesh",
+		}
+		req := httptest.NewRequest("GET", "http://kiali/api/ai/mcp/get_action_ui", nil)
+		res, status := Execute(&mcputil.KialiInterface{Request: req, BusinessLayer: businessLayer, Conf: conf}, args)
+		assert.Equal(t, http.StatusOK, status)
+		resp := res.(GetActionUIResponse)
+		require.Len(t, resp.Actions, 1)
+		assert.Equal(t, "View Mesh Graph", resp.Actions[0].Title)
+		assert.Equal(t, "/mesh", resp.Actions[0].Payload)
+	})
+
+	t.Run("Graph Action - Namespace", func(t *testing.T) {
+		args := map[string]interface{}{
+			"resourceType": "graph",
+			"namespaces":   "bookinfo",
+		}
+		req := httptest.NewRequest("GET", "http://kiali/api/ai/mcp/get_action_ui", nil)
+		res, status := Execute(&mcputil.KialiInterface{Request: req, BusinessLayer: businessLayer, Conf: conf}, args)
+		assert.Equal(t, http.StatusOK, status)
+		resp := res.(GetActionUIResponse)
+		require.Len(t, resp.Actions, 1)
+		assert.Contains(t, resp.Actions[0].Title, "View Traffic Graph for :bookinfo")
+		assert.Contains(t, resp.Actions[0].Payload, "/graph/namespaces?namespaces=bookinfo")
+	})
+
+	t.Run("Workload List Action", func(t *testing.T) {
+		args := map[string]interface{}{
+			"resourceType": "workload",
+			"namespaces":   "bookinfo",
+		}
+		req := httptest.NewRequest("GET", "http://kiali/api/ai/mcp/get_action_ui", nil)
+		res, status := Execute(&mcputil.KialiInterface{Request: req, BusinessLayer: businessLayer, Conf: conf}, args)
+		assert.Equal(t, http.StatusOK, status)
+		resp := res.(GetActionUIResponse)
+		require.Len(t, resp.Actions, 1)
+		assert.Equal(t, "View workloads List", resp.Actions[0].Title)
+		assert.Equal(t, "/workloads?namespaces=bookinfo", resp.Actions[0].Payload)
+	})
+
+	t.Run("Workload Details Action", func(t *testing.T) {
+		args := map[string]interface{}{
+			"resourceType": "workload",
+			"namespaces":   "bookinfo",
+			"resourceName": "details-v1",
+			"tab":          "logs",
+		}
+		req := httptest.NewRequest("GET", "http://kiali/api/ai/mcp/get_action_ui", nil)
+		res, status := Execute(&mcputil.KialiInterface{Request: req, BusinessLayer: businessLayer, Conf: conf}, args)
+		assert.Equal(t, http.StatusOK, status)
+		resp := res.(GetActionUIResponse)
+		require.Len(t, resp.Actions, 1)
+		assert.Equal(t, "View workload Details", resp.Actions[0].Title)
+		assert.Equal(t, "/namespaces/bookinfo/workloads/details-v1?tab=logs&clusterName=east", resp.Actions[0].Payload)
+	})
+
+	t.Run("Istio List Action", func(t *testing.T) {
+		args := map[string]interface{}{
+			"resourceType": "istio",
+			"namespaces":   "istio-system",
+		}
+		req := httptest.NewRequest("GET", "http://kiali/api/ai/mcp/get_action_ui", nil)
+		res, status := Execute(&mcputil.KialiInterface{Request: req, BusinessLayer: businessLayer, Conf: conf}, args)
+		assert.Equal(t, http.StatusOK, status)
+		resp := res.(GetActionUIResponse)
+		require.Len(t, resp.Actions, 1)
+		assert.Equal(t, "View Istio List of Configs", resp.Actions[0].Title)
+		assert.Equal(t, "/istio?namespaces=istio-system", resp.Actions[0].Payload)
+	})
+
+	t.Run("Service Details Action with metric tab", func(t *testing.T) {
+		args := map[string]interface{}{
+			"resourceType": "service",
+			"namespaces":   "bookinfo",
+			"resourceName": "productpage",
+			"tab":          "in_metrics",
+		}
+		req := httptest.NewRequest("GET", "http://kiali/api/ai/mcp/get_action_ui", nil)
+		res, status := Execute(&mcputil.KialiInterface{Request: req, BusinessLayer: businessLayer, Conf: conf}, args)
+		assert.Equal(t, http.StatusOK, status)
+		resp := res.(GetActionUIResponse)
+		require.Len(t, resp.Actions, 1)
+		assert.Equal(t, "View service Details", resp.Actions[0].Title)
+		assert.Equal(t, "/namespaces/bookinfo/services/productpage?tab=metrics&clusterName=east", resp.Actions[0].Payload)
+	})
+
+	t.Run("All Namespaces Action", func(t *testing.T) {
+		args := map[string]interface{}{
+			"resourceType": "workload",
+			"namespaces":   "all",
+		}
+		req := httptest.NewRequest("GET", "http://kiali/api/ai/mcp/get_action_ui", nil)
+		res, status := Execute(&mcputil.KialiInterface{Request: req, BusinessLayer: businessLayer, Conf: conf}, args)
+		assert.Equal(t, http.StatusOK, status)
+		resp := res.(GetActionUIResponse)
+		require.Len(t, resp.Actions, 1)
+		assert.Equal(t, "View workloads List", resp.Actions[0].Title)
+		assert.Equal(t, "/workloads", resp.Actions[0].Payload)
+	})
+
+	t.Run("Non-existent Namespace Returns Error", func(t *testing.T) {
+		args := map[string]interface{}{
+			"resourceType": "workload",
+			"namespaces":   "does-not-exist",
+			"resourceName": "test",
+		}
+		req := httptest.NewRequest("GET", "http://kiali/api/ai/mcp/get_action_ui", nil)
+		res, status := Execute(&mcputil.KialiInterface{Request: req, BusinessLayer: businessLayer, Conf: conf}, args)
+		assert.Equal(t, http.StatusOK, status)
+		resp := res.(GetActionUIResponse)
+		assert.Empty(t, resp.Actions)
+		assert.Contains(t, resp.Errors, `Namespace "does-not-exist" not found`)
+	})
+
+	t.Run("Non-existent Workload Returns Error", func(t *testing.T) {
+		args := map[string]interface{}{
+			"resourceType": "workload",
+			"namespaces":   "bookinfo",
+			"resourceName": "no-such-workload",
+		}
+		req := httptest.NewRequest("GET", "http://kiali/api/ai/mcp/get_action_ui", nil)
+		res, status := Execute(&mcputil.KialiInterface{Request: req, BusinessLayer: businessLayer, Conf: conf}, args)
+		assert.Equal(t, http.StatusOK, status)
+		resp := res.(GetActionUIResponse)
+		assert.Empty(t, resp.Actions)
+		assert.Contains(t, resp.Errors, `Workload "no-such-workload" not found in namespace "bookinfo"`)
+	})
+
+	t.Run("Non-existent Service Returns Error", func(t *testing.T) {
+		args := map[string]interface{}{
+			"resourceType": "service",
+			"namespaces":   "bookinfo",
+			"resourceName": "no-such-service",
+		}
+		req := httptest.NewRequest("GET", "http://kiali/api/ai/mcp/get_action_ui", nil)
+		res, status := Execute(&mcputil.KialiInterface{Request: req, BusinessLayer: businessLayer, Conf: conf}, args)
+		assert.Equal(t, http.StatusOK, status)
+		resp := res.(GetActionUIResponse)
+		assert.Empty(t, resp.Actions)
+		assert.Contains(t, resp.Errors, `Service "no-such-service" not found in namespace "bookinfo"`)
+	})
+
+	t.Run("Non-existent App Returns Error", func(t *testing.T) {
+		args := map[string]interface{}{
+			"resourceType": "app",
+			"namespaces":   "bookinfo",
+			"resourceName": "no-such-app",
+		}
+		req := httptest.NewRequest("GET", "http://kiali/api/ai/mcp/get_action_ui", nil)
+		res, status := Execute(&mcputil.KialiInterface{Request: req, BusinessLayer: businessLayer, Conf: conf}, args)
+		assert.Equal(t, http.StatusOK, status)
+		resp := res.(GetActionUIResponse)
+		assert.Empty(t, resp.Actions)
+		assert.Contains(t, resp.Errors, `Application "no-such-app" not found in namespace "bookinfo"`)
+	})
+
+	t.Run("Resource Detail With Empty Namespace Returns Error", func(t *testing.T) {
+		args := map[string]interface{}{
+			"resourceType": "service",
+			"resourceName": "productpage",
+		}
+		req := httptest.NewRequest("GET", "http://kiali/api/ai/mcp/get_action_ui", nil)
+		res, status := Execute(&mcputil.KialiInterface{Request: req, BusinessLayer: businessLayer, Conf: conf}, args)
+		assert.Equal(t, http.StatusOK, status)
+		resp := res.(GetActionUIResponse)
+		assert.Empty(t, resp.Actions)
+		assert.Contains(t, resp.Errors, "A single namespace is required")
+		assert.Contains(t, resp.Errors, `"productpage"`)
+	})
+
+	t.Run("Resource Detail With All Namespaces Returns Error", func(t *testing.T) {
+		args := map[string]interface{}{
+			"resourceType": "workload",
+			"namespaces":   "all",
+			"resourceName": "details-v1",
+		}
+		req := httptest.NewRequest("GET", "http://kiali/api/ai/mcp/get_action_ui", nil)
+		res, status := Execute(&mcputil.KialiInterface{Request: req, BusinessLayer: businessLayer, Conf: conf}, args)
+		assert.Equal(t, http.StatusOK, status)
+		resp := res.(GetActionUIResponse)
+		assert.Empty(t, resp.Actions)
+		assert.Contains(t, resp.Errors, "A single namespace is required")
+		assert.Contains(t, resp.Errors, `"details-v1"`)
+	})
+
+	t.Run("Resource Detail With Multiple Namespaces Returns Error", func(t *testing.T) {
+		args := map[string]interface{}{
+			"resourceType": "app",
+			"namespaces":   "bookinfo,istio-system",
+			"resourceName": "ratings",
+		}
+		req := httptest.NewRequest("GET", "http://kiali/api/ai/mcp/get_action_ui", nil)
+		res, status := Execute(&mcputil.KialiInterface{Request: req, BusinessLayer: businessLayer, Conf: conf}, args)
+		assert.Equal(t, http.StatusOK, status)
+		resp := res.(GetActionUIResponse)
+		assert.Empty(t, resp.Actions)
+		assert.Contains(t, resp.Errors, "A single namespace is required")
+		assert.Contains(t, resp.Errors, `"ratings"`)
+	})
+
+	t.Run("Service List Action", func(t *testing.T) {
+		args := map[string]interface{}{
+			"resourceType": "service",
+			"namespaces":   "bookinfo",
+		}
+		req := httptest.NewRequest("GET", "http://kiali/api/ai/mcp/get_action_ui", nil)
+		res, status := Execute(&mcputil.KialiInterface{Request: req, BusinessLayer: businessLayer, Conf: conf}, args)
+		assert.Equal(t, http.StatusOK, status)
+		resp := res.(GetActionUIResponse)
+		require.Len(t, resp.Actions, 1)
+		assert.Equal(t, "View services List", resp.Actions[0].Title)
+		assert.Equal(t, "/services?namespaces=bookinfo", resp.Actions[0].Payload)
+	})
+
+	t.Run("App List Action", func(t *testing.T) {
+		args := map[string]interface{}{
+			"resourceType": "app",
+			"namespaces":   "bookinfo",
+		}
+		req := httptest.NewRequest("GET", "http://kiali/api/ai/mcp/get_action_ui", nil)
+		res, status := Execute(&mcputil.KialiInterface{Request: req, BusinessLayer: businessLayer, Conf: conf}, args)
+		assert.Equal(t, http.StatusOK, status)
+		resp := res.(GetActionUIResponse)
+		require.Len(t, resp.Actions, 1)
+		assert.Equal(t, "View applications List", resp.Actions[0].Title)
+		assert.Equal(t, "/applications?namespaces=bookinfo", resp.Actions[0].Payload)
+	})
+
+	t.Run("Service Details Default Tab", func(t *testing.T) {
+		args := map[string]interface{}{
+			"resourceType": "service",
+			"namespaces":   "bookinfo",
+			"resourceName": "productpage",
+		}
+		req := httptest.NewRequest("GET", "http://kiali/api/ai/mcp/get_action_ui", nil)
+		res, status := Execute(&mcputil.KialiInterface{Request: req, BusinessLayer: businessLayer, Conf: conf}, args)
+		assert.Equal(t, http.StatusOK, status)
+		resp := res.(GetActionUIResponse)
+		require.Len(t, resp.Actions, 1)
+		assert.Equal(t, "View service Details", resp.Actions[0].Title)
+		assert.Equal(t, "/namespaces/bookinfo/services/productpage?tab=info&clusterName=east", resp.Actions[0].Payload)
+	})
+
+	t.Run("Namespaces Action", func(t *testing.T) {
+		args := map[string]interface{}{
+			"resourceType": "namespaces",
+		}
+		req := httptest.NewRequest("GET", "http://kiali/api/ai/mcp/get_action_ui", nil)
+		res, status := Execute(&mcputil.KialiInterface{Request: req, BusinessLayer: businessLayer, Conf: conf}, args)
+		assert.Equal(t, http.StatusOK, status)
+		resp := res.(GetActionUIResponse)
+		require.Len(t, resp.Actions, 1)
+		assert.Equal(t, "View Namespaces", resp.Actions[0].Title)
+		assert.Equal(t, "/namespaces", resp.Actions[0].Payload)
+	})
+
+	t.Run("Graph Action With Custom GraphType", func(t *testing.T) {
+		args := map[string]interface{}{
+			"resourceType": "graph",
+			"namespaces":   "bookinfo",
+			"graphType":    "app",
+		}
+		req := httptest.NewRequest("GET", "http://kiali/api/ai/mcp/get_action_ui", nil)
+		res, status := Execute(&mcputil.KialiInterface{Request: req, BusinessLayer: businessLayer, Conf: conf}, args)
+		assert.Equal(t, http.StatusOK, status)
+		resp := res.(GetActionUIResponse)
+		require.Len(t, resp.Actions, 1)
+		assert.Contains(t, resp.Actions[0].Payload, "graphType=app")
+	})
+
+	t.Run("Graph Action With All Namespaces", func(t *testing.T) {
+		args := map[string]interface{}{
+			"resourceType": "graph",
+			"namespaces":   "all",
+		}
+		req := httptest.NewRequest("GET", "http://kiali/api/ai/mcp/get_action_ui", nil)
+		res, status := Execute(&mcputil.KialiInterface{Request: req, BusinessLayer: businessLayer, Conf: conf}, args)
+		assert.Equal(t, http.StatusOK, status)
+		resp := res.(GetActionUIResponse)
+		require.Len(t, resp.Actions, 1)
+		assert.Contains(t, resp.Actions[0].Payload, "/graph/namespaces?namespaces=")
+		assert.Contains(t, resp.Actions[0].Title, "View Traffic Graph for :")
+	})
+
+	t.Run("Service List With All Namespaces", func(t *testing.T) {
+		args := map[string]interface{}{
+			"resourceType": "service",
+			"namespaces":   "all",
+		}
+		req := httptest.NewRequest("GET", "http://kiali/api/ai/mcp/get_action_ui", nil)
+		res, status := Execute(&mcputil.KialiInterface{Request: req, BusinessLayer: businessLayer, Conf: conf}, args)
+		assert.Equal(t, http.StatusOK, status)
+		resp := res.(GetActionUIResponse)
+		require.Len(t, resp.Actions, 1)
+		assert.Equal(t, "View services List", resp.Actions[0].Title)
+		assert.Equal(t, "/services", resp.Actions[0].Payload)
+	})
+
+	t.Run("Service List With Empty Namespace", func(t *testing.T) {
+		args := map[string]interface{}{
+			"resourceType": "service",
+		}
+		req := httptest.NewRequest("GET", "http://kiali/api/ai/mcp/get_action_ui", nil)
+		res, status := Execute(&mcputil.KialiInterface{Request: req, BusinessLayer: businessLayer, Conf: conf}, args)
+		assert.Equal(t, http.StatusOK, status)
+		resp := res.(GetActionUIResponse)
+		require.Len(t, resp.Actions, 1)
+		assert.Equal(t, "View services List", resp.Actions[0].Title)
+		assert.Equal(t, "/services", resp.Actions[0].Payload)
+	})
+
+	t.Run("Invalid Namespace In Multi-Namespace List Returns Error", func(t *testing.T) {
+		args := map[string]interface{}{
+			"resourceType": "workload",
+			"namespaces":   "bookinfo,does-not-exist",
+		}
+		req := httptest.NewRequest("GET", "http://kiali/api/ai/mcp/get_action_ui", nil)
+		res, status := Execute(&mcputil.KialiInterface{Request: req, BusinessLayer: businessLayer, Conf: conf}, args)
+		assert.Equal(t, http.StatusOK, status)
+		resp := res.(GetActionUIResponse)
+		assert.Empty(t, resp.Actions)
+		assert.Contains(t, resp.Errors, "does-not-exist")
+	})
+}
+
+func TestGetTabLabel(t *testing.T) {
+	assert.Equal(t, "info", getTabLabel("", "workload"))
+	assert.Equal(t, "logs", getTabLabel("logs", "workload"))
+	assert.Equal(t, "metrics", getTabLabel("in_metrics", "service"))
+	assert.Equal(t, "metrics", getTabLabel("out_metrics", "service"))
+	assert.Equal(t, "info", getTabLabel("invalid", "service"))
+}
+
+func TestActionRoutesMatchFrontend(t *testing.T) {
+	routePatterns := loadFrontendRoutes(t)
+
+	conf := config.NewConfig()
+	conf.KubernetesConfig.ClusterName = "east"
+	config.Set(conf)
+
+	k8s := kubetest.NewFakeK8sClient(
+		kubetest.FakeNamespace("bookinfo"),
+		kubetest.FakeNamespace("istio-system"),
+		&apps_v1.Deployment{
+			ObjectMeta: meta_v1.ObjectMeta{
+				Name:      "details-v1",
+				Namespace: "bookinfo",
+				Labels:    map[string]string{"app": "details", "version": "v1"},
+			},
+			Spec: apps_v1.DeploymentSpec{
+				Selector: &meta_v1.LabelSelector{
+					MatchLabels: map[string]string{"app": "details", "version": "v1"},
+				},
+				Template: core_v1.PodTemplateSpec{
+					ObjectMeta: meta_v1.ObjectMeta{
+						Labels: map[string]string{"app": "details", "version": "v1"},
+					},
+				},
+			},
+		},
+		&apps_v1.Deployment{
+			ObjectMeta: meta_v1.ObjectMeta{
+				Name:      "ratings-v1",
+				Namespace: "bookinfo",
+				Labels:    map[string]string{"app": "ratings", "version": "v1"},
+			},
+			Spec: apps_v1.DeploymentSpec{
+				Selector: &meta_v1.LabelSelector{
+					MatchLabels: map[string]string{"app": "ratings", "version": "v1"},
+				},
+				Template: core_v1.PodTemplateSpec{
+					ObjectMeta: meta_v1.ObjectMeta{
+						Labels: map[string]string{"app": "ratings", "version": "v1"},
+					},
+				},
+			},
+		},
+		&core_v1.Service{
+			ObjectMeta: meta_v1.ObjectMeta{
+				Name:      "productpage",
+				Namespace: "bookinfo",
+				Labels:    map[string]string{"app": "productpage"},
+			},
+		},
+	)
+	businessLayer := business.NewLayerBuilder(t, conf).WithClient(k8s).Build()
+	req := httptest.NewRequest("GET", "http://kiali/api/ai/mcp/get_action_ui", nil)
+
+	testCases := []map[string]interface{}{
+		{"resourceType": "overview"},
+		{"resourceType": "graph", "graph": "mesh"},
+		{"resourceType": "graph", "namespaces": "bookinfo"},
+		{"resourceType": "workload", "namespaces": "bookinfo"},
+		{"resourceType": "workload", "namespaces": "bookinfo", "resourceName": "details-v1", "tab": "logs"},
+		{"resourceType": "istio", "namespaces": "istio-system"},
+		{"resourceType": "service", "namespaces": "bookinfo", "resourceName": "productpage", "tab": "in_metrics"},
+		{"resourceType": "app", "namespaces": "bookinfo", "resourceName": "ratings"},
+	}
+
+	for _, args := range testCases {
+		res, status := Execute(&mcputil.KialiInterface{Request: req, BusinessLayer: businessLayer, Conf: conf}, args)
+		require.Equal(t, http.StatusOK, status)
+		resp := res.(GetActionUIResponse)
+		require.NotEmpty(t, resp.Actions)
+		for _, action := range resp.Actions {
+			assert.Truef(t, actionRouteMatches(action.Payload, routePatterns), "payload %q not found in frontend routes", action.Payload)
+		}
+	}
+}
+
+func loadFrontendRoutes(t *testing.T) []string {
+	t.Helper()
+
+	repoRoot := findRepoRoot(t)
+	pathsFile := filepath.Join(repoRoot, "frontend", "src", "config", "Paths.ts")
+	pathsContent, err := os.ReadFile(pathsFile)
+	require.NoError(t, err)
+
+	pathValues := map[string]string{}
+	pathMatcher := regexp.MustCompile(`(?m)^\s*([A-Z_]+)\s*=\s*'([^']+)'`)
+	for _, match := range pathMatcher.FindAllStringSubmatch(string(pathsContent), -1) {
+		pathValues[match[1]] = match[2]
+	}
+	require.NotEmpty(t, pathValues)
+
+	routesFile := filepath.Join(repoRoot, "frontend", "src", "routes.tsx")
+	routesContent, err := os.ReadFile(routesFile)
+	require.NoError(t, err)
+
+	paths := []string{}
+	matchPathLiteral := func(pattern string) {
+		matcher := regexp.MustCompile(pattern)
+		for _, match := range matcher.FindAllStringSubmatch(string(routesContent), -1) {
+			path := strings.TrimSpace(match[1])
+			path = replacePathsTemplate(t, path, pathValues)
+			if path != "*" && path != "" {
+				paths = append(paths, path)
+			}
+		}
+	}
+	matchPathLiteral("path:\\s*`([^`]*)`")
+	matchPathLiteral("path:\\s*'([^']*)'")
+	require.NotEmpty(t, paths)
+	return paths
+}
+
+func findRepoRoot(t *testing.T) string {
+	t.Helper()
+
+	workingDir, err := os.Getwd()
+	require.NoError(t, err)
+
+	dir := workingDir
+	for {
+		candidate := filepath.Join(dir, "frontend", "src", "routes.tsx")
+		if _, err := os.Stat(candidate); err == nil {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+
+	require.Fail(t, "unable to locate repo root with frontend/src/routes.tsx")
+	return ""
+}
+
+func replacePathsTemplate(t *testing.T, path string, values map[string]string) string {
+	t.Helper()
+
+	templateMatcher := regexp.MustCompile(`\$\{Paths\.([A-Z_]+)\}`)
+	return templateMatcher.ReplaceAllStringFunc(path, func(match string) string {
+		submatches := templateMatcher.FindStringSubmatch(match)
+		if len(submatches) != 2 {
+			return match
+		}
+		value, ok := values[submatches[1]]
+		require.Truef(t, ok, "missing Paths.%s in frontend config", submatches[1])
+		return value
+	})
+}
+
+func actionRouteMatches(payload string, routes []string) bool {
+	path := payload
+	if queryIndex := strings.Index(path, "?"); queryIndex != -1 {
+		path = path[:queryIndex]
+	}
+	for _, route := range routes {
+		if matchRoute(path, route) {
+			return true
+		}
+	}
+	return false
+}
+
+func matchRoute(path string, route string) bool {
+	if route == path {
+		return true
+	}
+	pathSegments := splitRoute(path)
+	routeSegments := splitRoute(route)
+	if len(pathSegments) != len(routeSegments) {
+		return false
+	}
+	for i, segment := range routeSegments {
+		if strings.HasPrefix(segment, ":") {
+			if pathSegments[i] == "" {
+				return false
+			}
+			continue
+		}
+		if segment != pathSegments[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func splitRoute(path string) []string {
+	trimmed := strings.Trim(path, "/")
+	if trimmed == "" {
+		return []string{}
+	}
+	return strings.Split(trimmed, "/")
+}
+
+func TestExecute_Validation(t *testing.T) {
+	conf := config.NewConfig()
+	config.Set(conf)
+	k8s := kubetest.NewFakeK8sClient()
+	businessLayer := business.NewLayerBuilder(t, conf).WithClient(k8s).Build()
+	ki := &mcputil.KialiInterface{
+		Request:       httptest.NewRequest("GET", "http://kiali/api/ai/mcp/get_action_ui", nil),
+		BusinessLayer: businessLayer,
+		Conf:          conf,
+	}
+
+	t.Run("MissingResourceType", func(t *testing.T) {
+		res, status := Execute(ki, map[string]interface{}{})
+		assert.Equal(t, http.StatusBadRequest, status)
+		assert.Contains(t, res.(string), "resourceType is required")
+	})
+
+	t.Run("EmptyResourceType", func(t *testing.T) {
+		res, status := Execute(ki, map[string]interface{}{"resourceType": ""})
+		assert.Equal(t, http.StatusBadRequest, status)
+		assert.Contains(t, res.(string), "resourceType is required")
+	})
+
+	t.Run("InvalidResourceType", func(t *testing.T) {
+		res, status := Execute(ki, map[string]interface{}{"resourceType": "invalid_type"})
+		assert.Equal(t, http.StatusBadRequest, status)
+		assert.Contains(t, res.(string), "invalid resourceType")
+		assert.Contains(t, res.(string), "invalid_type")
+	})
+
+	t.Run("AllValidResourceTypes", func(t *testing.T) {
+		for _, rt := range validResourceTypes {
+			t.Run(rt, func(t *testing.T) {
+				_, status := Execute(ki, map[string]interface{}{"resourceType": rt})
+				assert.Equal(t, http.StatusOK, status)
+			})
+		}
+	})
+}

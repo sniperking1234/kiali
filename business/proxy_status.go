@@ -1,75 +1,60 @@
 package business
 
 import (
-	"k8s.io/client-go/tools/clientcmd/api"
+	"context"
+	"fmt"
 
+	"github.com/kiali/kiali/cache"
+	"github.com/kiali/kiali/config"
+	"github.com/kiali/kiali/istio"
 	"github.com/kiali/kiali/kubernetes"
 	"github.com/kiali/kiali/models"
-	"github.com/kiali/kiali/prometheus/internalmetrics"
 )
 
-type ProxyStatus struct {
-	k8s           kubernetes.ClientInterface
-	businessLayer *Layer
+func NewProxyStatusService(conf *config.Config, cache cache.KialiCache, discovery istio.MeshDiscovery, kialiSAClients map[string]kubernetes.ClientInterface, namespace *NamespaceService) ProxyStatusService {
+	return ProxyStatusService{
+		conf:           conf,
+		discovery:      discovery,
+		kialiCache:     cache,
+		kialiSAClients: kialiSAClients,
+		namespace:      namespace,
+	}
 }
 
-func (in *ProxyStatus) GetPodProxyStatus(ns, pod string) (*kubernetes.ProxyStatus, error) {
-	if kialiCache == nil {
-		return nil, nil
-	}
-
-	if kialiCache.CheckProxyStatus() {
-		return kialiCache.GetPodProxyStatus(ns, pod), nil
-	}
-
-	var proxyStatus []*kubernetes.ProxyStatus
-	var err error
-
-	if proxyStatus, err = in.k8s.GetProxyStatus(); err != nil {
-		if proxyStatus, err = in.getProxyStatusUsingKialiSA(); err != nil {
-			return nil, err
-		}
-	}
-
-	kialiCache.SetProxyStatus(proxyStatus)
-	return kialiCache.GetPodProxyStatus(ns, pod), nil
+type ProxyStatusService struct {
+	conf           *config.Config
+	discovery      istio.MeshDiscovery
+	kialiCache     cache.KialiCache
+	kialiSAClients map[string]kubernetes.ClientInterface
+	namespace      *NamespaceService
 }
 
-func (in *ProxyStatus) getProxyStatusUsingKialiSA() ([]*kubernetes.ProxyStatus, error) {
-	clientFactory, err := kubernetes.GetClientFactory()
-	if err != nil {
-		return nil, err
-	}
-
-	kialiToken, err := kubernetes.GetKialiToken()
-	if err != nil {
-		return nil, err
-	}
-
-	k8s, err := clientFactory.GetClient(&api.AuthInfo{Token: kialiToken})
-	if err != nil {
-		return nil, err
-	}
-
-	return k8s.GetProxyStatus()
+// GetPodProxyStatus isSubscribed is used to return IGNORED if sent is empty, instead of NOT_SENT
+func (in *ProxyStatusService) GetPodProxyStatus(cluster, ns, pod string, isSubscribed bool) *models.ProxyStatus {
+	return castProxyStatus(in.kialiCache.GetPodProxyStatus(cluster, ns, pod), isSubscribed)
 }
 
-func castProxyStatus(ps *kubernetes.ProxyStatus) *models.ProxyStatus {
+// castProxyStatus returns a status string depending on the proxyStatus and whether the proxy is subscribed
+// See https://github.com/istio/istio/pull/51638/files#diff-fded610aca2639111f0d6b42e18dfc1ce047126340a2d36bb976cfa4c575b984R8
+func castProxyStatus(ps *kubernetes.ProxyStatus, isSubscribed bool) *models.ProxyStatus {
 	if ps == nil {
 		return nil
 	}
 
 	return &models.ProxyStatus{
-		CDS: xdsStatus(ps.ClusterSent, ps.ClusterAcked),
-		EDS: xdsStatus(ps.EndpointSent, ps.EndpointAcked),
-		LDS: xdsStatus(ps.ListenerSent, ps.ListenerAcked),
-		RDS: xdsStatus(ps.RouteSent, ps.RouteAcked),
+		CDS: xdsStatus(ps.ClusterSent, ps.ClusterAcked, isSubscribed),
+		EDS: xdsStatus(ps.EndpointSent, ps.EndpointAcked, isSubscribed),
+		LDS: xdsStatus(ps.ListenerSent, ps.ListenerAcked, isSubscribed),
+		RDS: xdsStatus(ps.RouteSent, ps.RouteAcked, isSubscribed),
 	}
 }
 
-func xdsStatus(sent, acked string) string {
+func xdsStatus(sent, acked string, isSubscribed bool) string {
 	if sent == "" {
-		return "NOT_SENT"
+		if isSubscribed {
+			return "NOT_SENT"
+		}
+		return "IGNORED"
 	}
 	if sent == acked {
 		return "Synced"
@@ -82,38 +67,41 @@ func xdsStatus(sent, acked string) string {
 	return "Stale"
 }
 
-func (in *ProxyStatus) GetConfigDump(namespace, pod string) (models.EnvoyProxyDump, error) {
-	var err error
-	promtimer := internalmetrics.GetGoFunctionMetric("business", "ProxyStatus", "GetConfigDump")
-	defer promtimer.ObserveNow(&err)
+func (in *ProxyStatusService) GetConfigDump(cluster, namespace, pod string) (models.EnvoyProxyDump, error) {
+	kialiSAClient, ok := in.kialiSAClients[cluster]
+	if !ok {
+		return models.EnvoyProxyDump{}, fmt.Errorf("cluster [%s] not found", cluster)
+	}
 
-	dump, err := in.k8s.GetConfigDump(namespace, pod)
+	dump, err := kialiSAClient.GetConfigDump(namespace, pod)
 	return models.EnvoyProxyDump{ConfigDump: dump}, err
 }
 
-func (in *ProxyStatus) GetConfigDumpResourceEntries(namespace, pod, resource string) (*models.EnvoyProxyDump, error) {
-	var err error
-	promtimer := internalmetrics.GetGoFunctionMetric("business", "ProxyStatus", "GetConfigDump")
-	defer promtimer.ObserveNow(&err)
+func (in *ProxyStatusService) GetConfigDumpResourceEntries(ctx context.Context, cluster, namespace, pod, resource string) (*models.EnvoyProxyDump, error) {
+	kialiSAClient, ok := in.kialiSAClients[cluster]
+	if !ok {
+		return nil, fmt.Errorf("cluster [%s] not found", cluster)
+	}
 
-	dump, err := in.k8s.GetConfigDump(namespace, pod)
+	dump, err := kialiSAClient.GetConfigDump(namespace, pod)
 	if err != nil {
 		return nil, err
 	}
 
-	namespaces, err := in.businessLayer.Namespace.GetNamespaces()
+	namespaces, err := in.namespace.GetClusterNamespaces(ctx, cluster)
 	if err != nil {
 		return nil, err
 	}
 
-	return buildDump(dump, resource, namespaces)
+	identityDomain := resolveIdentityDomainWithDiscovery(ctx, in.discovery, cluster, in.conf.ExternalServices.Istio.IstioIdentityDomain)
+	return buildDump(dump, resource, namespaces, identityDomain)
 }
 
-func buildDump(dump *kubernetes.ConfigDump, resource string, namespaces []models.Namespace) (*models.EnvoyProxyDump, error) {
+func buildDump(dump *kubernetes.ConfigDump, resource string, namespaces []models.Namespace, identityDomain string) (*models.EnvoyProxyDump, error) {
 	response := &models.EnvoyProxyDump{}
 	var err error
 
-	nss := make([]string, len(namespaces))
+	nss := make([]string, 0, len(namespaces))
 	for _, ns := range namespaces {
 		nss = append(nss, ns.Name)
 	}
@@ -121,11 +109,11 @@ func buildDump(dump *kubernetes.ConfigDump, resource string, namespaces []models
 	switch resource {
 	case "clusters":
 		summary := &models.Clusters{}
-		err = summary.Parse(dump)
+		err = summary.Parse(dump, identityDomain)
 		response.Clusters = summary
 	case "routes":
 		summary := &models.Routes{}
-		err = summary.Parse(dump, nss)
+		err = summary.Parse(dump, nss, identityDomain)
 		response.Routes = summary
 	case "bootstrap":
 		summary := &models.Bootstrap{}

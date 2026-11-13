@@ -1,88 +1,123 @@
 package business
 
 import (
-	"fmt"
+	"context"
+	"encoding/json"
 	"testing"
+	"time"
 
-	osproject_v1 "github.com/openshift/api/project/v1"
+	"github.com/golang/protobuf/ptypes/wrappers"
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
+	api_networking_v1 "istio.io/api/networking/v1"
+	extentions_v1alpha1 "istio.io/client-go/pkg/apis/extensions/v1alpha1"
+	networking_v1 "istio.io/client-go/pkg/apis/networking/v1"
 	auth_v1 "k8s.io/api/authorization/v1"
+	core_v1 "k8s.io/api/core/v1"
 	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 
 	"github.com/kiali/kiali/config"
 	"github.com/kiali/kiali/kubernetes"
 	"github.com/kiali/kiali/kubernetes/kubetest"
 	"github.com/kiali/kiali/models"
 	"github.com/kiali/kiali/tests/data"
+	"github.com/kiali/kiali/tests/testutils"
+	"github.com/kiali/kiali/tests/testutils/validations"
 )
 
 func TestParseListParams(t *testing.T) {
-	namespace := "bookinfo"
 	objects := ""
 	labelSelector := ""
-	criteria := ParseIstioConfigCriteria(namespace, objects, labelSelector, "")
+	criteria := ParseIstioConfigCriteria(objects, labelSelector, "")
 
-	assert.Equal(t, "bookinfo", criteria.Namespace)
 	assert.True(t, criteria.IncludeVirtualServices)
 	assert.True(t, criteria.IncludeDestinationRules)
 	assert.True(t, criteria.IncludeServiceEntries)
+	assert.True(t, criteria.IncludeTrafficExtensions)
+	assert.True(t, criteria.IncludeWasmPlugins)
 
-	objects = "gateways"
-	criteria = ParseIstioConfigCriteria(namespace, objects, labelSelector, "")
+	objects = kubernetes.Gateways.String()
+	criteria = ParseIstioConfigCriteria(objects, labelSelector, "")
 
 	assert.True(t, criteria.IncludeGateways)
 	assert.False(t, criteria.IncludeVirtualServices)
 	assert.False(t, criteria.IncludeDestinationRules)
 	assert.False(t, criteria.IncludeServiceEntries)
 
-	objects = "virtualservices"
-	criteria = ParseIstioConfigCriteria(namespace, objects, labelSelector, "")
+	objects = kubernetes.K8sGateways.String()
+	criteria = ParseIstioConfigCriteria(objects, labelSelector, "")
+
+	assert.True(t, criteria.IncludeK8sGateways)
+	assert.False(t, criteria.IncludeVirtualServices)
+	assert.False(t, criteria.IncludeDestinationRules)
+	assert.False(t, criteria.IncludeServiceEntries)
+
+	objects = kubernetes.VirtualServices.String()
+	criteria = ParseIstioConfigCriteria(objects, labelSelector, "")
 
 	assert.False(t, criteria.IncludeGateways)
 	assert.True(t, criteria.IncludeVirtualServices)
 	assert.False(t, criteria.IncludeDestinationRules)
 	assert.False(t, criteria.IncludeServiceEntries)
 
-	objects = "destinationrules"
-	criteria = ParseIstioConfigCriteria(namespace, objects, labelSelector, "")
+	objects = kubernetes.DestinationRules.String()
+	criteria = ParseIstioConfigCriteria(objects, labelSelector, "")
 
 	assert.False(t, criteria.IncludeGateways)
 	assert.False(t, criteria.IncludeVirtualServices)
 	assert.True(t, criteria.IncludeDestinationRules)
 	assert.False(t, criteria.IncludeServiceEntries)
 
-	objects = "serviceentries"
-	criteria = ParseIstioConfigCriteria(namespace, objects, labelSelector, "")
+	objects = kubernetes.ServiceEntries.String()
+	criteria = ParseIstioConfigCriteria(objects, labelSelector, "")
 
 	assert.False(t, criteria.IncludeGateways)
 	assert.False(t, criteria.IncludeVirtualServices)
 	assert.False(t, criteria.IncludeDestinationRules)
 	assert.True(t, criteria.IncludeServiceEntries)
 
-	objects = "virtualservices"
-	criteria = ParseIstioConfigCriteria(namespace, objects, labelSelector, "")
+	objects = kubernetes.VirtualServices.String()
+	criteria = ParseIstioConfigCriteria(objects, labelSelector, "")
 
 	assert.False(t, criteria.IncludeGateways)
 	assert.True(t, criteria.IncludeVirtualServices)
 	assert.False(t, criteria.IncludeDestinationRules)
 	assert.False(t, criteria.IncludeServiceEntries)
 
-	objects = "destinationrules,virtualservices"
-	criteria = ParseIstioConfigCriteria(namespace, objects, labelSelector, "")
+	objects = kubernetes.DestinationRules.String() + ";" + kubernetes.VirtualServices.String()
+	criteria = ParseIstioConfigCriteria(objects, labelSelector, "")
 
 	assert.False(t, criteria.IncludeGateways)
 	assert.True(t, criteria.IncludeVirtualServices)
 	assert.True(t, criteria.IncludeDestinationRules)
 	assert.False(t, criteria.IncludeServiceEntries)
 
+	objects = kubernetes.TrafficExtensions.String()
+	criteria = ParseIstioConfigCriteria(objects, labelSelector, "")
+
+	assert.True(t, criteria.IncludeTrafficExtensions)
+	assert.False(t, criteria.IncludeWasmPlugins)
+	assert.False(t, criteria.IncludeGateways)
+	assert.False(t, criteria.IncludeVirtualServices)
+	assert.False(t, criteria.IncludeDestinationRules)
+
+	objects = kubernetes.WasmPlugins.String()
+	criteria = ParseIstioConfigCriteria(objects, labelSelector, "")
+
+	assert.True(t, criteria.IncludeWasmPlugins)
+	assert.False(t, criteria.IncludeTrafficExtensions)
+	assert.False(t, criteria.IncludeGateways)
+
 	objects = "notsupported"
-	criteria = ParseIstioConfigCriteria(namespace, objects, labelSelector, "")
+	criteria = ParseIstioConfigCriteria(objects, labelSelector, "")
 
 	assert.False(t, criteria.IncludeGateways)
 	assert.False(t, criteria.IncludeVirtualServices)
 	assert.False(t, criteria.IncludeDestinationRules)
 	assert.False(t, criteria.IncludeServiceEntries)
+	assert.False(t, criteria.IncludeTrafficExtensions)
 }
 
 func TestGetIstioConfigList(t *testing.T) {
@@ -91,129 +126,250 @@ func TestGetIstioConfigList(t *testing.T) {
 	config.Set(conf)
 
 	criteria := IstioConfigCriteria{
-		Namespace:               "test",
 		IncludeGateways:         false,
 		IncludeVirtualServices:  false,
 		IncludeDestinationRules: false,
 		IncludeServiceEntries:   false,
 	}
+	cluster := conf.KubernetesConfig.ClusterName
 
-	configService := mockGetIstioConfigList()
+	configService := mockGetIstioConfigList(t)
 
-	istioconfigList, err := configService.GetIstioConfigList(criteria)
+	istioconfigList, err := configService.GetIstioConfigList(context.TODO(), cluster, criteria)
 
 	assert.Equal(0, len(istioconfigList.Gateways))
-	assert.Equal(0, len(istioconfigList.VirtualServices.Items))
-	assert.Equal(0, len(istioconfigList.DestinationRules.Items))
+	assert.Equal(0, len(istioconfigList.VirtualServices))
+	assert.Equal(0, len(istioconfigList.DestinationRules))
 	assert.Equal(0, len(istioconfigList.ServiceEntries))
 	assert.Nil(err)
 
 	criteria.IncludeGateways = true
 
-	istioconfigList, err = configService.GetIstioConfigList(criteria)
+	istioconfigList, err = configService.GetIstioConfigList(context.TODO(), cluster, criteria)
 
 	assert.Equal(2, len(istioconfigList.Gateways))
-	assert.Equal(0, len(istioconfigList.VirtualServices.Items))
-	assert.Equal(0, len(istioconfigList.DestinationRules.Items))
+	assert.Equal(0, len(istioconfigList.VirtualServices))
+	assert.Equal(0, len(istioconfigList.DestinationRules))
 	assert.Equal(0, len(istioconfigList.ServiceEntries))
 	assert.Nil(err)
 
 	criteria.IncludeVirtualServices = true
 
-	istioconfigList, err = configService.GetIstioConfigList(criteria)
+	istioconfigList, err = configService.GetIstioConfigList(context.TODO(), cluster, criteria)
 
 	assert.Equal(2, len(istioconfigList.Gateways))
-	assert.Equal(2, len(istioconfigList.VirtualServices.Items))
-	assert.Equal(0, len(istioconfigList.DestinationRules.Items))
+	assert.Equal(2, len(istioconfigList.VirtualServices))
+	assert.Equal(0, len(istioconfigList.DestinationRules))
 	assert.Equal(0, len(istioconfigList.ServiceEntries))
 	assert.Nil(err)
 
 	criteria.IncludeDestinationRules = true
 
-	istioconfigList, err = configService.GetIstioConfigList(criteria)
+	istioconfigList, err = configService.GetIstioConfigList(context.TODO(), cluster, criteria)
 
 	assert.Equal(2, len(istioconfigList.Gateways))
-	assert.Equal(2, len(istioconfigList.VirtualServices.Items))
-	assert.Equal(2, len(istioconfigList.DestinationRules.Items))
+	assert.Equal(2, len(istioconfigList.VirtualServices))
+	assert.Equal(2, len(istioconfigList.DestinationRules))
 	assert.Equal(0, len(istioconfigList.ServiceEntries))
 	assert.Nil(err)
 
 	criteria.IncludeServiceEntries = true
 
-	istioconfigList, err = configService.GetIstioConfigList(criteria)
+	istioconfigList, err = configService.GetIstioConfigList(context.TODO(), cluster, criteria)
 
 	assert.Equal(2, len(istioconfigList.Gateways))
-	assert.Equal(2, len(istioconfigList.VirtualServices.Items))
-	assert.Equal(2, len(istioconfigList.DestinationRules.Items))
+	assert.Equal(2, len(istioconfigList.VirtualServices))
+	assert.Equal(2, len(istioconfigList.DestinationRules))
 	assert.Equal(1, len(istioconfigList.ServiceEntries))
 	assert.Nil(err)
 }
 
 func TestGetIstioConfigDetails(t *testing.T) {
 	assert := assert.New(t)
+
+	configService := mockGetIstioConfigDetails(t)
+	conf := config.Get()
+
+	istioConfigDetails, err := configService.GetIstioConfigDetails(context.TODO(), conf.KubernetesConfig.ClusterName, "test", kubernetes.Gateways, "gw-1")
+	assert.Equal("gw-1", istioConfigDetails.Gateway.Name)
+	assert.True(istioConfigDetails.Permissions.Update)
+	assert.False(istioConfigDetails.Permissions.Delete)
+	assert.Equal(conf.KubernetesConfig.ClusterName, istioConfigDetails.Namespace.Cluster)
+	assert.Nil(err)
+
+	istioConfigDetails, err = configService.GetIstioConfigDetails(context.TODO(), conf.KubernetesConfig.ClusterName, "test", kubernetes.VirtualServices, "reviews")
+	assert.Equal("reviews", istioConfigDetails.VirtualService.Name)
+	assert.Equal("VirtualService", istioConfigDetails.VirtualService.Kind)
+	assert.Equal("networking.istio.io/v1", istioConfigDetails.VirtualService.APIVersion)
+	assert.Nil(err)
+
+	istioConfigDetails, err = configService.GetIstioConfigDetails(context.TODO(), conf.KubernetesConfig.ClusterName, "test", kubernetes.DestinationRules, "reviews-dr")
+	assert.Equal("reviews-dr", istioConfigDetails.DestinationRule.Name)
+	assert.Equal("DestinationRule", istioConfigDetails.DestinationRule.Kind)
+	assert.Equal("networking.istio.io/v1", istioConfigDetails.DestinationRule.APIVersion)
+	assert.Nil(err)
+
+	istioConfigDetails, err = configService.GetIstioConfigDetails(context.TODO(), conf.KubernetesConfig.ClusterName, "test", kubernetes.ServiceEntries, "googleapis")
+	assert.Equal("googleapis", istioConfigDetails.ServiceEntry.Name)
+	assert.Equal("ServiceEntry", istioConfigDetails.ServiceEntry.Kind)
+	assert.Equal("networking.istio.io/v1", istioConfigDetails.ServiceEntry.APIVersion)
+	assert.Nil(err)
+}
+
+func TestCheckMulticlusterPermissions(t *testing.T) {
+	assert := assert.New(t)
+
+	configService := mockGetIstioConfigDetailsMulticluster(t)
+
+	istioConfigDetails, err := configService.GetIstioConfigDetails(context.TODO(), config.Get().KubernetesConfig.ClusterName, "test", kubernetes.Gateways, "gw-1")
+	assert.Equal("gw-1", istioConfigDetails.Gateway.Name)
+	assert.True(istioConfigDetails.Permissions.Update)
+	assert.False(istioConfigDetails.Permissions.Delete)
+	assert.Equal(config.Get().KubernetesConfig.ClusterName, istioConfigDetails.Namespace.Cluster)
+	assert.Nil(err)
+
+	istioConfigDetailsRemote, err := configService.GetIstioConfigDetails(context.TODO(), "east", "test", kubernetes.Gateways, "gw-1")
+	assert.Equal("gw-1", istioConfigDetailsRemote.Gateway.Name)
+	assert.True(istioConfigDetailsRemote.Permissions.Update)
+	assert.False(istioConfigDetailsRemote.Permissions.Delete)
+	assert.Equal("east", istioConfigDetailsRemote.Namespace.Cluster)
+	assert.Nil(err)
+}
+
+// Regression test for https://github.com/kiali/kiali/issues/10486
+// A role that names individual resources (no resources: ["*"] wildcard),
+// like the OLM-generated ClusterRoles aggregated into OpenShift's admin/edit,
+// must still grant permissions when checked by plural resource name.
+func TestGetIstioConfigPermissionsNamedResources(t *testing.T) {
+	assert := assert.New(t)
+
 	conf := config.NewConfig()
 	config.Set(conf)
 
-	configService := mockGetIstioConfigDetails()
+	verbs := map[string]bool{"create": true, "patch": true, "delete": true}
+	rules := map[string]map[string]bool{
+		"networking.istio.io/sidecars":             verbs,
+		"networking.istio.io/gateways":             verbs,
+		"networking.istio.io/serviceentries":       verbs,
+		"security.istio.io/authorizationpolicies":  verbs,
+		"security.istio.io/peerauthentications":    verbs,
+		"security.istio.io/requestauthentications": verbs,
+	}
 
-	istioConfigDetails, err := configService.GetIstioConfigDetails("test", "gateways", "gw-1")
-	assert.Equal("gw-1", istioConfigDetails.Gateway.Metadata.Name)
-	assert.True(istioConfigDetails.Permissions.Update)
-	assert.False(istioConfigDetails.Permissions.Delete)
-	assert.Nil(err)
+	k8s := kubetest.NewFakeK8sClient(&core_v1.Namespace{ObjectMeta: meta_v1.ObjectMeta{Name: "test"}})
+	configService := NewLayerBuilder(t, conf).WithClient(&fakeAccessReview{k8s, rules}).Build().IstioConfig
 
-	istioConfigDetails, err = configService.GetIstioConfigDetails("test", "virtualservices", "reviews")
-	assert.Equal("reviews", istioConfigDetails.VirtualService.Metadata.Name)
-	assert.Nil(err)
+	permissions := configService.GetIstioConfigPermissions(context.TODO(), []string{"test"}, conf.KubernetesConfig.ClusterName)
+	assert.NotNil(permissions["test"])
 
-	istioConfigDetails, err = configService.GetIstioConfigDetails("test", "destinationrules", "reviews-dr")
-	assert.Equal("reviews-dr", istioConfigDetails.DestinationRule.Metadata.Name)
-	assert.Nil(err)
+	for _, gvk := range []schema.GroupVersionKind{
+		kubernetes.Sidecars,
+		kubernetes.Gateways,
+		kubernetes.ServiceEntries,
+		kubernetes.AuthorizationPolicies,
+		kubernetes.PeerAuthentications,
+		kubernetes.RequestAuthentications,
+	} {
+		perm := (*permissions["test"])[gvk.String()]
+		if assert.NotNil(perm, gvk.String()) {
+			assert.True(perm.Create, gvk.String())
+			assert.True(perm.Update, gvk.String())
+			assert.True(perm.Delete, gvk.String())
+		}
+	}
 
-	istioConfigDetails, err = configService.GetIstioConfigDetails("test", "serviceentries", "googleapis")
-	assert.Equal("googleapis", istioConfigDetails.ServiceEntry.Metadata.Name)
-	assert.Nil(err)
-
-	istioConfigDetails, err = configService.GetIstioConfigDetails("test", "rules-bad", "stdio")
-	assert.Error(err)
+	// Types not granted by the role stay denied.
+	for _, gvk := range []schema.GroupVersionKind{
+		kubernetes.K8sGateways,
+		kubernetes.K8sReferenceGrants,
+	} {
+		perm := (*permissions["test"])[gvk.String()]
+		if assert.NotNil(perm, gvk.String()) {
+			assert.False(perm.Create, gvk.String())
+			assert.False(perm.Update, gvk.String())
+			assert.False(perm.Delete, gvk.String())
+		}
+	}
 }
 
-func mockGetIstioConfigList() IstioConfigService {
-	k8s := new(kubetest.K8SClientMock)
-	k8s.On("IsOpenShift").Return(true)
-	k8s.On("GetProject", mock.AnythingOfType("string")).Return(&osproject_v1.Project{}, nil)
-	k8s.On("GetIstioObjects", mock.AnythingOfType("string"), "gateways", mock.AnythingOfType("string")).Return(fakeGetGateways(), nil)
-	k8s.On("GetIstioObjects", mock.AnythingOfType("string"), "virtualservices", "").Return(fakeGetVirtualServices(), nil)
-	k8s.On("GetIstioObjects", mock.AnythingOfType("string"), "destinationrules", "").Return(fakeGetDestinationRules(), nil)
-	k8s.On("GetIstioObjects", mock.AnythingOfType("string"), "serviceentries", "").Return(fakeGetServiceEntries(), nil)
-	k8s.On("GetIstioObjects", mock.AnythingOfType("string"), "rules", "").Return(fakeGetIstioRules(), nil)
-	k8s.On("GetIstioObjects", mock.AnythingOfType("string"), "adapters", "").Return(fakeGetAdapters(), nil)
-	k8s.On("GetIstioObjects", mock.AnythingOfType("string"), "templates", "").Return(fakeGetTemplates(), nil)
-	k8s.On("GetIstioObjects", mock.AnythingOfType("string"), "quotaspecs", "").Return(fakeGetQuotaSpecs(), nil)
-	k8s.On("GetIstioObjects", mock.AnythingOfType("string"), "quotaspecbindings", "").Return(fakeGetQuotaSpecBindings(), nil)
-	k8s.On("GetIstioObjects", mock.AnythingOfType("string"), "policies", "").Return(fakeGetPolicies(), nil)
+// A role granting resources: ["*"] in an API group (like Kiali's own role
+// template) must keep working with per-resource checks.
+func TestGetIstioConfigPermissionsWildcardResources(t *testing.T) {
+	assert := assert.New(t)
 
-	return IstioConfigService{k8s: k8s, businessLayer: NewWithBackends(k8s, nil, nil)}
+	conf := config.NewConfig()
+	config.Set(conf)
+
+	verbs := map[string]bool{"create": true, "patch": true, "delete": true}
+	rules := map[string]map[string]bool{
+		"networking.istio.io/*": verbs,
+		"security.istio.io/*":   verbs,
+	}
+
+	k8s := kubetest.NewFakeK8sClient(&core_v1.Namespace{ObjectMeta: meta_v1.ObjectMeta{Name: "test"}})
+	configService := NewLayerBuilder(t, conf).WithClient(&fakeAccessReview{k8s, rules}).Build().IstioConfig
+
+	permissions := configService.GetIstioConfigPermissions(context.TODO(), []string{"test"}, conf.KubernetesConfig.ClusterName)
+	assert.NotNil(permissions["test"])
+
+	for _, gvk := range []schema.GroupVersionKind{
+		kubernetes.Sidecars,
+		kubernetes.Gateways,
+		kubernetes.ServiceEntries,
+		kubernetes.AuthorizationPolicies,
+		kubernetes.PeerAuthentications,
+		kubernetes.RequestAuthentications,
+	} {
+		perm := (*permissions["test"])[gvk.String()]
+		if assert.NotNil(perm, gvk.String()) {
+			assert.True(perm.Create, gvk.String())
+			assert.True(perm.Update, gvk.String())
+			assert.True(perm.Delete, gvk.String())
+		}
+	}
 }
 
-func fakeGetGateways() []kubernetes.IstioObject {
+func mockGetIstioConfigList(t *testing.T) IstioConfigService {
+	fakeIstioObjects := []runtime.Object{&core_v1.Namespace{ObjectMeta: meta_v1.ObjectMeta{Name: "test"}}}
+	for _, g := range fakeGetGateways() {
+		fakeIstioObjects = append(fakeIstioObjects, g.DeepCopyObject())
+	}
+	for _, v := range fakeGetVirtualServices() {
+		fakeIstioObjects = append(fakeIstioObjects, v.DeepCopyObject())
+	}
+	for _, d := range fakeGetDestinationRules() {
+		fakeIstioObjects = append(fakeIstioObjects, d.DeepCopyObject())
+	}
+	for _, s := range fakeGetServiceEntries() {
+		fakeIstioObjects = append(fakeIstioObjects, s.DeepCopyObject())
+	}
+	k8s := kubetest.NewFakeK8sClient(
+		fakeIstioObjects...,
+	)
+	k8s.OpenShift = true
+
+	conf := config.NewConfig()
+
+	return NewLayerBuilder(t, conf).WithClient(k8s).Build().IstioConfig
+}
+
+func fakeGetGateways() []*networking_v1.Gateway {
 	gw1 := data.CreateEmptyGateway("gw-1", "test", map[string]string{
 		"app": "my-gateway1-controller",
 	})
-
-	gw1.GetSpec()["servers"] = []interface{}{
-		map[string]interface{}{
-			"port": map[string]interface{}{
-				"number":   80,
-				"name":     "http",
-				"protocol": "HTTP",
+	gw1.Spec.Servers = []*api_networking_v1.Server{
+		{
+			Port: &api_networking_v1.Port{
+				Number:   80,
+				Name:     "http",
+				Protocol: "HTTP",
 			},
-			"hosts": []interface{}{
+			Hosts: []string{
 				"uk.bookinfo.com",
 				"eu.bookinfo.com",
 			},
-			"tls": map[string]interface{}{
-				"httpsRedirect": "true",
+			Tls: &api_networking_v1.ServerTLSSettings{
+				HttpsRedirect: true,
 			},
 		},
 	}
@@ -221,59 +377,56 @@ func fakeGetGateways() []kubernetes.IstioObject {
 	gw2 := data.CreateEmptyGateway("gw-2", "test", map[string]string{
 		"app": "my-gateway2-controller",
 	})
-
-	gw2.GetSpec()["servers"] = []interface{}{
-		map[string]interface{}{
-			"port": map[string]interface{}{
-				"number":   80,
-				"name":     "http",
-				"protocol": "HTTP",
+	gw2.Spec.Servers = []*api_networking_v1.Server{
+		{
+			Port: &api_networking_v1.Port{
+				Number:   80,
+				Name:     "http",
+				Protocol: "HTTP",
 			},
-			"hosts": []interface{}{
+			Hosts: []string{
 				"uk.bookinfo.com",
 				"eu.bookinfo.com",
 			},
-			"tls": map[string]interface{}{
-				"httpsRedirect": "true",
+			Tls: &api_networking_v1.ServerTLSSettings{
+				HttpsRedirect: true,
 			},
 		},
 	}
 
-	return []kubernetes.IstioObject{gw1, gw2}
+	return []*networking_v1.Gateway{gw1, gw2}
 }
 
-func fakeGetVirtualServices() []kubernetes.IstioObject {
-	virtualService1 := data.AddRoutesToVirtualService("http", data.CreateRoute("reviews", "v2", 50),
-		data.AddRoutesToVirtualService("http", data.CreateRoute("reviews", "v3", 50),
+func fakeGetVirtualServices() []*networking_v1.VirtualService {
+	virtualService1 := data.AddHttpRoutesToVirtualService(data.CreateHttpRouteDestination("reviews", "v2", 50),
+		data.AddHttpRoutesToVirtualService(data.CreateHttpRouteDestination("reviews", "v3", 50),
 			data.CreateEmptyVirtualService("reviews", "test", []string{"reviews"}),
 		),
 	)
 
-	virtualService2 := data.AddRoutesToVirtualService("http", data.CreateRoute("details", "v2", 50),
-		data.AddRoutesToVirtualService("http", data.CreateRoute("details", "v3", 50),
+	virtualService2 := data.AddHttpRoutesToVirtualService(data.CreateHttpRouteDestination("details", "v2", 50),
+		data.AddHttpRoutesToVirtualService(data.CreateHttpRouteDestination("details", "v3", 50),
 			data.CreateEmptyVirtualService("details", "test", []string{"details"}),
 		),
 	)
 
-	return []kubernetes.IstioObject{virtualService1, virtualService2}
+	return []*networking_v1.VirtualService{virtualService1, virtualService2}
 }
 
-func fakeGetDestinationRules() []kubernetes.IstioObject {
-
+func fakeGetDestinationRules() []*networking_v1.DestinationRule {
 	destinationRule1 := data.AddSubsetToDestinationRule(data.CreateSubset("v1", "v1"),
 		data.AddSubsetToDestinationRule(data.CreateSubset("v2", "v2"),
 			data.CreateEmptyDestinationRule("test", "reviews-dr", "reviews")))
 
-	destinationRule1.GetSpec()["trafficPolicy"] = map[string]interface{}{
-		"connectionPool": map[string]interface{}{
-			"http": map[string]interface{}{
-				"maxRequestsPerConnection": 100,
+	errors := wrappers.UInt32Value{Value: 50}
+	destinationRule1.Spec.TrafficPolicy = &api_networking_v1.TrafficPolicy{
+		ConnectionPool: &api_networking_v1.ConnectionPoolSettings{
+			Http: &api_networking_v1.ConnectionPoolSettings_HTTPSettings{
+				MaxRequestsPerConnection: 100,
 			},
 		},
-		"outlierDetection": map[string]interface{}{
-			"http": map[string]interface{}{
-				"consecutiveErrors": 50,
-			},
+		OutlierDetection: &api_networking_v1.OutlierDetection{
+			Consecutive_5XxErrors: &errors,
 		},
 	}
 
@@ -281,178 +434,35 @@ func fakeGetDestinationRules() []kubernetes.IstioObject {
 		data.AddSubsetToDestinationRule(data.CreateSubset("v2", "v2"),
 			data.CreateEmptyDestinationRule("test", "details-dr", "details")))
 
-	destinationRule2.GetSpec()["trafficPolicy"] = map[string]interface{}{
-		"connectionPool": map[string]interface{}{
-			"http": map[string]interface{}{
-				"maxRequestsPerConnection": 100,
+	destinationRule2.Spec.TrafficPolicy = &api_networking_v1.TrafficPolicy{
+		ConnectionPool: &api_networking_v1.ConnectionPoolSettings{
+			Http: &api_networking_v1.ConnectionPoolSettings_HTTPSettings{
+				MaxRequestsPerConnection: 100,
 			},
 		},
-		"outlierDetection": map[string]interface{}{
-			"http": map[string]interface{}{
-				"consecutiveErrors": 50,
-			},
+		OutlierDetection: &api_networking_v1.OutlierDetection{
+			Consecutive_5XxErrors: &errors,
 		},
 	}
 
-	return []kubernetes.IstioObject{destinationRule1, destinationRule2}
+	return []*networking_v1.DestinationRule{destinationRule1, destinationRule2}
 }
 
-func fakeGetServiceEntries() []kubernetes.IstioObject {
-	serviceEntry := kubernetes.GenericIstioObject{
-		ObjectMeta: meta_v1.ObjectMeta{
-			Name: "googleapis",
-		},
-		Spec: map[string]interface{}{
-			"hosts": []interface{}{
-				"*.googleapis.com",
-			},
-			"ports": []interface{}{
-				map[string]interface{}{
-					"number":   443,
-					"name":     "https",
-					"protocol": "http",
-				},
-			},
+func fakeGetServiceEntries() []*networking_v1.ServiceEntry {
+	serviceEntry := networking_v1.ServiceEntry{}
+	serviceEntry.Name = "googleapis"
+	serviceEntry.Namespace = "test"
+	serviceEntry.Spec.Hosts = []string{
+		"*.googleapis.com",
+	}
+	serviceEntry.Spec.Ports = []*api_networking_v1.ServicePort{
+		{
+			Number:   443,
+			Name:     "https",
+			Protocol: "HTTP",
 		},
 	}
-	return []kubernetes.IstioObject{&serviceEntry}
-}
-
-func fakeGetIstioRules() []kubernetes.IstioObject {
-	stdioRule := kubernetes.GenericIstioObject{}
-	stdioRule.Name = "stdio"
-	stdioRule.Spec = map[string]interface{}{
-		"match": "true",
-		"actions": []map[string]interface{}{
-			{
-				"handler": "handler.stdio",
-				"instances": []string{
-					"accesslog.logentry",
-				},
-			},
-		},
-	}
-	return []kubernetes.IstioObject{&stdioRule}
-}
-
-func fakeGetAdapters() []kubernetes.IstioObject {
-	handler := kubernetes.GenericIstioObject{}
-	handler.Name = "preferencewhitelist"
-	handler.Spec = map[string]interface{}{
-		"overrides": []string{
-			"recommendation",
-		},
-		"blacklist": false,
-		"adapter":   "listchecker",
-	}
-	return []kubernetes.IstioObject{&handler}
-}
-
-func fakeGetTemplates() []kubernetes.IstioObject {
-	instance := kubernetes.GenericIstioObject{}
-	instance.Name = "preferencesource"
-	instance.Spec = map[string]interface{}{
-		"value":    "source.labels[\"app\"]",
-		"template": "listentry",
-	}
-	return []kubernetes.IstioObject{&instance}
-}
-
-func fakeCheckFromCustomerRule() kubernetes.IstioObject {
-	checkfromcustomerRule := kubernetes.GenericIstioObject{}
-	checkfromcustomerRule.Name = "checkfromcustomer"
-	checkfromcustomerRule.Spec = map[string]interface{}{
-		"match": "destination.labels[\"app\"] == \"preference\"",
-		"actions": []map[string]interface{}{
-			{
-				"handler": "preferencewhitelist.listchecker",
-				"instances": []string{
-					"preferencesource.listentry",
-				},
-			},
-		},
-	}
-	return &checkfromcustomerRule
-}
-
-func fakeGetQuotaSpecs() []kubernetes.IstioObject {
-	quotaSpec := kubernetes.GenericIstioObject{}
-	quotaSpec.Name = "request-count"
-	quotaSpec.Spec = map[string]interface{}{
-		"rules": []interface{}{
-			map[string]interface{}{
-				"quotas": []interface{}{
-					map[string]interface{}{
-						"charge": 1,
-						"quota":  "RequestCount",
-					},
-				},
-			},
-		},
-	}
-	return []kubernetes.IstioObject{&quotaSpec}
-}
-
-func fakeGetQuotaSpecBindings() []kubernetes.IstioObject {
-	quotaSpec := kubernetes.GenericIstioObject{}
-	quotaSpec.Name = "request-count"
-	quotaSpec.Spec = map[string]interface{}{
-		"quotaSpecs": []interface{}{
-			map[string]interface{}{
-				"name":      "request-count",
-				"namespace": "istio-system",
-			},
-		},
-		"services": []interface{}{
-			map[string]interface{}{
-				"name": "ratings",
-			},
-			map[string]interface{}{
-				"name": "reviews",
-			},
-			map[string]interface{}{
-				"name": "details",
-			},
-			map[string]interface{}{
-				"name": "productpage",
-			},
-		},
-	}
-	return []kubernetes.IstioObject{&quotaSpec}
-}
-
-func fakeGetPolicies() []kubernetes.IstioObject {
-	policy := kubernetes.GenericIstioObject{}
-	policy.Name = "request-count"
-	policy.Spec = map[string]interface{}{
-		"targets": []interface{}{
-			map[string]interface{}{
-				"name": "target",
-				"port": []interface{}{
-					map[string]interface{}{
-						"number": 8080,
-						"name":   "tomcat",
-					},
-				},
-			},
-			map[string]interface{}{
-				"name": "target",
-				"port": []interface{}{
-					map[string]interface{}{
-						"number": 80,
-						"name":   "nginx",
-					},
-				},
-			},
-		},
-		"peers": []interface{}{
-			map[string]interface{}{
-				"mode": "STRICT",
-			},
-		},
-	}
-	return []kubernetes.IstioObject{&policy}
-
+	return []*networking_v1.ServiceEntry{&serviceEntry}
 }
 
 func fakeGetSelfSubjectAccessReview() []*auth_v1.SelfSubjectAccessReview {
@@ -498,267 +508,548 @@ func fakeGetSelfSubjectAccessReview() []*auth_v1.SelfSubjectAccessReview {
 	return []*auth_v1.SelfSubjectAccessReview{&create, &update, &delete}
 }
 
-func mockGetIstioConfigDetails() IstioConfigService {
-	k8s := new(kubetest.K8SClientMock)
-	k8s.On("IsOpenShift").Return(true)
-	k8s.On("GetProject", mock.AnythingOfType("string")).Return(&osproject_v1.Project{}, nil)
-	k8s.On("GetIstioObject", "test", "gateways", "gw-1").Return(fakeGetGateways()[0], nil)
-	k8s.On("GetIstioObject", "test", "virtualservices", "reviews").Return(fakeGetVirtualServices()[0], nil)
-	k8s.On("GetIstioObject", "test", "destinationrules", "reviews-dr").Return(fakeGetDestinationRules()[0], nil)
-	k8s.On("GetIstioObject", "test", "serviceentries", "googleapis").Return(fakeGetServiceEntries()[0], nil)
-	k8s.On("GetIstioObject", "test", "rules", "checkfromcustomer").Return(fakeCheckFromCustomerRule(), nil)
-	k8s.On("GetIstioObject", "test", "adapters", "preferencewhitelist").Return(fakeGetAdapters()[0], nil)
-	k8s.On("GetIstioObject", "test", "templates", "preferencesource").Return(fakeGetTemplates()[0], nil)
-	k8s.On("GetIstioObject", "test", "quotaspecs", "request-count").Return(fakeGetQuotaSpecs()[0], nil)
-	k8s.On("GetIstioObject", "test", "quotaspecbindings", "request-count").Return(fakeGetQuotaSpecBindings()[0], nil)
-	k8s.On("GetSelfSubjectAccessReview", "test", mock.AnythingOfType("string"), mock.AnythingOfType("string"), mock.AnythingOfType("[]string")).Return(fakeGetSelfSubjectAccessReview(), nil)
+// Need to mock out the SelfSubjectAccessReview.
+type fakeAccessReview struct {
+	kubernetes.UserClientInterface
+	// rules emulates RBAC roles that name individual resources (like the
+	// OLM-generated ClusterRoles aggregated into OpenShift's admin/edit).
+	// Keyed by "api/resource" (wildcards "api/*" and "*/*" are honored) with
+	// the set of allowed verbs. When nil, a legacy fixed response is returned.
+	rules map[string]map[string]bool
+}
 
-	return IstioConfigService{k8s: k8s, businessLayer: NewWithBackends(k8s, nil, nil)}
+func (a *fakeAccessReview) allowed(api, resourceType, verb string) bool {
+	for _, key := range []string{api + "/" + resourceType, api + "/*", "*/*"} {
+		if a.rules[key][verb] {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *fakeAccessReview) GetSelfSubjectAccessReview(ctx context.Context, namespace, api, resourceType string, verbs []string) ([]*auth_v1.SelfSubjectAccessReview, error) {
+	if a.rules == nil {
+		return fakeGetSelfSubjectAccessReview(), nil
+	}
+	ssars := make([]*auth_v1.SelfSubjectAccessReview, 0, len(verbs))
+	for _, verb := range verbs {
+		ssars = append(ssars, &auth_v1.SelfSubjectAccessReview{
+			Spec: auth_v1.SelfSubjectAccessReviewSpec{
+				ResourceAttributes: &auth_v1.ResourceAttributes{
+					Namespace: namespace,
+					Verb:      verb,
+					Group:     api,
+					Resource:  resourceType,
+				},
+			},
+			Status: auth_v1.SubjectAccessReviewStatus{
+				Allowed: a.allowed(api, resourceType, verb),
+			},
+		})
+	}
+	return ssars, nil
+}
+
+func mockGetIstioConfigDetails(t *testing.T) IstioConfigService {
+	conf := config.NewConfig()
+	config.Set(conf)
+	fakeIstioObjects := []runtime.Object{
+		fakeGetGateways()[0],
+		fakeGetVirtualServices()[0],
+		fakeGetDestinationRules()[0],
+		fakeGetServiceEntries()[0],
+		&core_v1.Namespace{ObjectMeta: meta_v1.ObjectMeta{Name: "test"}},
+	}
+	k8s := kubetest.NewFakeK8sClient(fakeIstioObjects...)
+	k8s.OpenShift = true
+
+	return NewLayerBuilder(t, conf).WithClient(&fakeAccessReview{UserClientInterface: k8s}).Build().IstioConfig
+}
+
+func mockGetIstioConfigDetailsMulticluster(t *testing.T) IstioConfigService {
+	conf := config.NewConfig()
+	config.Set(conf)
+	fakeIstioObjects := []runtime.Object{
+		fakeGetGateways()[0],
+		fakeGetVirtualServices()[0],
+		fakeGetDestinationRules()[0],
+		fakeGetServiceEntries()[0],
+		&core_v1.Namespace{ObjectMeta: meta_v1.ObjectMeta{Name: "test"}},
+	}
+	k8s := kubetest.NewFakeK8sClient(fakeIstioObjects...)
+	k8s.OpenShift = true
+
+	k8sclients := make(map[string]kubernetes.UserClientInterface)
+	k8sclients[conf.KubernetesConfig.ClusterName] = &fakeAccessReview{UserClientInterface: k8s}
+	k8sclients["east"] = &fakeAccessReview{UserClientInterface: k8s}
+
+	return NewLayerBuilder(t, conf).WithClients(k8sclients).Build().IstioConfig
 }
 
 func TestIsValidHost(t *testing.T) {
 	conf := config.NewConfig()
 	config.Set(conf)
 
-	virtualServiceIstioObject := kubernetes.GenericIstioObject{
-		ObjectMeta: meta_v1.ObjectMeta{
-			Name: "reviews",
-		},
-		Spec: map[string]interface{}{
-			"hosts": []interface{}{
-				"reviews",
-			},
-			"http": []interface{}{
-				map[string]interface{}{
-					"route": []interface{}{
-						map[string]interface{}{
-							"destination": map[string]interface{}{
-								"host":   "reviews",
-								"subset": "v2",
-							},
-							"weight": 50,
-						},
-						map[string]interface{}{
-							"destination": map[string]interface{}{
-								"host":   "reviews",
-								"subset": "v3",
-							},
-							"weight": 50,
-						},
-					},
-				},
-			},
-		},
-	}
-	virtualService := models.VirtualService{}
-	virtualService.Parse(virtualServiceIstioObject.DeepCopyIstioObject())
+	vs := data.CreateEmptyVirtualService("reviews", "test", []string{"reviews"})
+	vs = data.AddHttpRoutesToVirtualService(data.CreateHttpRouteDestination("reviews", "v2", 50), vs)
+	vs = data.AddHttpRoutesToVirtualService(data.CreateHttpRouteDestination("reviews", "v3", 50), vs)
 
-	assert.False(t, virtualService.IsValidHost("", ""))
-	assert.False(t, virtualService.IsValidHost("", "ratings"))
-	assert.True(t, virtualService.IsValidHost("", "reviews"))
+	id := config.ResolveIdentityDomain(conf.ExternalServices.Istio.IstioIdentityDomain, "")
+	assert.False(t, models.IsVSValidHost(vs, "test", "", id))
+	assert.False(t, models.IsVSValidHost(vs, "test", "ratings", id))
+	assert.True(t, models.IsVSValidHost(vs, "test", "reviews", id))
 }
 
 func TestHasCircuitBreaker(t *testing.T) {
 	conf := config.NewConfig()
 	config.Set(conf)
 
-	// Note - I don't think the subset definitions here have any impact on the CB
-	// detection. They do not do any sort of override so presumably any version, including
-	// a v3 would inherit the DR-level CB definition.
-	destinationRule1 := kubernetes.GenericIstioObject{
-		Spec: map[string]interface{}{
-			"host": "reviews",
-			"trafficPolicy": map[string]interface{}{
-				"connectionPool": map[string]interface{}{
-					"http": map[string]interface{}{
-						"maxRequestsPerConnection": 100,
-					},
-				},
-				"outlierDetection": map[string]interface{}{
-					"http": map[string]interface{}{
-						"consecutiveErrors": 50,
-					},
-				},
-			},
-			"subsets": []interface{}{
-				map[string]interface{}{
-					"name": "v1",
-					"labels": map[string]interface{}{
-						"version": "v1",
-					},
-				},
-				map[string]interface{}{
-					"name": "v2",
-					"labels": map[string]interface{}{
-						"version": "v2",
-					},
-				},
+	errors := wrappers.UInt32Value{Value: 50}
+	dRule1 := data.CreateEmptyDestinationRule("test", "reviews", "reviews")
+	dRule1.Spec.TrafficPolicy = &api_networking_v1.TrafficPolicy{
+		ConnectionPool: &api_networking_v1.ConnectionPoolSettings{
+			Http: &api_networking_v1.ConnectionPoolSettings_HTTPSettings{
+				MaxRequestsPerConnection: 100,
 			},
 		},
-	}
-	dRule1 := models.DestinationRule{}
-	dRule1.Parse(destinationRule1.DeepCopyIstioObject())
-
-	assert.False(t, dRule1.HasCircuitBreaker("", "", ""))
-	assert.True(t, dRule1.HasCircuitBreaker("", "reviews", ""))
-	assert.False(t, dRule1.HasCircuitBreaker("", "reviews-bad", ""))
-	assert.True(t, dRule1.HasCircuitBreaker("", "reviews", "v1"))
-	assert.True(t, dRule1.HasCircuitBreaker("", "reviews", "v2"))
-	assert.True(t, dRule1.HasCircuitBreaker("", "reviews", "v3"))
-	assert.False(t, dRule1.HasCircuitBreaker("", "reviews-bad", "v2"))
-
-	destinationRule2 := kubernetes.GenericIstioObject{
-		Spec: map[string]interface{}{
-			"host": "reviews",
-			"subsets": []interface{}{
-				map[string]interface{}{
-					"name": "v1",
-					"labels": map[string]interface{}{
-						"version": "v1",
-					},
-				},
-				map[string]interface{}{
-					"name": "v2",
-					"labels": map[string]interface{}{
-						"version": "v2",
-					},
-					"trafficPolicy": map[string]interface{}{
-						"connectionPool": map[string]interface{}{
-							"http": map[string]interface{}{
-								"maxRequestsPerConnection": 100,
-							},
-						},
-						"outlierDetection": map[string]interface{}{
-							"http": map[string]interface{}{
-								"consecutiveErrors": 50,
-							},
-						},
-					},
-				},
-			},
+		OutlierDetection: &api_networking_v1.OutlierDetection{
+			Consecutive_5XxErrors: &errors,
 		},
 	}
-	dRule2 := models.DestinationRule{}
-	dRule2.Parse(destinationRule2.DeepCopyIstioObject())
+	dRule1 = data.AddSubsetToDestinationRule(data.CreateSubset("v1", "v1"), dRule1)
+	dRule1 = data.AddSubsetToDestinationRule(data.CreateSubset("v2", "v2"), dRule1)
 
-	assert.True(t, dRule2.HasCircuitBreaker("", "reviews", ""))
-	assert.False(t, dRule2.HasCircuitBreaker("", "reviews", "v1"))
-	assert.True(t, dRule2.HasCircuitBreaker("", "reviews", "v2"))
-	assert.False(t, dRule2.HasCircuitBreaker("", "reviews-bad", "v2"))
+	id := config.ResolveIdentityDomain(conf.ExternalServices.Istio.IstioIdentityDomain, "")
+	assert.False(t, models.HasDRCircuitBreaker(dRule1, "test", "", "", id))
+	assert.True(t, models.HasDRCircuitBreaker(dRule1, "test", "reviews", "", id))
+	assert.False(t, models.HasDRCircuitBreaker(dRule1, "test", "reviews-bad", "", id))
+	assert.True(t, models.HasDRCircuitBreaker(dRule1, "test", "reviews", "v1", id))
+	assert.True(t, models.HasDRCircuitBreaker(dRule1, "test", "reviews", "v2", id))
+	assert.True(t, models.HasDRCircuitBreaker(dRule1, "test", "reviews", "v3", id))
+	assert.False(t, models.HasDRCircuitBreaker(dRule1, "test", "reviews-bad", "v2", id))
+
+	dRule2 := data.CreateEmptyDestinationRule("test", "reviews", "reviews")
+	dRule2 = data.AddSubsetToDestinationRule(data.CreateSubset("v1", "v1"), dRule2)
+	dRule2 = data.AddSubsetToDestinationRule(data.CreateSubset("v2", "v2"), dRule2)
+	dRule2.Spec.Subsets[1].TrafficPolicy = &api_networking_v1.TrafficPolicy{
+		ConnectionPool: &api_networking_v1.ConnectionPoolSettings{
+			Http: &api_networking_v1.ConnectionPoolSettings_HTTPSettings{
+				MaxRequestsPerConnection: 100,
+			},
+		},
+		OutlierDetection: &api_networking_v1.OutlierDetection{
+			Consecutive_5XxErrors: &errors,
+		},
+	}
+
+	assert.True(t, models.HasDRCircuitBreaker(dRule2, "test", "reviews", "", id))
+	assert.False(t, models.HasDRCircuitBreaker(dRule2, "test", "reviews", "v1", id))
+	assert.True(t, models.HasDRCircuitBreaker(dRule2, "test", "reviews", "v2", id))
+	assert.False(t, models.HasDRCircuitBreaker(dRule2, "test", "reviews-bad", "v2", id))
 }
 
 func TestDeleteIstioConfigDetails(t *testing.T) {
 	assert := assert.New(t)
-	configService := mockDeleteIstioConfigDetails()
+	k8s := kubetest.NewFakeK8sClient(
+		kubetest.FakeNamespace("test"),
+		data.CreateEmptyVirtualService("reviews-to-delete", "test", []string{"reviews"}),
+	)
+	conf := config.NewConfig()
+	config.Set(conf)
 
-	err := configService.DeleteIstioConfigDetail("networking.istio.io", "test", "virtualservices", "reviews-to-delete")
+	configService := NewLayerBuilder(t, conf).WithClient(k8s).Build().IstioConfig
+
+	err := configService.DeleteIstioConfigDetail(context.Background(), conf.KubernetesConfig.ClusterName, "test", kubernetes.VirtualServices, "reviews-to-delete")
 	assert.Nil(err)
-
-	err = configService.DeleteIstioConfigDetail("config.istio.io", "test", "templates", "listchecker-to-delete")
-	assert.Nil(err)
-}
-
-func mockDeleteIstioConfigDetails() IstioConfigService {
-	k8s := new(kubetest.K8SClientMock)
-	k8s.On("DeleteIstioObject", "networking.istio.io", "test", "virtualservices", "reviews-to-delete").Return(nil)
-	k8s.On("DeleteIstioObject", "config.istio.io", "test", "templates", "listchecker-to-delete").Return(nil)
-	return IstioConfigService{k8s: k8s}
 }
 
 func TestUpdateIstioConfigDetails(t *testing.T) {
 	assert := assert.New(t)
-	configService := mockUpdateIstioConfigDetails()
+	require := require.New(t)
+	k8s := kubetest.NewFakeK8sClient(
+		kubetest.FakeNamespace("test"),
+		data.CreateEmptyVirtualService("reviews-to-update", "test", []string{"reviews"}),
+	)
+	conf := config.NewConfig()
+	config.Set(conf)
 
-	updatedVirtualService, err := configService.UpdateIstioConfigDetail("networking.istio.io", "test", "virtualservices", "reviews-to-update", "{}")
+	configService := NewLayerBuilder(t, conf).WithClient(k8s).Build().IstioConfig
+
+	updatedVirtualService, err := configService.UpdateIstioConfigDetail(context.Background(), conf.KubernetesConfig.ClusterName, "test", kubernetes.VirtualServices, "reviews-to-update", "{}")
+	require.NoError(err)
 	assert.Equal("test", updatedVirtualService.Namespace.Name)
-	assert.Equal("virtualservices", updatedVirtualService.ObjectType)
-	assert.Equal("reviews-to-update", updatedVirtualService.VirtualService.Metadata.Name)
-	assert.Nil(err)
-}
-
-func mockUpdateIstioConfigDetails() IstioConfigService {
-	k8s := new(kubetest.K8SClientMock)
-	var updatedVirtualService, updatedTemplate kubernetes.IstioObject
-
-	updatedVirtualService = &kubernetes.GenericIstioObject{
-		ObjectMeta: meta_v1.ObjectMeta{
-			Name:      "reviews-to-update",
-			Namespace: "test",
-		},
-	}
-	updatedTemplate = &kubernetes.GenericIstioObject{
-		ObjectMeta: meta_v1.ObjectMeta{
-			Name:      "listchecker-to-update",
-			Namespace: "test",
-		},
-	}
-	k8s.On("UpdateIstioObject", "networking.istio.io", "test", "virtualservices", "reviews-to-update", mock.AnythingOfType("string")).Return(updatedVirtualService, nil)
-	k8s.On("UpdateIstioObject", "config.istio.io", "test", "templates", "listchecker-to-update", mock.AnythingOfType("string")).Return(updatedTemplate, nil)
-	return IstioConfigService{k8s: k8s}
-}
-
-// mockCreateIstioConfigDetails to verify the behavior of API calls is the same for create and update
-func mockCreateIstioConfigDetails() IstioConfigService {
-	k8s := new(kubetest.K8SClientMock)
-	var createdVirtualService, createdTemplate kubernetes.IstioObject
-
-	createdVirtualService = &kubernetes.GenericIstioObject{
-		ObjectMeta: meta_v1.ObjectMeta{
-			Name:      "reviews-to-update",
-			Namespace: "test",
-		},
-	}
-	createdTemplate = &kubernetes.GenericIstioObject{
-		ObjectMeta: meta_v1.ObjectMeta{
-			Name:      "listchecker-to-update",
-			Namespace: "test",
-		},
-	}
-	k8s.On("CreateIstioObject", "networking.istio.io", "test", "virtualservices", mock.AnythingOfType("string")).Return(createdVirtualService, nil)
-	k8s.On("CreateIstioObject", "config.istio.io", "test", "templates", mock.AnythingOfType("string")).Return(createdTemplate, nil)
-	return IstioConfigService{k8s: k8s}
+	assert.Equal(conf.KubernetesConfig.ClusterName, updatedVirtualService.Namespace.Cluster)
+	assert.Equal(kubernetes.VirtualServices.String(), updatedVirtualService.ObjectGVK.String())
+	assert.Equal("reviews-to-update", updatedVirtualService.VirtualService.Name)
 }
 
 func TestCreateIstioConfigDetails(t *testing.T) {
 	assert := assert.New(t)
-	configService := mockCreateIstioConfigDetails()
+	k8s := kubetest.NewFakeK8sClient(
+		kubetest.FakeNamespace("test"),
+	)
+	conf := config.NewConfig()
+	config.Set(conf)
+	configService := NewLayerBuilder(t, conf).WithClient(k8s).Build().IstioConfig
 
-	createVirtualService, err := configService.CreateIstioConfigDetail("networking.istio.io", "test", "virtualservices", []byte("{}"))
+	createVirtualService, err := configService.CreateIstioConfigDetail(context.Background(), conf.KubernetesConfig.ClusterName, "test", kubernetes.VirtualServices, []byte("{}"))
 	assert.Equal("test", createVirtualService.Namespace.Name)
-	assert.Equal("virtualservices", createVirtualService.ObjectType)
-	assert.Equal("reviews-to-update", createVirtualService.VirtualService.Metadata.Name)
+	assert.Equal(conf.KubernetesConfig.ClusterName, createVirtualService.Namespace.Cluster)
+	assert.Equal(kubernetes.VirtualServices.String(), createVirtualService.ObjectGVK.String())
+	// Name is now encoded in the payload of the virtualservice so, it modifies this test
+	// assert.Equal("reviews-to-update", createVirtualService.VirtualService.Name)
 	assert.Nil(err)
 }
 
 func TestFilterIstioObjectsForWorkloadSelector(t *testing.T) {
 	assert := assert.New(t)
 
-	path := fmt.Sprintf("../tests/data/filters/workload-selector-filter.yaml")
-	loader := &data.YamlFixtureLoader{Filename: path}
+	path := "../tests/data/filters/workload-selector-filter.yaml"
+	loader := &validations.YamlFixtureLoader{Filename: path}
 	err := loader.Load()
-
 	if err != nil {
 		t.Error("Error loading test data.")
 	}
 
-	istioObjects := loader.GetAllResources()
+	istioConfigList := loader.GetResources()
 
 	s := "app=my-gateway"
-	gw := kubernetes.FilterIstioObjectsForWorkloadSelector(s, istioObjects)
+	gw := kubernetes.FilterGatewaysBySelector(s, istioConfigList.Gateways)
 	assert.Equal(1, len(gw))
-	assert.Equal("my-gateway", gw[0].GetObjectMeta().Name)
+	assert.Equal("my-gateway", gw[0].Name)
 
 	s = "app=my-envoyfilter"
-	ef := kubernetes.FilterIstioObjectsForWorkloadSelector(s, istioObjects)
+	ef := kubernetes.FilterEnvoyFiltersBySelector(s, istioConfigList.EnvoyFilters)
 	assert.Equal(1, len(ef))
-	assert.Equal("my-envoyfilter", ef[0].GetObjectMeta().Name)
+	assert.Equal("my-envoyfilter", ef[0].Name)
 
 	s = "app=my-sidecar"
-	sc := kubernetes.FilterIstioObjectsForWorkloadSelector(s, istioObjects)
+	sc := kubernetes.FilterSidecarsBySelector(s, istioConfigList.Sidecars)
 	assert.Equal(1, len(sc))
-	assert.Equal("my-sidecar", sc[0].GetObjectMeta().Name)
+	assert.Equal("my-sidecar", sc[0].Name)
 
 	s = "app=my-security"
-	sec := kubernetes.FilterIstioObjectsForWorkloadSelector(s, istioObjects)
-	assert.Equal(3, len(sec))
+	ap := kubernetes.FilterAuthorizationPoliciesBySelector(s, istioConfigList.AuthorizationPolicies)
+	assert.Equal(1, len(ap))
+
+	s = "app=my-security"
+	ra := kubernetes.FilterRequestAuthenticationsBySelector(s, istioConfigList.RequestAuthentications)
+	assert.Equal(1, len(ra))
+
+	s = "app=my-security"
+	pa := kubernetes.FilterPeerAuthenticationsBySelector(s, istioConfigList.PeerAuthentications)
+	assert.Equal(1, len(pa))
+}
+
+func TestListWithAllNamespacesButNoAccessReturnsEmpty(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+
+	conf := config.NewConfig()
+	conf.KubernetesConfig.CacheTokenNamespaceDuration = 10000
+	conf.KubernetesConfig.ClusterName = "Kubernetes"
+	kubernetes.SetConfig(t, *conf)
+	fakeIstioObjects := []runtime.Object{
+		kubetest.FakeNamespace("test"),
+	}
+	fakeIstioObjects = append(fakeIstioObjects, kubernetes.ToRuntimeObjects(fakeGetGateways())...)
+	k8s := kubetest.NewFakeK8sClient(fakeIstioObjects...)
+
+	// Set the token and set the namespaces so that when namespace access is checked,
+	// the token namespace cache will be used but will not have the "test" namespace
+	// in it so the list should return empty.
+	k8s.Token = "test"
+	configService := NewLayerBuilder(t, conf).WithClient(k8s).Build().IstioConfig
+	configService.kialiCache.SetClusterNamespaces("test", "Kubernetes", []models.Namespace{{Cluster: "Kubernetes", Name: "nottest"}})
+
+	criteria := IstioConfigCriteria{
+		IncludeGateways: true,
+	}
+
+	istioConfigList, err := configService.GetIstioConfigList(context.Background(), conf.KubernetesConfig.ClusterName, criteria)
+	require.NoError(err)
+
+	assert.Len(istioConfigList.Gateways, 0)
+}
+
+func TestListNamespaceScopedReturnsAllAccessibleNamespaces(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+
+	conf := testutils.GetConfigFromYaml(t, `
+kubernetes_config:
+  cache_token_namespace_duration: 10000
+deployment:
+  cluster_wide_access: false
+  discovery_selectors:
+    default:
+    - matchLabels: {"kubernetes.io/metadata.name": "test" }
+    - matchLabels: {"kubernetes.io/metadata.name": "test-b" }
+    - matchLabels: {"kubernetes.io/metadata.name": "istio-system" }
+`)
+	kubernetes.SetConfig(t, *conf)
+	objects := []runtime.Object{
+		kubetest.FakeNamespace("istio-system"),
+		kubetest.FakeNamespace("test"),
+		kubetest.FakeNamespace("test-b"),
+		kubetest.FakeNamespace("test-c"),
+	}
+	objects = append(objects, kubernetes.ToRuntimeObjects(fakeGetGateways())...)
+	testBGateways := fakeGetGateways()
+	for _, gateway := range testBGateways {
+		gateway.Namespace = "test-b"
+		objects = append(objects, gateway)
+	}
+	testCGateways := fakeGetGateways()
+	for _, gateway := range testCGateways {
+		gateway.Namespace = "test-c"
+		objects = append(objects, gateway)
+	}
+	k8s := kubetest.NewFakeK8sClient(objects...)
+
+	configService := NewLayerBuilder(t, conf).WithClient(k8s).Build().IstioConfig
+
+	criteria := IstioConfigCriteria{
+		IncludeGateways: true,
+	}
+
+	istioConfigList, err := configService.GetIstioConfigList(context.Background(), conf.KubernetesConfig.ClusterName, criteria)
+	require.NoError(err)
+
+	assert.Len(istioConfigList.Gateways, 4)
+}
+
+func fakeGetTrafficExtensions() []*extentions_v1alpha1.TrafficExtension {
+	tx1 := &extentions_v1alpha1.TrafficExtension{
+		ObjectMeta: meta_v1.ObjectMeta{
+			Name:      "my-wasm-filter",
+			Namespace: "test",
+		},
+	}
+	tx2 := &extentions_v1alpha1.TrafficExtension{
+		ObjectMeta: meta_v1.ObjectMeta{
+			Name:      "my-lua-filter",
+			Namespace: "test",
+		},
+	}
+	return []*extentions_v1alpha1.TrafficExtension{tx1, tx2}
+}
+
+func TestGetIstioConfigListIncludesTrafficExtensions(t *testing.T) {
+	assert := assert.New(t)
+	conf := config.NewConfig()
+	config.Set(conf)
+	cluster := conf.KubernetesConfig.ClusterName
+
+	fakeIstioObjects := []runtime.Object{
+		&core_v1.Namespace{ObjectMeta: meta_v1.ObjectMeta{Name: "test"}},
+	}
+	for _, tx := range fakeGetTrafficExtensions() {
+		fakeIstioObjects = append(fakeIstioObjects, tx.DeepCopyObject())
+	}
+	k8s := kubetest.NewFakeK8sClient(fakeIstioObjects...)
+
+	configService := NewLayerBuilder(t, conf).WithClient(k8s).Build().IstioConfig
+
+	// Without IncludeTrafficExtensions, list should be empty.
+	criteria := IstioConfigCriteria{IncludeTrafficExtensions: false}
+	list, err := configService.GetIstioConfigList(context.TODO(), cluster, criteria)
+	assert.Nil(err)
+	assert.Equal(0, len(list.TrafficExtensions))
+
+	// With IncludeTrafficExtensions, both objects should be returned.
+	criteria.IncludeTrafficExtensions = true
+	list, err = configService.GetIstioConfigList(context.TODO(), cluster, criteria)
+	assert.Nil(err)
+	assert.Equal(2, len(list.TrafficExtensions))
+
+	names := []string{list.TrafficExtensions[0].Name, list.TrafficExtensions[1].Name}
+	assert.Contains(names, "my-wasm-filter")
+	assert.Contains(names, "my-lua-filter")
+}
+
+func TestGetIstioConfigDetailsTrafficExtension(t *testing.T) {
+	assert := assert.New(t)
+	conf := config.NewConfig()
+	config.Set(conf)
+
+	txObjects := fakeGetTrafficExtensions()
+	fakeIstioObjects := []runtime.Object{
+		&core_v1.Namespace{ObjectMeta: meta_v1.ObjectMeta{Name: "test"}},
+		txObjects[0],
+	}
+	k8s := kubetest.NewFakeK8sClient(fakeIstioObjects...)
+	k8s.OpenShift = true
+
+	configService := NewLayerBuilder(t, conf).WithClient(&fakeAccessReview{UserClientInterface: k8s}).Build().IstioConfig
+
+	details, err := configService.GetIstioConfigDetails(context.TODO(), conf.KubernetesConfig.ClusterName, "test", kubernetes.TrafficExtensions, "my-wasm-filter")
+	assert.Nil(err)
+	assert.NotNil(details.TrafficExtension)
+	assert.Equal("my-wasm-filter", details.TrafficExtension.Name)
+	assert.Equal("test", details.TrafficExtension.Namespace)
+}
+
+func TestDeleteIstioConfigDetailsTrafficExtension(t *testing.T) {
+	assert := assert.New(t)
+	conf := config.NewConfig()
+	config.Set(conf)
+
+	tx := fakeGetTrafficExtensions()[0]
+	k8s := kubetest.NewFakeK8sClient(
+		kubetest.FakeNamespace("test"),
+		tx,
+	)
+
+	configService := NewLayerBuilder(t, conf).WithClient(k8s).Build().IstioConfig
+
+	err := configService.DeleteIstioConfigDetail(context.Background(), conf.KubernetesConfig.ClusterName, "test", kubernetes.TrafficExtensions, "my-wasm-filter")
+	assert.Nil(err)
+}
+
+func TestCreateIstioConfigDetailsTrafficExtension(t *testing.T) {
+	assert := assert.New(t)
+	conf := config.NewConfig()
+	config.Set(conf)
+
+	k8s := kubetest.NewFakeK8sClient(kubetest.FakeNamespace("test"))
+	configService := NewLayerBuilder(t, conf).WithClient(k8s).Build().IstioConfig
+
+	payload, _ := json.Marshal(map[string]any{
+		"apiVersion": "extensions.istio.io/v1alpha1",
+		"kind":       "TrafficExtension",
+		"metadata":   map[string]string{"name": "new-filter", "namespace": "test"},
+	})
+	details, err := configService.CreateIstioConfigDetail(context.Background(), conf.KubernetesConfig.ClusterName, "test", kubernetes.TrafficExtensions, payload)
+	assert.Nil(err)
+	assert.Equal("test", details.Namespace.Name)
+	assert.Equal(conf.KubernetesConfig.ClusterName, details.Namespace.Cluster)
+	assert.Equal(kubernetes.TrafficExtensions.String(), details.ObjectGVK.String())
+}
+
+func TestUpdateIstioConfigDetailsTrafficExtension(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	conf := config.NewConfig()
+	config.Set(conf)
+
+	tx := fakeGetTrafficExtensions()[0]
+	k8s := kubetest.NewFakeK8sClient(
+		kubetest.FakeNamespace("test"),
+		tx,
+	)
+	configService := NewLayerBuilder(t, conf).WithClient(k8s).Build().IstioConfig
+
+	updated, err := configService.UpdateIstioConfigDetail(context.Background(), conf.KubernetesConfig.ClusterName, "test", kubernetes.TrafficExtensions, "my-wasm-filter", "{}")
+	require.NoError(err)
+	assert.Equal("test", updated.Namespace.Name)
+	assert.Equal(conf.KubernetesConfig.ClusterName, updated.Namespace.Cluster)
+	assert.Equal(kubernetes.TrafficExtensions.String(), updated.ObjectGVK.String())
+	assert.Equal("my-wasm-filter", updated.TrafficExtension.Name)
+}
+
+func TestGetIstioConfigListTrafficExtensionsMissingCRD(t *testing.T) {
+	assert := assert.New(t)
+	conf := config.NewConfig()
+	config.Set(conf)
+	cluster := conf.KubernetesConfig.ClusterName
+
+	// Build a client without any TrafficExtension objects - the cache will simply return empty.
+	// A missing CRD is handled in GetIstioConfigList via api_meta.IsNoMatchError; here we verify
+	// that when IsIstioAPI() returns true (the default for the fake client) and the list succeeds
+	// with zero items, the result is an empty (non-nil) slice.
+	k8s := kubetest.NewFakeK8sClient(
+		&core_v1.Namespace{ObjectMeta: meta_v1.ObjectMeta{Name: "test"}},
+	)
+	configService := NewLayerBuilder(t, conf).WithClient(k8s).Build().IstioConfig
+
+	criteria := IstioConfigCriteria{IncludeTrafficExtensions: true}
+	list, err := configService.GetIstioConfigList(context.TODO(), cluster, criteria)
+	assert.Nil(err)
+	assert.NotNil(list.TrafficExtensions)
+	assert.Equal(0, len(list.TrafficExtensions))
+}
+
+func TestUpdateIstioObjectWithoutValidations(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	conf := config.Get()
+	istioConfigList := fakeIstioConfigList()
+
+	// Using a mocked configuration from the validations testing
+	// This configuration will result in some validations errors
+	validationService := mockCombinedValidationService(t, conf, istioConfigList,
+		[]string{"details.test.svc.cluster.local", "product.test.svc.cluster.local", "customer.test.svc.cluster.local"})
+
+	// Setting the resources to the k8s client too
+	k8s := kubetest.NewFakeK8sClient(
+		kubetest.FakeNamespace("test"),
+		istioConfigList.VirtualServices[0],
+		istioConfigList.DestinationRules[0],
+		istioConfigList.Gateways[0],
+	)
+
+	// Disabling validations
+	duration, err := time.ParseDuration("0s")
+	if err != nil {
+		println("Error parsing duration:", err.Error())
+		return
+	}
+	conf.ExternalServices.Istio.ValidationReconcileInterval = &duration
+
+	configService := NewLayerBuilder(t, conf).WithClient(k8s).Build().IstioConfig
+	configService.businessLayer.Validations = validationService
+
+	updatedVirtualService, err := configService.UpdateIstioConfigDetail(context.Background(), conf.KubernetesConfig.ClusterName, "test", kubernetes.VirtualServices, "product-vs", "{}")
+
+	require.NoError(err)
+	assert.Equal("product-vs", updatedVirtualService.VirtualService.Name)
+	assert.Equal(0, len(configService.kialiCache.Validations().Items()))
+}
+
+// TestGetIstioConfigListNoUserClientReturnsEmpty ensures that a cluster the
+// requesting user has no client for (no session on it, in non-impersonation
+// mode) yields an empty list rather than a "K8s Client not found" error: the
+// cluster-scoped list endpoints must degrade like their siblings
+// (clusters/apps, clusters/workloads), not 500. The SA client still sees the
+// cluster, so the empty result must come from the missing user client and not
+// from missing data.
+func TestGetIstioConfigListNoUserClientReturnsEmpty(t *testing.T) {
+	assert := assert.New(t)
+	conf := config.NewConfig()
+	config.Set(conf)
+
+	home := conf.KubernetesConfig.ClusterName
+	remote := "remote-cluster"
+
+	// Both clusters hold the same fixtures: a namespace and two gateways.
+	newClient := func() kubernetes.UserClientInterface {
+		fakeObjects := []runtime.Object{&core_v1.Namespace{ObjectMeta: meta_v1.ObjectMeta{Name: "test"}}}
+		for _, g := range fakeGetGateways() {
+			fakeObjects = append(fakeObjects, g.DeepCopyObject())
+		}
+		k8s := kubetest.NewFakeK8sClient(fakeObjects...)
+		k8s.OpenShift = true
+		return k8s
+	}
+
+	layer := NewLayerBuilder(t, conf).
+		WithClients(map[string]kubernetes.UserClientInterface{home: newClient(), remote: newClient()}).
+		Build()
+	// Drop the user's remote session: the SA clients still cover both
+	// clusters, the user clients only the home cluster.
+	delete(layer.IstioConfig.userClients, remote)
+
+	criteria := IstioConfigCriteria{IncludeGateways: true}
+
+	// The remote cluster lists nothing for the user: empty result, no error.
+	list, err := layer.IstioConfig.GetIstioConfigList(context.TODO(), remote, criteria)
+	assert.Nil(err)
+	assert.NotNil(list)
+	assert.Equal(0, len(list.Gateways))
+
+	// The home cluster still lists normally.
+	list, err = layer.IstioConfig.GetIstioConfigList(context.TODO(), home, criteria)
+	assert.Nil(err)
+	assert.Equal(2, len(list.Gateways))
 }

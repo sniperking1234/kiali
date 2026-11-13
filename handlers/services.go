@@ -1,156 +1,302 @@
 package handlers
 
 import (
-	"io/ioutil"
 	"net/http"
 	"sync"
 
 	"github.com/gorilla/mux"
 
+	"github.com/kiali/kiali/business"
+	"github.com/kiali/kiali/cache"
+	"github.com/kiali/kiali/config"
+	"github.com/kiali/kiali/grafana"
+	"github.com/kiali/kiali/handlers/queryparams"
+	"github.com/kiali/kiali/istio"
+	"github.com/kiali/kiali/kubernetes"
 	"github.com/kiali/kiali/models"
+	"github.com/kiali/kiali/prometheus"
+	"github.com/kiali/kiali/tracing"
 	"github.com/kiali/kiali/util"
 )
 
-// ServiceList is the API handler to fetch the list of services in a given namespace
-func ServiceList(w http.ResponseWriter, r *http.Request) {
-	params := mux.Vars(r)
+// serviceListParams holds the path and query parameters for ServiceList
+//
+// swagger:parameters serviceList
+type serviceListParams struct {
+	baseHealthParams
+	// Optional
+	IncludeHealth          bool `json:"health"`
+	IncludeIstioResources  bool `json:"istioResources"`
+	IncludeOnlyDefinitions bool `json:"onlyDefinitions"`
+}
 
-	// Get business layer
-	business, err := getBusiness(r)
+// Package-level schema — documents the service list query contract.
+var serviceListQueryParams = []queryparams.Param{
+	queryparams.BoolParam("health", true),
+	queryparams.BoolParam("istioResources", true),
+	queryparams.BoolParam("onlyDefinitions", true),
+	queryparams.StringParam("namespaces", ""),
+}
+
+// serviceDetailsQueryParams documents the ServiceDetails query contract.
+// health is accepted for compatibility with clients/tests; GetServiceDetails always includes health today.
+var serviceDetailsQueryParams = []queryparams.Param{
+	queryparams.ClusterParam(),
+	queryparams.BoolParam("health", true),
+	queryparams.PromDurationParam("rateInterval", config.DefaultHealthRateInterval),
+	queryparams.BoolParam("validate", false),
+}
+
+// serviceUpdateQueryParams documents the ServiceUpdate query contract.
+var serviceUpdateQueryParams = []queryparams.Param{
+	queryparams.ClusterParam(),
+	queryparams.StringParam("patchType", defaultPatchType),
+	queryparams.PromDurationParam("rateInterval", config.DefaultHealthRateInterval),
+	queryparams.BoolParam("validate", false),
+}
+
+func (p *serviceListParams) extract(conf *config.Config, r *http.Request) error {
+	vars := mux.Vars(r)
+	result, err := p.parseSchema(conf, r, serviceListQueryParams...)
 	if err != nil {
-		RespondWithError(w, http.StatusInternalServerError, "Services initialization error: "+err.Error())
-		return
+		return err
 	}
-	namespace := params["namespace"]
+	p.Namespace = vars["namespace"]
+	p.IncludeHealth = result.Bool("health")
+	p.IncludeIstioResources = result.Bool("istioResources")
+	p.IncludeOnlyDefinitions = result.Bool("onlyDefinitions")
+	return nil
+}
 
-	// Fetch and build services
-	serviceList, err := business.Svc.GetServiceList(namespace)
-	if err != nil {
-		handleErrorResponse(w, err)
-		return
+// ClustersServices is the API handler to fetch the list of services from a given cluster
+func ClustersServices(
+	conf *config.Config,
+	kialiCache cache.KialiCache,
+	clientFactory kubernetes.ClientFactory,
+	prom prometheus.ClientInterface,
+	cpm business.ControlPlaneMonitor,
+	traceClientLoader func() tracing.ClientInterface,
+	grafana *grafana.Service,
+	discovery *istio.Discovery,
+) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		query := r.URL.Query()
+		namespacesQueryParam := query.Get("namespaces") // csl of namespaces
+		p := serviceListParams{}
+		if err := p.extract(conf, r); err != nil {
+			RespondWithQueryParamError(w, err.Error())
+			return
+		}
+
+		businessLayer, err := getLayer(r, conf, kialiCache, clientFactory, cpm, prom, traceClientLoader, grafana, discovery)
+		if err != nil {
+			RespondWithError(w, http.StatusInternalServerError, "Services initialization error: "+err.Error())
+			return
+		}
+
+		// The accessible namespace names for the cluster, narrowed to the
+		// namespaces query parameter when it is set (fail closed on error).
+		nss, ok := accessibleNamespaceNames(w, r.Context(), businessLayer, p.ClusterName, namespacesQueryParam)
+		if !ok {
+			return
+		}
+
+		clusterServicesList := &models.ClusterServices{
+			Cluster:     p.ClusterName,
+			Services:    []models.ServiceOverview{},
+			Validations: models.IstioValidations{},
+		}
+
+		for _, ns := range nss {
+			criteria := business.ServiceCriteria{
+				Cluster:                p.ClusterName,
+				Namespace:              ns,
+				IncludeHealth:          p.IncludeHealth,
+				IncludeIstioResources:  p.IncludeIstioResources,
+				IncludeOnlyDefinitions: p.IncludeOnlyDefinitions,
+				RateInterval:           "",
+				QueryTime:              p.QueryTime,
+			}
+
+			if criteria.IncludeHealth {
+				rateInterval, err := adjustRateInterval(r.Context(), businessLayer, ns, p.RateInterval, p.QueryTime, p.ClusterName)
+				if err != nil {
+					handleErrorResponse(w, err, "Adjust rate interval error: "+err.Error())
+					return
+				}
+				criteria.RateInterval = rateInterval
+			}
+
+			// Fetch and build services
+			serviceList, err := businessLayer.Svc.GetServiceList(r.Context(), criteria)
+			if err != nil {
+				handleErrorResponse(w, err)
+				return
+			}
+			clusterServicesList.Services = append(clusterServicesList.Services, serviceList.Services...)
+			clusterServicesList.Validations = clusterServicesList.Validations.MergeValidations(serviceList.Validations)
+		}
+
+		RespondWithJSON(w, http.StatusOK, clusterServicesList)
 	}
-
-	RespondWithJSON(w, http.StatusOK, serviceList)
 }
 
 // ServiceDetails is the API handler to fetch full details of an specific service
-func ServiceDetails(w http.ResponseWriter, r *http.Request) {
-	// Get business layer
-	business, err := getBusiness(r)
-	if err != nil {
-		RespondWithError(w, http.StatusInternalServerError, "Services initialization error: "+err.Error())
-		return
+func ServiceDetails(
+	conf *config.Config,
+	kialiCache cache.KialiCache,
+	clientFactory kubernetes.ClientFactory,
+	prom prometheus.ClientInterface,
+	cpm business.ControlPlaneMonitor,
+	traceClientLoader func() tracing.ClientInterface,
+	grafana *grafana.Service,
+	discovery *istio.Discovery,
+) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		business, err := getLayer(r, conf, kialiCache, clientFactory, cpm, prom, traceClientLoader, grafana, discovery)
+		if err != nil {
+			RespondWithError(w, http.StatusInternalServerError, "Services initialization error: "+err.Error())
+			return
+		}
+
+		queryParams := r.URL.Query()
+		parsed, err := queryparams.ParseWithConfig(queryParams, conf, serviceDetailsQueryParams)
+		if err != nil {
+			RespondWithQueryParamError(w, err.Error())
+			return
+		}
+		cluster := parsed.Cluster()
+		rateInterval := parsed.Duration("rateInterval")
+
+		includeValidations := parsed.Bool("validate")
+		if !conf.IsValidationsEnabled() {
+			includeValidations = false
+		}
+
+		params := mux.Vars(r)
+
+		namespace := params["namespace"]
+		service := params["service"]
+		queryTime := util.Clock.Now()
+		rateInterval, err = adjustRateInterval(r.Context(), business, namespace, rateInterval, queryTime, cluster)
+		if err != nil {
+			handleErrorResponse(w, err)
+			return
+		}
+
+		istioConfigValidations := models.IstioValidations{}
+		var errValidations error
+
+		wg := sync.WaitGroup{}
+		if includeValidations {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				istioConfigValidations, errValidations = business.Validations.GetValidationsForService(r.Context(), cluster, namespace, service)
+			}()
+		}
+
+		serviceDetails, err := business.Svc.GetServiceDetails(r.Context(), cluster, namespace, service, rateInterval, queryTime)
+		if includeValidations && err == nil {
+			wg.Wait()
+			serviceDetails.Validations = istioConfigValidations.MergeValidations(serviceDetails.Validations)
+			err = errValidations
+		} else if serviceDetails != nil && serviceDetails.Validations == nil {
+			// Ensure validations is never nil to prevent frontend crashes
+			serviceDetails.Validations = models.IstioValidations{}
+		}
+
+		if err != nil {
+			handleErrorResponse(w, err)
+			return
+		}
+
+		RespondWithJSON(w, http.StatusOK, serviceDetails)
 	}
-
-	// Rate interval is needed to fetch request rates based health
-	queryParams := r.URL.Query()
-	rateInterval := queryParams.Get("rateInterval")
-	if rateInterval == "" {
-		rateInterval = defaultHealthRateInterval
-	}
-
-	includeValidations := false
-	if _, found := queryParams["validate"]; found {
-		includeValidations = true
-	}
-
-	params := mux.Vars(r)
-	namespace := params["namespace"]
-	service := params["service"]
-	queryTime := util.Clock.Now()
-	rateInterval, err = adjustRateInterval(business, namespace, rateInterval, queryTime)
-	if err != nil {
-		RespondWithError(w, http.StatusInternalServerError, "Adjust rate interval error: "+err.Error())
-		return
-	}
-
-	var istioConfigValidations = models.IstioValidations{}
-	var errValidations error
-
-	wg := sync.WaitGroup{}
-	if includeValidations {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			istioConfigValidations, errValidations = business.Validations.GetValidations(namespace, service)
-		}()
-	}
-
-	serviceDetails, err := business.Svc.GetService(namespace, service, rateInterval, queryTime)
-	if includeValidations && err == nil {
-		wg.Wait()
-		serviceDetails.Validations = istioConfigValidations
-		err = errValidations
-	}
-
-	if err != nil {
-		handleErrorResponse(w, err)
-		return
-	}
-
-	RespondWithJSON(w, http.StatusOK, serviceDetails)
 }
 
-func ServiceUpdate(w http.ResponseWriter, r *http.Request) {
-	// Get business layer
-	business, err := getBusiness(r)
-	if err != nil {
-		RespondWithError(w, http.StatusInternalServerError, "Services initialization error: "+err.Error())
-		return
+func ServiceUpdate(
+	conf *config.Config,
+	kialiCache cache.KialiCache,
+	clientFactory kubernetes.ClientFactory,
+	prom prometheus.ClientInterface,
+	cpm business.ControlPlaneMonitor,
+	traceClientLoader func() tracing.ClientInterface,
+	grafana *grafana.Service,
+	discovery *istio.Discovery,
+) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		business, err := getLayer(r, conf, kialiCache, clientFactory, cpm, prom, traceClientLoader, grafana, discovery)
+		if err != nil {
+			RespondWithError(w, http.StatusInternalServerError, "Services initialization error: "+err.Error())
+			return
+		}
+
+		queryParams := r.URL.Query()
+		parsed, err := queryparams.ParseWithConfig(queryParams, conf, serviceUpdateQueryParams)
+		if err != nil {
+			RespondWithQueryParamError(w, err.Error())
+			return
+		}
+		cluster := parsed.Cluster()
+		rateInterval := parsed.Duration("rateInterval")
+
+		patchType := parsed.String("patchType")
+		if patchType == "" {
+			patchType = defaultPatchType
+		}
+
+		includeValidations := parsed.Bool("validate")
+		if !conf.IsValidationsEnabled() {
+			includeValidations = false
+		}
+
+		params := mux.Vars(r)
+
+		namespace := params["namespace"]
+		service := params["service"]
+		queryTime := util.Clock.Now()
+		rateInterval, err = adjustRateInterval(r.Context(), business, namespace, rateInterval, queryTime, cluster)
+		if err != nil {
+			RespondWithError(w, http.StatusInternalServerError, "Adjust rate interval error: "+err.Error())
+			return
+		}
+
+		body, err := boundedReadAll(r)
+		if err != nil {
+			RespondWithError(w, http.StatusBadRequest, "Update request with bad update patch: "+err.Error())
+			return
+		}
+		jsonPatch := string(body)
+		istioConfigValidations := models.IstioValidations{}
+		var errValidations error
+
+		wg := sync.WaitGroup{}
+		if includeValidations {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				istioConfigValidations, errValidations = business.Validations.GetValidationsForService(r.Context(), cluster, namespace, service)
+			}()
+		}
+
+		serviceDetails, err := business.Svc.UpdateService(r.Context(), cluster, namespace, service, rateInterval, queryTime, jsonPatch, patchType)
+
+		if includeValidations && err == nil {
+			wg.Wait()
+			serviceDetails.Validations = istioConfigValidations
+			err = errValidations
+		} else if serviceDetails != nil && serviceDetails.Validations == nil {
+			// Ensure validations is never nil to prevent frontend crashes
+			serviceDetails.Validations = models.IstioValidations{}
+		}
+
+		if err != nil {
+			handleErrorResponse(w, err)
+			return
+		}
+
+		audit(r, "UPDATE", namespace, "n/a", "Service Update. Name: ["+service+"], Patch: "+jsonPatch)
+		RespondWithJSON(w, http.StatusOK, serviceDetails)
 	}
-
-	// Rate interval is needed to fetch request rates based health
-	queryParams := r.URL.Query()
-	rateInterval := queryParams.Get("rateInterval")
-	if rateInterval == "" {
-		rateInterval = defaultHealthRateInterval
-	}
-
-	includeValidations := false
-	if _, found := queryParams["validate"]; found {
-		includeValidations = true
-	}
-
-	params := mux.Vars(r)
-	namespace := params["namespace"]
-	service := params["service"]
-	queryTime := util.Clock.Now()
-	rateInterval, err = adjustRateInterval(business, namespace, rateInterval, queryTime)
-	if err != nil {
-		RespondWithError(w, http.StatusInternalServerError, "Adjust rate interval error: "+err.Error())
-		return
-	}
-
-	body, err := ioutil.ReadAll(r.Body)
-	if err != nil {
-		RespondWithError(w, http.StatusBadRequest, "Update request with bad update patch: "+err.Error())
-	}
-	jsonPatch := string(body)
-	var istioConfigValidations = models.IstioValidations{}
-	var errValidations error
-
-	wg := sync.WaitGroup{}
-	if includeValidations {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			istioConfigValidations, errValidations = business.Validations.GetValidations(namespace, service)
-		}()
-	}
-
-	serviceDetails, err := business.Svc.UpdateService(namespace, service, rateInterval, queryTime, jsonPatch)
-
-	if includeValidations && err == nil {
-		wg.Wait()
-		serviceDetails.Validations = istioConfigValidations
-		err = errValidations
-	}
-
-	if err != nil {
-		handleErrorResponse(w, err)
-		return
-	}
-
-	audit(r, "UPDATE on Namespace: "+namespace+" Service name: "+service+" Patch: "+jsonPatch)
-	RespondWithJSON(w, http.StatusOK, serviceDetails)
 }

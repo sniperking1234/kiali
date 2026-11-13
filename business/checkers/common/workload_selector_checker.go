@@ -2,45 +2,44 @@ package common
 
 import (
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 
-	"github.com/kiali/kiali/kubernetes"
 	"github.com/kiali/kiali/models"
 )
 
 type GenericNoWorkloadFoundChecker struct {
-	SubjectType       string
-	Subject           kubernetes.IstioObject
-	WorkloadList      models.WorkloadList
-	GetSelectorLabels func(s kubernetes.IstioObject) map[string]string
-	Path              string
+	Namespace             string
+	ObjectGVK             schema.GroupVersionKind
+	SelectorLabels        map[string]string
+	WorkloadsPerNamespace map[string]models.Workloads
+	Path                  string
 }
 
-func SelectorNoWorkloadFoundChecker(subjectType string, subject kubernetes.IstioObject, workloadList models.WorkloadList) GenericNoWorkloadFoundChecker {
+func SelectorNoWorkloadFoundChecker(objectGVK schema.GroupVersionKind, namespace string, selectorLabels map[string]string, workloadsPerNamespace map[string]models.Workloads) GenericNoWorkloadFoundChecker {
 	return GenericNoWorkloadFoundChecker{
-		SubjectType:       subjectType,
-		Subject:           subject,
-		WorkloadList:      workloadList,
-		GetSelectorLabels: GetSelectorLabels,
-		Path:              "spec/selector/matchLabels",
+		Namespace:             namespace,
+		ObjectGVK:             objectGVK,
+		SelectorLabels:        selectorLabels,
+		WorkloadsPerNamespace: workloadsPerNamespace,
+		Path:                  "spec/selector/matchLabels",
 	}
 }
 
-func WorkloadSelectorNoWorkloadFoundChecker(subjectType string, subject kubernetes.IstioObject, workloadList models.WorkloadList) GenericNoWorkloadFoundChecker {
+func WorkloadSelectorNoWorkloadFoundChecker(objectGVK schema.GroupVersionKind, namespace string, selectorLabels map[string]string, workloadsPerNamespace map[string]models.Workloads) GenericNoWorkloadFoundChecker {
 	return GenericNoWorkloadFoundChecker{
-		SubjectType:       subjectType,
-		Subject:           subject,
-		WorkloadList:      workloadList,
-		GetSelectorLabels: GetWorkloadSelectorLabels,
-		Path:              "spec/workloadSelector/labels",
+		Namespace:             namespace,
+		ObjectGVK:             objectGVK,
+		SelectorLabels:        selectorLabels,
+		WorkloadsPerNamespace: workloadsPerNamespace,
+		Path:                  "spec/workloadSelector/labels",
 	}
 }
 
 func (wsc GenericNoWorkloadFoundChecker) Check() ([]*models.IstioCheck, bool) {
 	checks := make([]*models.IstioCheck, 0)
 
-	labels := wsc.GetSelectorLabels(wsc.Subject)
-	if len(labels) > 0 {
-		if !wsc.hasMatchingWorkload(labels) {
+	if len(wsc.SelectorLabels) > 0 {
+		if !wsc.hasMatchingWorkload(wsc.SelectorLabels) {
 			check := models.Build("generic.selector.workloadnotfound", wsc.Path)
 			checks = append(checks, &check)
 		}
@@ -51,10 +50,19 @@ func (wsc GenericNoWorkloadFoundChecker) Check() ([]*models.IstioCheck, bool) {
 func (wsc GenericNoWorkloadFoundChecker) hasMatchingWorkload(labelSelector map[string]string) bool {
 	selector := labels.SelectorFromSet(labelSelector)
 
-	for _, wl := range wsc.WorkloadList.Workloads {
-		wlLabelSet := labels.Set(wl.Labels)
-		if selector.Matches(wlLabelSet) {
-			return true
+	workloadsByNamespace := wsc.WorkloadsPerNamespace
+	if wsc.Namespace != "" {
+		workloadsByNamespace = map[string]models.Workloads{
+			wsc.Namespace: wsc.WorkloadsPerNamespace[wsc.Namespace],
+		}
+	}
+
+	for _, workloads := range workloadsByNamespace {
+		for _, wl := range workloads {
+			wlLabelSet := labels.Set(wl.Labels)
+			if selector.Matches(wlLabelSet) {
+				return true
+			}
 		}
 	}
 	return false

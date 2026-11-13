@@ -4,7 +4,6 @@
 #
 
 .prepare-kiali-image-files:
-	@CONSOLE_VERSION=${CONSOLE_VERSION} CONSOLE_LOCAL_DIR=${CONSOLE_LOCAL_DIR} deploy/get-console.sh
 	@echo Preparing container image files
 	@mkdir -p ${OUTDIR}/docker
 	@cp -r deploy/docker/* ${OUTDIR}/docker
@@ -34,6 +33,26 @@ else
 container-build: container-build-kiali
 endif
 
+## container-build-int-tests: Build Kiali integration tests container image
+container-build-int-tests:
+ifeq ($(DORP),docker)
+	@echo Building container image for Kiali integration tests using docker
+	docker build --pull -t ${INT_TESTS_QUAY_TAG} --build-arg="GO_VERSION=${GO_VERSION_KIALI}" -f tests/integration/Dockerfile .
+else
+	@echo Building container image for Kiali integration tests using podman
+	podman build --pull -t ${INT_TESTS_QUAY_TAG} --build-arg="GO_VERSION=${GO_VERSION_KIALI}" -f tests/integration/Dockerfile .
+endif
+
+## container-build-cypress-tests: Build Kiali cypress tests container image
+container-build-cypress-tests:
+ifeq ($(DORP),docker)
+	@echo Building container image for Kiali cypress tests using docker
+	docker build --pull -t ${CYPRESS_TESTS_QUAY_TAG} -f deploy/docker/Dockerfile-cypress .
+else
+	@echo Building container image for Kiali cypress tests using podman
+	podman build --pull -t ${CYPRESS_TESTS_QUAY_TAG} -f deploy/docker/Dockerfile-cypress .
+endif
+
 ## container-push-kiali-quay: Pushes the Kiali image to quay.
 container-push-kiali-quay:
 ifeq ($(DORP),docker)
@@ -44,8 +63,32 @@ else
 	podman push ${QUAY_TAG}
 endif
 
+## container-push-operator-quay: Pushes the operator image to quay.
+container-push-operator-quay:
+	$(MAKE) -C "${ROOTDIR}/operator" -e "OPERATOR_QUAY_TAG=${OPERATOR_QUAY_TAG}" push
+
 ## container-push: Pushes all container images to quay
-container-push: container-push-kiali-quay
+container-push: container-push-kiali-quay container-push-operator-quay
+
+## container-push-int-tests-quay: Pushes the Kiali integration test image to quay.
+container-push-int-tests-quay:
+ifeq ($(DORP),docker)
+	@echo Pushing Kiali integration test image to ${INT_TESTS_QUAY_TAG} using docker
+	docker push ${INT_TESTS_QUAY_TAG}
+else
+	@echo Pushing Kiali integration test image to ${INT_TESTS_QUAY_TAG} using podman
+	podman push ${INT_TESTS_QUAY_TAG}
+endif
+
+## container-push-cypress-tests-quay: Pushes the Kiali cypress test image to quay.
+container-push-cypress-tests-quay:
+ifeq ($(DORP),docker)
+	@echo Pushing Kiali cypress test image to ${CYPRESS_TESTS_QUAY_TAG} using docker
+	docker push ${CYPRESS_TESTS_QUAY_TAG}
+else
+	@echo Pushing Kiali cypress test image to ${CYPRESS_TESTS_QUAY_TAG} using podman
+	podman push ${CYPRESS_TESTS_QUAY_TAG}
+endif
 
 # Ensure "docker buildx" is available and enabled. For more details, see: https://github.com/docker/buildx/blob/master/README.md
 # This does a few things:
@@ -91,14 +134,14 @@ container-push: container-push-kiali-quay
 .ensure-buildx-builder: .ensure-docker-buildx
 	@if ! docker buildx inspect kiali-builder > /dev/null 2>&1; then \
 	  echo "The buildx builder instance named 'kiali-builder' does not exist. Creating one now."; \
-	  if ! docker buildx create --name=kiali-builder --driver-opt=image=moby/buildkit:v0.8.0; then \
+	  if ! docker buildx create --name=kiali-builder --driver-opt=image=moby/buildkit:v0.13.2; then \
 	    echo "Failed to create the buildx builder 'kiali-builder'"; \
 	    exit 1; \
 	  fi \
 	fi; \
 	if [[ $$(uname -s) == "Linux" ]]; then \
 	  echo "Ensuring QEMU is set up for this Linux host"; \
-	  if ! docker run --privileged --rm quay.io/kiali/binfmt:latest --install all; then \
+	  if ! docker run --privileged --rm tonistiigi/binfmt:latest --install all; then \
 	    echo "Failed to ensure QEMU is set up. This build will be allowed to continue, but it may fail at a later step."; \
 	  fi \
 	fi
@@ -111,5 +154,13 @@ container-multi-arch-push-kiali-operator-quay: .ensure-operator-repo-exists .ens
 
 ## container-multi-arch-push-kiali-quay: Pushes the Kiali multi-arch image to quay.
 container-multi-arch-push-kiali-quay: .ensure-buildx-builder .prepare-kiali-image-files
-	@echo Pushing Kiali multi-arch image to ${QUAY_TAG} using docker buildx
-	docker buildx build --push --pull --no-cache --builder=kiali-builder $(foreach arch,${TARGET_ARCHS},--platform=linux/${arch}) $(foreach tag,${QUAY_TAG},--tag=${tag}) -f ${OUTDIR}/docker/Dockerfile-multi-arch ${OUTDIR}/docker
+	@echo Pushing Kiali multi-arch image to ${QUAY_TAG}-distro using docker buildx
+	docker buildx build --push --pull --no-cache --builder=kiali-builder $(foreach arch,${TARGET_ARCHS},--platform=linux/${arch}) $(foreach tag,${QUAY_TAG},--tag=${tag}-distro) -f ${OUTDIR}/docker/Dockerfile-multi-arch ${OUTDIR}/docker
+
+## container-multi-arch-distroless-push-kiali-quay: Pushes the Kiali multi-arch distroless image to quay.
+container-multi-arch-distroless-push-kiali-quay: .ensure-buildx-builder .prepare-kiali-image-files
+	@echo Pushing Kiali multi-arch distroless image to ${QUAY_TAG} using docker buildx
+	docker buildx build --push --pull --no-cache --builder=kiali-builder $(foreach arch,${TARGET_ARCHS},--platform=linux/${arch}) $(foreach tag,${QUAY_TAG},--tag=${tag}) -f ${OUTDIR}/docker/Dockerfile-multi-arch-distroless ${OUTDIR}/docker
+
+## container-multi-arch-all-push-kiali-quay: Pushes the Kiali all multi-arch images to quay.
+container-multi-arch-all-push-kiali-quay: container-multi-arch-push-kiali-quay container-multi-arch-distroless-push-kiali-quay

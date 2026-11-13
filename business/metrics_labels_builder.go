@@ -2,7 +2,11 @@ package business
 
 import (
 	"fmt"
+	"sort"
 	"strings"
+
+	"github.com/kiali/kiali/config"
+	"github.com/kiali/kiali/prometheus"
 )
 
 const (
@@ -13,13 +17,14 @@ const (
 )
 
 type MetricsLabelsBuilder struct {
-	side     string
+	conf     *config.Config
+	labelsKV []string
 	peerSide string
 	protocol string
-	labelsKV []string
+	side     string
 }
 
-func NewMetricsLabelsBuilder(direction string) *MetricsLabelsBuilder {
+func NewMetricsLabelsBuilder(direction string, conf *config.Config) *MetricsLabelsBuilder {
 	side := destination
 	peerSide := source
 	if direction == "outbound" {
@@ -27,8 +32,9 @@ func NewMetricsLabelsBuilder(direction string) *MetricsLabelsBuilder {
 		peerSide = destination
 	}
 	return &MetricsLabelsBuilder{
-		side:     side,
+		conf:     conf,
 		peerSide: peerSide,
+		side:     side,
 	}
 }
 
@@ -37,13 +43,36 @@ func (lb *MetricsLabelsBuilder) Add(key, value string) *MetricsLabelsBuilder {
 	return lb
 }
 
+func (lb *MetricsLabelsBuilder) AddOp(key, value, op string) *MetricsLabelsBuilder {
+	lb.labelsKV = append(lb.labelsKV, fmt.Sprintf(`%s%s"%s"`, key, op, value))
+	return lb
+}
+
 func (lb *MetricsLabelsBuilder) addSided(partialKey, value, side string) *MetricsLabelsBuilder {
 	lb.labelsKV = append(lb.labelsKV, fmt.Sprintf(`%s_%s="%s"`, side, partialKey, value))
 	return lb
 }
 
-func (lb *MetricsLabelsBuilder) Reporter(name string) *MetricsLabelsBuilder {
-	return lb.Add("reporter", name)
+func (lb *MetricsLabelsBuilder) Reporters(reporters []string) *MetricsLabelsBuilder {
+	if len(reporters) == 0 {
+		return lb
+	}
+
+	normalized := make([]string, 0, len(reporters))
+	seen := make(map[string]struct{}, len(reporters))
+	for _, reporter := range reporters {
+		if _, found := seen[reporter]; found {
+			continue
+		}
+		seen[reporter] = struct{}{}
+		normalized = append(normalized, reporter)
+	}
+
+	sort.Strings(normalized)
+	if len(normalized) == 1 {
+		return lb.Add("reporter", normalized[0])
+	}
+	return lb.AddOp("reporter", strings.Join(normalized, "|"), "=~")
 }
 
 func (lb *MetricsLabelsBuilder) SelfReporter() *MetricsLabelsBuilder {
@@ -69,6 +98,10 @@ func (lb *MetricsLabelsBuilder) Workload(name, namespace string) *MetricsLabelsB
 		lb.addSided("workload_namespace", namespace, lb.side)
 	}
 	return lb.addSided("workload", name, lb.side)
+}
+
+func (lb *MetricsLabelsBuilder) Cluster(cluster string) *MetricsLabelsBuilder {
+	return lb.addSided("cluster", cluster, lb.side)
 }
 
 func (lb *MetricsLabelsBuilder) App(name, namespace string) *MetricsLabelsBuilder {
@@ -115,6 +148,16 @@ func (lb *MetricsLabelsBuilder) Protocol(name string) *MetricsLabelsBuilder {
 
 func (lb *MetricsLabelsBuilder) Aggregate(key, value string) *MetricsLabelsBuilder {
 	return lb.Add(key, value)
+}
+
+// QueryScope adds scope labels, if configured
+func (lb *MetricsLabelsBuilder) QueryScope() *MetricsLabelsBuilder {
+	scope := lb.conf.ExternalServices.Prometheus.QueryScope
+
+	for labelName, labelValue := range scope {
+		lb.Add(prometheus.SanitizeLabelName(labelName), labelValue)
+	}
+	return lb
 }
 
 func (lb *MetricsLabelsBuilder) Build() string {

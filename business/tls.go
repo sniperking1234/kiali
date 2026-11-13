@@ -1,185 +1,433 @@
 package business
 
 import (
-	"sync"
+	"context"
+	"fmt"
+	"slices"
 
-	core_v1 "k8s.io/api/core/v1"
+	istiov1alpha1 "istio.io/api/mesh/v1alpha1"
+	security_v1 "istio.io/client-go/pkg/apis/security/v1"
 
+	"github.com/kiali/kiali/cache"
 	"github.com/kiali/kiali/config"
+	"github.com/kiali/kiali/istio"
 	"github.com/kiali/kiali/kubernetes"
 	"github.com/kiali/kiali/models"
+	"github.com/kiali/kiali/observability"
 	"github.com/kiali/kiali/util/mtls"
+	"github.com/kiali/kiali/util/sliceutil"
 )
 
 type TLSService struct {
-	k8s             kubernetes.ClientInterface
-	businessLayer   *Layer
-	enabledAutoMtls *bool
+	businessLayer *Layer
+	conf          *config.Config
+	discovery     istio.MeshDiscovery
+	kialiCache    cache.KialiCache
+	userClients   map[string]kubernetes.UserClientInterface
 }
 
 const (
-	MTLSEnabled          = "MTLS_ENABLED"
-	MTLSPartiallyEnabled = "MTLS_PARTIALLY_ENABLED"
-	MTLSNotEnabled       = "MTLS_NOT_ENABLED"
-	MTLSDisabled         = "MTLS_DISABLED"
+	MTLSDisabled               = "MTLS_DISABLED"
+	MTLSEnabled                = "MTLS_ENABLED"
+	MTLSEnabledExtended        = "MTLS_ENABLED_EXTENDED"
+	MTLSNotEnabled             = "MTLS_NOT_ENABLED"
+	MTLSPartiallyEnabled       = "MTLS_PARTIALLY_ENABLED"
+	MTLSUnset                  = "UNSET"
+	MTLSUnsetInheritedDisabled = "UNSET_INHERITED_DISABLED"
+	MTLSUnsetInheritedStrict   = "UNSET_INHERITED_STRICT"
+	MTLSValidationError        = "MTLS_VALIDATION_ERROR"
 )
 
-func (in *TLSService) MeshWidemTLSStatus(namespaces []string) (models.MTLSStatus, error) {
-	pas, error := in.getMeshPeerAuthentications()
-	if error != nil {
-		return models.MTLSStatus{}, error
+func (in *TLSService) MeshWidemTLSStatus(ctx context.Context, cluster string, revision string) (models.MTLSStatus, error) {
+	var end observability.EndFunc
+	ctx, end = observability.StartSpan(ctx, "MeshWidemTLSStatus",
+		observability.Attribute("package", "business"),
+		observability.Attribute(observability.TracingClusterTag, cluster),
+		observability.Attribute("revision", revision),
+	)
+	defer end()
+
+	criteria := IstioConfigCriteria{
+		IncludeDestinationRules:    true,
+		IncludePeerAuthentications: true,
 	}
 
-	drs, error := in.getAllDestinationRules(namespaces)
-	if error != nil {
-		return models.MTLSStatus{}, error
+	mesh, err := in.discovery.Mesh(ctx)
+	if err != nil {
+		return models.MTLSStatus{}, err
+	}
+
+	if len(mesh.ControlPlanes) == 0 {
+		return models.MTLSStatus{}, fmt.Errorf("no controlplanes found on cluster [%s]", cluster)
+	}
+
+	idx := slices.IndexFunc(mesh.ControlPlanes, func(controlPlane models.ControlPlane) bool {
+		return controlPlane.Revision == revision && controlPlane.Cluster.Name == cluster
+	})
+	if idx == -1 {
+		return models.MTLSStatus{}, fmt.Errorf("revision [%s] not found on cluster [%s]", revision, cluster)
+	}
+	controlPlane := mesh.ControlPlanes[idx]
+
+	istioConfigList, err := in.businessLayer.IstioConfig.GetIstioConfigList(ctx, cluster, criteria)
+	if err != nil {
+		return models.MTLSStatus{}, err
+	}
+
+	namespaces, err := in.businessLayer.Namespace.GetClusterNamespaces(ctx, cluster)
+	if err != nil {
+		return models.MTLSStatus{}, err
+	}
+
+	// Look for enabled if rev label isn't set: https://istio.io/latest/docs/setup/additional-setup/sidecar-injection/#controlling-the-injection-policy
+	namespacesForRevision := sliceutil.Filter(namespaces, func(ns models.Namespace) bool {
+		return ns.Labels[config.IstioRevisionLabel] == revision || ns.Labels[config.IstioInjectionLabelName] == "enabled"
+	})
+	namespaceNames := sliceutil.Map(namespacesForRevision, func(ns models.Namespace) string {
+		return ns.Name
+	})
+
+	pas := kubernetes.FilterByNamespaceNames(istioConfigList.PeerAuthentications, []string{controlPlane.IstiodNamespace})
+	drs := kubernetes.FilterByNamespaceNames(istioConfigList.DestinationRules, namespaceNames)
+
+	mtlsStatus := mtls.MtlsStatus{
+		PeerAuthentications: pas,
+		DestinationRules:    drs,
+		AutoMtlsEnabled:     controlPlane.MeshConfig.EnableAutoMtls.Value,
+		AllowPermissive:     false,
+	}
+
+	// The default is TLSV1_2 unless it's explicitly set to TLSV1_3 so we can ignore AUTO.
+	minTLS := istiov1alpha1.MeshConfig_TLSConfig_TLSV1_2
+	if controlPlane.MeshConfig != nil && controlPlane.MeshConfig.MeshMTLS != nil &&
+		controlPlane.MeshConfig.MeshMTLS.MinProtocolVersion == istiov1alpha1.MeshConfig_TLSConfig_TLSV1_3 {
+		minTLS = istiov1alpha1.MeshConfig_TLSConfig_TLSV1_3
+	}
+
+	return models.MTLSStatus{
+		Status:          mtlsStatus.MeshMtlsStatus().OverallStatus,
+		AutoMTLSEnabled: mtlsStatus.AutoMtlsEnabled,
+		MinTLS:          minTLS.String(),
+	}, nil
+}
+
+func (in *TLSService) NamespaceWidemTLSStatus(ctx context.Context, namespace, cluster string) (models.MTLSStatus, error) {
+	var end observability.EndFunc
+	ctx, end = observability.StartSpan(ctx, "NamespaceWidemTLSStatus",
+		observability.Attribute("package", "business"),
+		observability.Attribute(observability.TracingClusterTag, cluster),
+		observability.Attribute("namespace", namespace),
+	)
+	defer end()
+
+	mesh, err := in.discovery.Mesh(ctx)
+	if err != nil {
+		return models.MTLSStatus{}, err
+	}
+
+	allNamespaces, err := in.businessLayer.Namespace.GetClusterNamespaces(ctx, cluster)
+	if err != nil {
+		return models.MTLSStatus{}, err
+	}
+
+	criteria := IstioConfigCriteria{
+		IncludeDestinationRules:    true,
+		IncludePeerAuthentications: true,
+	}
+
+	istioConfigList, err := in.businessLayer.IstioConfig.GetIstioConfigList(ctx, cluster, criteria)
+	if err != nil {
+		return models.MTLSStatus{}, err
+	}
+
+	pasAll := kubernetes.FilterByNamespaceNames(istioConfigList.PeerAuthentications, []string{namespace})
+	rootNamespace := rootNamespaceFromMesh(mesh, cluster, namespace)
+	if rootNamespace == namespace {
+		pasAll = []*security_v1.PeerAuthentication{}
+	}
+	pas := in.filterNamespaceWidePeerAuthentications(pasAll)
+	allNamespaceNames := sliceutil.Map(allNamespaces, func(ns models.Namespace) string {
+		return ns.Name
+	})
+	drs := kubernetes.FilterByNamespaceNames(istioConfigList.DestinationRules, allNamespaceNames)
+
+	ns, err := in.businessLayer.Namespace.GetClusterNamespace(ctx, namespace, cluster)
+	if err != nil {
+		return models.MTLSStatus{}, err
 	}
 
 	mtlsStatus := mtls.MtlsStatus{
 		PeerAuthentications: pas,
 		DestinationRules:    drs,
-		AutoMtlsEnabled:     in.hasAutoMTLSEnabled(),
+		AutoMtlsEnabled:     autoMTLSFromMesh(mesh, cluster, namespace),
 		AllowPermissive:     false,
 	}
 
+	status := in.namespaceMTLSOverallStatus(ctx, cluster, namespace, pas, mtlsStatus)
+	if status == MTLSUnset {
+		status = in.resolveUnsetNamespaceStatus(ctx, cluster, namespace, rootNamespace, ns)
+	}
+
 	return models.MTLSStatus{
-		Status: mtlsStatus.MeshMtlsStatus().OverallStatus,
+		Status:          status,
+		AutoMTLSEnabled: mtlsStatus.AutoMtlsEnabled,
+		Cluster:         cluster,
+		Namespace:       namespace,
 	}, nil
 }
 
-func (in *TLSService) getMeshPeerAuthentications() ([]kubernetes.IstioObject, error) {
-	var mps []kubernetes.IstioObject
-	var err error
-	controlPlaneNs := config.Get().IstioNamespace
-	if IsResourceCached(controlPlaneNs, kubernetes.PeerAuthentications) {
-		mps, err = kialiCache.GetIstioObjects(controlPlaneNs, kubernetes.PeerAuthentications, "")
-	} else {
-		mps, err = in.k8s.GetIstioObjects(controlPlaneNs, kubernetes.PeerAuthentications, "")
-	}
-	return mps, err
-}
+func (in *TLSService) ClusterWideNSmTLSStatus(ctx context.Context, namespaces []models.Namespace, cluster string) ([]models.MTLSStatus, error) {
+	var end observability.EndFunc
+	ctx, end = observability.StartSpan(ctx, "ClusterWideNSmTLSStatus",
+		observability.Attribute("package", "business"),
+		observability.Attribute(observability.TracingClusterTag, cluster),
+	)
+	defer end()
 
-func (in *TLSService) getAllDestinationRules(namespaces []string) ([]kubernetes.IstioObject, error) {
-	drChan := make(chan []kubernetes.IstioObject, len(namespaces))
-	errChan := make(chan error, 1)
-	wg := sync.WaitGroup{}
+	result := []models.MTLSStatus{}
 
-	wg.Add(len(namespaces))
-
-	for _, namespace := range namespaces {
-		go func(ns string) {
-			defer wg.Done()
-			var drs []kubernetes.IstioObject
-			var err error
-			// Check if namespace is cached
-			// Namespace access is checked in the upper call
-			if IsResourceCached(ns, kubernetes.DestinationRules) {
-				drs, err = kialiCache.GetIstioObjects(ns, kubernetes.DestinationRules, "")
-			} else {
-				drs, err = in.k8s.GetIstioObjects(ns, kubernetes.DestinationRules, "")
-			}
-			if err != nil {
-				errChan <- err
-				return
-			}
-
-			drChan <- drs
-		}(namespace)
+	criteria := IstioConfigCriteria{
+		IncludeDestinationRules:    true,
+		IncludePeerAuthentications: true,
 	}
 
-	wg.Wait()
-	close(errChan)
-	close(drChan)
+	istioConfigList, err := in.businessLayer.IstioConfig.GetIstioConfigList(ctx, cluster, criteria)
+	if err != nil {
+		return result, err
+	}
 
-	for err := range errChan {
-		if err != nil {
-			return nil, err
+	meshStatusByRevision := in.meshStatusByRevisionForNamespaces(ctx, cluster, namespaces)
+
+	mesh, err := in.discovery.Mesh(ctx)
+	if err != nil {
+		return result, err
+	}
+
+	cpForNamespace := make(map[string]*models.ControlPlane, len(namespaces))
+	for _, ns := range namespaces {
+		if cp, err := mesh.ControlPlaneForNamespace(cluster, ns.Name); err == nil && cp != nil {
+			cpForNamespace[ns.Name] = cp
 		}
 	}
 
-	allDestinationRules := make([]kubernetes.IstioObject, 0)
-	for drs := range drChan {
-		allDestinationRules = append(allDestinationRules, drs...)
+	for _, namespace := range namespaces {
+		pasAll := kubernetes.FilterByNamespaceNames(istioConfigList.PeerAuthentications, []string{namespace.Name})
+
+		cp := cpForNamespace[namespace.Name]
+		rootNamespace := ""
+		autoMtls := true
+		if cp != nil {
+			rootNamespace = cp.RootNamespace
+			if cp.MeshConfig != nil && cp.MeshConfig.EnableAutoMtls != nil {
+				autoMtls = cp.MeshConfig.EnableAutoMtls.Value
+			}
+		}
+
+		if rootNamespace == namespace.Name {
+			pasAll = []*security_v1.PeerAuthentication{}
+		}
+		pas := in.filterNamespaceWidePeerAuthentications(pasAll)
+
+		mtlsStatus := mtls.MtlsStatus{
+			PeerAuthentications: pas,
+			DestinationRules:    istioConfigList.DestinationRules,
+			AutoMtlsEnabled:     autoMtls,
+			AllowPermissive:     false,
+		}
+
+		status := in.namespaceMTLSOverallStatus(ctx, cluster, namespace.Name, pas, mtlsStatus)
+		if status == MTLSUnset {
+			revision := namespace.Revision
+			if revision == "" && namespace.Labels != nil {
+				revision = namespace.Labels[config.IstioRevisionLabel]
+			}
+			if revision == "" {
+				revision = models.DefaultRevisionLabel
+			}
+			status = in.resolveUnsetStatusWithMeshStatus(meshStatusByRevision[revision], cluster, namespace.Name, rootNamespace)
+		}
+
+		result = append(result, models.MTLSStatus{
+			Status:          status,
+			AutoMTLSEnabled: mtlsStatus.AutoMtlsEnabled,
+			Cluster:         cluster,
+			Namespace:       namespace.Name,
+		})
 	}
 
-	return allDestinationRules, nil
+	return result, nil
 }
 
-func (in TLSService) NamespaceWidemTLSStatus(namespace string) (models.MTLSStatus, error) {
-	pas, err := in.getPeerAuthentications(namespace)
+// resolveUnsetNamespaceStatus returns the effective mTLS status when namespace status is UNSET:
+// - Control plane (root) namespace: mesh-wide status for its revision.
+// - Data plane namespace with mesh in STRICT: MTLS_ENABLED_EXTENDED so the UI shows a closed lock.
+func (in *TLSService) resolveUnsetNamespaceStatus(ctx context.Context, cluster, namespace, rootNamespace string, ns *models.Namespace) string {
+	revision := models.DefaultRevisionLabel
+	if ns != nil {
+		revision = ns.Revision
+		if revision == "" && ns.Labels != nil {
+			revision = ns.Labels[config.IstioRevisionLabel]
+		}
+		if revision == "" {
+			revision = models.DefaultRevisionLabel
+		}
+	}
+	meshStatus, err := in.MeshWidemTLSStatus(ctx, cluster, revision)
 	if err != nil {
-		return models.MTLSStatus{}, nil
+		return MTLSUnset
 	}
-
-	nss, err := in.getNamespaces()
-	if err != nil {
-		return models.MTLSStatus{}, nil
-	}
-
-	drs, err := in.getAllDestinationRules(nss)
-	if err != nil {
-		return models.MTLSStatus{}, nil
-	}
-
-	mtlsStatus := mtls.MtlsStatus{
-		Namespace:           namespace,
-		PeerAuthentications: pas,
-		DestinationRules:    drs,
-		AutoMtlsEnabled:     in.hasAutoMTLSEnabled(),
-		AllowPermissive:     false,
-	}
-
-	return models.MTLSStatus{
-		Status: mtlsStatus.NamespaceMtlsStatus().OverallStatus,
-	}, nil
+	return in.resolveUnsetStatusWithMeshStatus(meshStatus.Status, cluster, namespace, rootNamespace)
 }
 
-func (in TLSService) getPeerAuthentications(namespace string) ([]kubernetes.IstioObject, error) {
-	if namespace == config.Get().IstioNamespace {
-		return []kubernetes.IstioObject{}, nil
+// meshStatusByRevisionForNamespaces returns mesh-wide mTLS status per revision for the given namespaces.
+func (in *TLSService) meshStatusByRevisionForNamespaces(ctx context.Context, cluster string, namespaces []models.Namespace) map[string]string {
+	revisions := make(map[string]struct{})
+	for _, ns := range namespaces {
+		rev := ns.Revision
+		if rev == "" && ns.Labels != nil {
+			rev = ns.Labels[config.IstioRevisionLabel]
+		}
+		if rev == "" {
+			rev = models.DefaultRevisionLabel
+		}
+		revisions[rev] = struct{}{}
 	}
-	if IsResourceCached(namespace, kubernetes.PeerAuthentications) {
-		return kialiCache.GetIstioObjects(namespace, kubernetes.PeerAuthentications, "")
-	} else {
-		return in.k8s.GetIstioObjects(namespace, kubernetes.PeerAuthentications, "")
+	out := make(map[string]string, len(revisions))
+	for rev := range revisions {
+		meshStatus, err := in.MeshWidemTLSStatus(ctx, cluster, rev)
+		if err != nil {
+			continue
+		}
+		out[rev] = meshStatus.Status
 	}
+	return out
 }
 
-func (in TLSService) getNamespaces() ([]string, error) {
-	nss, nssErr := in.businessLayer.Namespace.GetNamespaces()
-	if nssErr != nil {
-		return nil, nssErr
+// resolveUnsetStatusWithMeshStatus returns the effective status when namespace is UNSET given mesh status.
+func (in *TLSService) resolveUnsetStatusWithMeshStatus(meshStatus, cluster, namespaceName, rootNamespace string) string {
+	if rootNamespace == namespaceName {
+		if meshStatus != "" {
+			return meshStatus
+		}
+		return MTLSUnset
 	}
-
-	nsNames := make([]string, 0)
-	for _, ns := range nss {
-		nsNames = append(nsNames, ns.Name)
+	// Namespace has no policy (UNSET) but mesh is STRICT: show "Unset" label with closed lock icon only.
+	if meshStatus == MTLSEnabled {
+		return MTLSUnsetInheritedStrict
 	}
-
-	return nsNames, nil
+	// Namespace has no policy (UNSET) but mesh is DISABLED: show "Unset" label with disabled-style icon/tooltip.
+	if meshStatus == MTLSDisabled {
+		return MTLSUnsetInheritedDisabled
+	}
+	return MTLSUnset
 }
 
-func (in *TLSService) hasAutoMTLSEnabled() bool {
-	if in.enabledAutoMtls != nil {
-		return *in.enabledAutoMtls
+func (in *TLSService) namespaceMTLSOverallStatus(ctx context.Context, cluster, namespace string, peerAuthentications []*security_v1.PeerAuthentication, mtlsStatus mtls.MtlsStatus) string {
+	// If there are validation errors on any PeerAuthentication in the namespace, surface that as a distinct status.
+	// This has priority over UNSET.
+	if in.peerAuthenticationHasValidationErrors(cluster, peerAuthentications) {
+		return MTLSValidationError
 	}
 
-	cfg := config.Get()
-	var istioConfig *core_v1.ConfigMap
-	var err error
-	if IsNamespaceCached(cfg.IstioNamespace) {
-		istioConfig, err = kialiCache.GetConfigMap(cfg.IstioNamespace, cfg.ExternalServices.Istio.ConfigMapName)
-	} else {
-		istioConfig, err = in.k8s.GetConfigMap(cfg.IstioNamespace, cfg.ExternalServices.Istio.ConfigMapName)
+	// Treat the namespace as UNSET when there is no namespace-wide PeerAuthentication that actually defines mTLS.
+	// This covers both cases:
+	// - no PeerAuthentications at all
+	// - PeerAuthentications present but with mtls unset / not specified
+	if !in.hasNamespaceWideMTLSPolicy(peerAuthentications) {
+		return MTLSUnset
 	}
-	if err != nil {
+
+	return mtlsStatus.NamespaceMtlsStatus(namespace, resolveIdentityDomainWithDiscovery(ctx, in.discovery, cluster, in.conf.ExternalServices.Istio.IstioIdentityDomain)).OverallStatus
+}
+
+func (in *TLSService) hasNamespaceWideMTLSPolicy(peerAuthentications []*security_v1.PeerAuthentication) bool {
+	for _, pa := range peerAuthentications {
+		if pa == nil || pa.Spec.Mtls == nil {
+			continue
+		}
+
+		// If mtls is specified but mode is UNSET, it doesn't actually modify mTLS behavior.
+		if pa.Spec.Mtls.Mode.String() != "UNSET" {
+			return true
+		}
+	}
+	return false
+}
+
+// filterNamespaceWidePeerAuthentications returns only those PeerAuthentications that apply namespace-wide.
+// Selector-less PeerAuthentications apply to the entire namespace. Some users/tools may send an explicit
+// selector with an empty MatchLabels (which also applies to the whole namespace); treat that as namespace-wide too.
+func (in *TLSService) filterNamespaceWidePeerAuthentications(peerAuthentications []*security_v1.PeerAuthentication) []*security_v1.PeerAuthentication {
+	filtered := make([]*security_v1.PeerAuthentication, 0, len(peerAuthentications))
+	for _, pa := range peerAuthentications {
+		if pa == nil {
+			continue
+		}
+		if pa.Spec.Selector == nil {
+			filtered = append(filtered, pa)
+			continue
+		}
+		if len(pa.Spec.Selector.MatchLabels) == 0 {
+			filtered = append(filtered, pa)
+		}
+	}
+	return filtered
+}
+
+func (in *TLSService) peerAuthenticationHasValidationErrors(cluster string, peerAuthentications []*security_v1.PeerAuthentication) bool {
+	validations := in.kialiCache.Validations().Items()
+
+	for _, pa := range peerAuthentications {
+		if pa == nil {
+			continue
+		}
+
+		key := models.IstioValidationKey{
+			ObjectGVK: kubernetes.PeerAuthentications,
+			Name:      pa.Name,
+			Namespace: pa.Namespace,
+			Cluster:   cluster,
+		}
+
+		validation, found := validations[key]
+		if !found || validation == nil {
+			continue
+		}
+
+		if !validation.Valid {
+			return true
+		}
+
+		for _, check := range validation.Checks {
+			if check != nil && check.Severity == models.ErrorSeverity {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+func rootNamespaceFromMesh(mesh *models.Mesh, cluster, namespace string) string {
+	if mesh == nil {
+		return ""
+	}
+	cp, err := mesh.ControlPlaneForNamespace(cluster, namespace)
+	if err != nil || cp == nil {
+		return ""
+	}
+	return cp.RootNamespace
+}
+
+// autoMTLSFromMesh returns whether auto mTLS is enabled for the control plane managing the given namespace.
+// Uses ControlPlaneForNamespace to find the correct CP without requiring revision labels.
+func autoMTLSFromMesh(mesh *models.Mesh, cluster, namespace string) bool {
+	if mesh == nil {
 		return true
 	}
-	mc, err := kubernetes.GetIstioConfigMap(istioConfig)
-	if err != nil {
+	cp, err := mesh.ControlPlaneForNamespace(cluster, namespace)
+	if err != nil || cp == nil || cp.MeshConfig == nil || cp.MeshConfig.EnableAutoMtls == nil {
 		return true
 	}
-	autoMtls := mc.GetEnableAutoMtls()
-	in.enabledAutoMtls = &autoMtls
-	return autoMtls
+	return cp.MeshConfig.EnableAutoMtls.Value
 }

@@ -1,14 +1,14 @@
-FROM registry.access.redhat.com/ubi8-minimal AS base-amd64
-FROM registry.access.redhat.com/ubi8-minimal AS base-arm64
-FROM registry.access.redhat.com/ubi8-minimal AS base-s390x
-FROM registry.access.redhat.com/ubi8-minimal AS base-ppc64le
+FROM registry.access.redhat.com/ubi9-minimal AS base-amd64
+FROM registry.access.redhat.com/ubi9-minimal AS base-arm64
+FROM registry.access.redhat.com/ubi9-minimal AS base-s390x
+FROM registry.access.redhat.com/ubi9-minimal AS base-ppc64le
 
-FROM base-${TARGETARCH:-amd64}
+FROM base-${TARGETARCH}
 
 LABEL maintainer="kiali-dev@googlegroups.com"
 
-ENV KIALI_HOME=/opt/kiali \
-    PATH=$KIALI_HOME:$PATH
+ENV KIALI_HOME=/opt/kiali
+ENV PATH=$KIALI_HOME:$PATH
 
 WORKDIR $KIALI_HOME
 
@@ -19,11 +19,6 @@ RUN microdnf install -y shadow-utils && \
 
 ARG TARGETARCH
 COPY kiali-${TARGETARCH} $KIALI_HOME/kiali
-
-ADD console $KIALI_HOME/console/
-
-RUN chown -R kiali:kiali $KIALI_HOME/console && \
-    chmod -R g=u $KIALI_HOME/console
 
 USER 1000
 

@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	networking_v1 "istio.io/client-go/pkg/apis/networking/v1"
 
 	"github.com/kiali/kiali/config"
 	"github.com/kiali/kiali/kubernetes"
@@ -22,14 +23,15 @@ func TestCorrectGateways(t *testing.T) {
 			"app": "real",
 		}))
 
-	gws := [][]kubernetes.IstioObject{{gwObject}}
+	gws := []*networking_v1.Gateway{gwObject}
 
-	validations := MultiMatchChecker{
-		GatewaysPerNamespace: gws,
+	vals := MultiMatchChecker{
+		Conf:     config.Get(),
+		Gateways: gws,
 	}.Check()
 
-	assert.Empty(validations)
-	_, ok := validations[models.IstioValidationKey{ObjectType: "gateway", Namespace: "test", Name: "validgateway"}]
+	assert.Empty(vals)
+	_, ok := vals[models.IstioValidationKey{ObjectGVK: kubernetes.Gateways, Namespace: "test", Name: "validgateway"}]
 	assert.False(ok)
 }
 
@@ -49,15 +51,16 @@ func TestCaseMatching(t *testing.T) {
 			"app": "canidae",
 		}))
 
-	gws := [][]kubernetes.IstioObject{{gwObject}}
+	gws := []*networking_v1.Gateway{gwObject}
 
-	validations := MultiMatchChecker{
-		GatewaysPerNamespace: gws,
+	vals := MultiMatchChecker{
+		Conf:     config.Get(),
+		Gateways: gws,
 	}.Check()
 
-	assert.NotEmpty(validations)
-	assert.Equal(1, len(validations))
-	validation, ok := validations[models.IstioValidationKey{ObjectType: "gateway", Namespace: "test", Name: "foxxed"}]
+	assert.NotEmpty(vals)
+	assert.Equal(1, len(vals))
+	validation, ok := vals[models.IstioValidationKey{ObjectGVK: kubernetes.Gateways, Namespace: "test", Name: "foxxed"}]
 	assert.True(ok)
 	assert.True(validation.Valid)
 }
@@ -78,13 +81,14 @@ func TestDashSubdomainMatching(t *testing.T) {
 			"app": "canidae",
 		}))
 
-	gws := [][]kubernetes.IstioObject{{gwObject}}
+	gws := []*networking_v1.Gateway{gwObject}
 
-	validations := MultiMatchChecker{
-		GatewaysPerNamespace: gws,
+	vals := MultiMatchChecker{
+		Conf:     config.Get(),
+		Gateways: gws,
 	}.Check()
 
-	assert.Empty(validations)
+	assert.Empty(vals)
 }
 
 // Two gateways can share port+host unless they use different ingress
@@ -105,13 +109,14 @@ func TestSameHostPortConfigInDifferentIngress(t *testing.T) {
 			"app": "istio-ingress-prv",
 		}))
 
-	gws := [][]kubernetes.IstioObject{{gwObject}, {gwObject2}}
+	gws := []*networking_v1.Gateway{gwObject, gwObject2}
 
-	validations := MultiMatchChecker{
-		GatewaysPerNamespace: gws,
+	vals := MultiMatchChecker{
+		Conf:     config.Get(),
+		Gateways: gws,
 	}.Check()
 
-	assert.Equal(0, len(validations))
+	assert.Equal(0, len(vals))
 }
 
 func TestSameHostPortConfigInDifferentNamespace(t *testing.T) {
@@ -131,25 +136,52 @@ func TestSameHostPortConfigInDifferentNamespace(t *testing.T) {
 			"app": "real",
 		}))
 
-	gws := [][]kubernetes.IstioObject{{gwObject}, {gwObject2}}
+	gws := []*networking_v1.Gateway{gwObject, gwObject2}
 
-	validations := MultiMatchChecker{
-		GatewaysPerNamespace: gws,
+	vals := MultiMatchChecker{
+		Conf:     config.Get(),
+		Gateways: gws,
 	}.Check()
 
-	assert.NotEmpty(validations)
-	assert.Equal(2, len(validations))
-	validation, ok := validations[models.IstioValidationKey{ObjectType: "gateway", Namespace: "bookinfo", Name: "stillvalid"}]
+	assert.NotEmpty(vals)
+	assert.Equal(2, len(vals))
+	validation, ok := vals[models.IstioValidationKey{ObjectGVK: kubernetes.Gateways, Namespace: "bookinfo", Name: "stillvalid"}]
 	assert.True(ok)
 	assert.True(validation.Valid)
 
-	secValidation, ok := validations[models.IstioValidationKey{ObjectType: "gateway", Namespace: "test", Name: "validgateway"}]
+	secValidation, ok := vals[models.IstioValidationKey{ObjectGVK: kubernetes.Gateways, Namespace: "test", Name: "validgateway"}]
 	assert.True(ok)
 	assert.True(secValidation.Valid)
 
 	// Check references
 	assert.Equal(1, len(validation.References))
 	assert.Equal(1, len(secValidation.References))
+}
+
+func TestSameHostDifferentPortConfig(t *testing.T) {
+	conf := config.NewConfig()
+	config.Set(conf)
+
+	assert := assert.New(t)
+
+	gwObject := data.AddServerToGateway(data.CreateServer([]string{"valid"}, 80, "http", "http"),
+		data.CreateEmptyGateway("validgateway", "test", map[string]string{
+			"istio": "istio-ingress",
+		}))
+
+	gwObject2 := data.AddServerToGateway(data.CreateServer([]string{"valid"}, 443, "https", "https"),
+		data.CreateEmptyGateway("validgateway", "test", map[string]string{
+			"istio": "istio-ingress",
+		}))
+
+	gws := []*networking_v1.Gateway{gwObject, gwObject2}
+
+	vals := MultiMatchChecker{
+		Conf:     config.Get(),
+		Gateways: gws,
+	}.Check()
+
+	assert.Equal(0, len(vals))
 }
 
 func TestWildCardMatchingHost(t *testing.T) {
@@ -175,28 +207,104 @@ func TestWildCardMatchingHost(t *testing.T) {
 			"istio": "istio-ingress",
 		}))
 
-	gws := [][]kubernetes.IstioObject{{gwObject}, {gwObject2, gwObject3}}
+	gws := []*networking_v1.Gateway{gwObject, gwObject2, gwObject3}
 
-	validations := MultiMatchChecker{
-		GatewaysPerNamespace: gws,
+	vals := MultiMatchChecker{
+		Conf:     config.Get(),
+		Gateways: gws,
 	}.Check()
 
-	assert.NotEmpty(validations)
-	assert.Equal(3, len(validations))
-	validation, ok := validations[models.IstioValidationKey{ObjectType: "gateway", Namespace: "test", Name: "stillvalid"}]
+	assert.NotEmpty(vals)
+	assert.Equal(3, len(vals))
+	validation, ok := vals[models.IstioValidationKey{ObjectGVK: kubernetes.Gateways, Namespace: "test", Name: "stillvalid"}]
 	assert.True(ok)
 	assert.True(validation.Valid)
 
 	// valid should have "*" as ref
 	// "*" should have valid and *.just as ref
 	// *.just should have "*" as ref
-	for _, v := range validations {
+	for _, v := range vals {
 		if v.Name == "stillvalid" {
 			assert.Equal(2, len(v.References))
 		} else {
 			assert.Equal(1, len(v.References))
 		}
 	}
+}
+
+func TestSkipWildCardMatchingHost(t *testing.T) {
+	conf := config.NewConfig()
+	conf.KialiFeatureFlags.Validations.SkipWildcardGatewayHosts = true
+	config.Set(conf)
+
+	assert := assert.New(t)
+
+	gwObject := data.AddServerToGateway(data.CreateServer([]string{"valid"}, 80, "http", "http"),
+		data.CreateEmptyGateway("validgateway", "test", map[string]string{
+			"istio": "istio-ingress",
+		}))
+
+	// Another namespace
+	gwObject2 := data.AddServerToGateway(data.CreateServer([]string{"*"}, 80, "http", "http"),
+		data.CreateEmptyGateway("stillvalid", "test", map[string]string{
+			"istio": "istio-ingress",
+		}))
+
+	// Another namespace
+	gwObject3 := data.AddServerToGateway(data.CreateServer([]string{"*.justhost.com"}, 80, "http", "http"),
+		data.CreateEmptyGateway("keepsvalid", "test", map[string]string{
+			"istio": "istio-ingress",
+		}))
+
+	// Another namespace
+	gwObject4 := data.AddServerToGateway(data.CreateServer([]string{"*.subdomain.justhost.com"}, 80, "http", "http"),
+		data.CreateEmptyGateway("keepsvalid", "test", map[string]string{
+			"istio": "istio-ingress",
+		}))
+
+	gws := []*networking_v1.Gateway{gwObject, gwObject2, gwObject3, gwObject4}
+
+	vals := MultiMatchChecker{
+		Conf:     config.Get(),
+		Gateways: gws,
+	}.Check()
+
+	assert.Equal(0, len(vals))
+}
+
+func TestSameWildcardHostPortConfigInDifferentNamespace(t *testing.T) {
+	conf := config.NewConfig()
+	config.Set(conf)
+
+	assert := assert.New(t)
+
+	gwObject := data.AddServerToGateway(data.CreateServer([]string{"*"}, 80, "http", "http"),
+		data.CreateEmptyGateway("bookinfo-gateway-auto-host", "bookinfo", map[string]string{}))
+
+	// Another namespace
+	gwObject2 := data.AddServerToGateway(data.CreateServer([]string{"*"}, 80, "http", "http"),
+		data.CreateEmptyGateway("bookinfo-gateway-auto-host-copy", "bookinfo2", map[string]string{}))
+
+	gws := []*networking_v1.Gateway{gwObject, gwObject2}
+
+	vals := MultiMatchChecker{
+		Conf:     config.Get(),
+		Gateways: gws,
+	}.Check()
+
+	assert.NotEmpty(vals)
+	assert.Equal(2, len(vals))
+	validation, ok := vals[models.IstioValidationKey{ObjectGVK: kubernetes.Gateways, Namespace: "bookinfo2", Name: "bookinfo-gateway-auto-host-copy"}]
+	assert.True(ok)
+	assert.True(validation.Valid)
+
+	secValidation, ok := vals[models.IstioValidationKey{ObjectGVK: kubernetes.Gateways, Namespace: "bookinfo", Name: "bookinfo-gateway-auto-host"}]
+	assert.True(ok)
+	assert.True(secValidation.Valid)
+
+	// Check references
+	assert.Equal(1, len(validation.References))
+	assert.Equal(1, len(secValidation.References))
 }
 
 func TestAnotherSubdomainWildcardCombination(t *testing.T) {
@@ -215,15 +323,16 @@ func TestAnotherSubdomainWildcardCombination(t *testing.T) {
 			"app": "monotreme",
 		}))
 
-	gws := [][]kubernetes.IstioObject{{gwObject}}
+	gws := []*networking_v1.Gateway{gwObject}
 
-	validations := MultiMatchChecker{
-		GatewaysPerNamespace: gws,
+	vals := MultiMatchChecker{
+		Conf:     config.Get(),
+		Gateways: gws,
 	}.Check()
 
-	assert.NotEmpty(validations)
-	assert.Equal(1, len(validations))
-	validation, ok := validations[models.IstioValidationKey{ObjectType: "gateway", Namespace: "test", Name: "shouldnotbevalid"}]
+	assert.NotEmpty(vals)
+	assert.Equal(1, len(vals))
+	validation, ok := vals[models.IstioValidationKey{ObjectGVK: kubernetes.Gateways, Namespace: "test", Name: "shouldnotbevalid"}]
 	assert.True(ok)
 	assert.True(validation.Valid)
 }
@@ -244,13 +353,40 @@ func TestNoMatchOnSubdomainHost(t *testing.T) {
 			"app": "someother",
 		}))
 
-	gws := [][]kubernetes.IstioObject{{gwObject}}
+	gws := []*networking_v1.Gateway{gwObject}
 
-	validations := MultiMatchChecker{
-		GatewaysPerNamespace: gws,
+	vals := MultiMatchChecker{
+		Conf:     config.Get(),
+		Gateways: gws,
 	}.Check()
 
-	assert.Empty(validations)
+	assert.Empty(vals)
+}
+
+func TestNoMatchOnWildcardSubdomainHost(t *testing.T) {
+	conf := config.NewConfig()
+	config.Set(conf)
+
+	assert := assert.New(t)
+
+	gwObject := data.AddServerToGateway(data.CreateServer(
+		[]string{
+			"*.example.com",
+			"*.thisisfine.example.com",
+		}, 80, "http", "http"),
+
+		data.CreateEmptyGateway("shouldbevalid", "test", map[string]string{
+			"app": "someother",
+		}))
+
+	gws := []*networking_v1.Gateway{gwObject}
+
+	vals := MultiMatchChecker{
+		Conf:     config.Get(),
+		Gateways: gws,
+	}.Check()
+
+	assert.Empty(vals)
 }
 
 func TestTwoWildCardsMatching(t *testing.T) {
@@ -270,15 +406,16 @@ func TestTwoWildCardsMatching(t *testing.T) {
 			"istio": "istio-ingress",
 		}))
 
-	gws := [][]kubernetes.IstioObject{{gwObject}, {gwObject2}}
+	gws := []*networking_v1.Gateway{gwObject, gwObject2}
 
-	validations := MultiMatchChecker{
-		GatewaysPerNamespace: gws,
+	vals := MultiMatchChecker{
+		Conf:     config.Get(),
+		Gateways: gws,
 	}.Check()
 
-	assert.NotEmpty(validations)
-	assert.Equal(2, len(validations))
-	validation, ok := validations[models.IstioValidationKey{ObjectType: "gateway", Namespace: "test", Name: "stillvalid"}]
+	assert.NotEmpty(vals)
+	assert.Equal(2, len(vals))
+	validation, ok := vals[models.IstioValidationKey{ObjectGVK: kubernetes.Gateways, Namespace: "test", Name: "stillvalid"}]
 	assert.True(ok)
 	assert.True(validation.Valid)
 	assert.Equal("spec/servers[0]/hosts[0]", validation.Checks[0].Path)
@@ -300,17 +437,18 @@ func TestDuplicateGatewaysErrorCount(t *testing.T) {
 			"app": "real",
 		}))
 
-	gws := [][]kubernetes.IstioObject{{gwObject, gwObjectIdentical}}
+	gws := []*networking_v1.Gateway{gwObject, gwObjectIdentical}
 
-	validations := MultiMatchChecker{
-		GatewaysPerNamespace: gws,
+	vals := MultiMatchChecker{
+		Conf:     config.Get(),
+		Gateways: gws,
 	}.Check()
 
-	assert.NotEmpty(validations)
-	validgateway, ok := validations[models.IstioValidationKey{ObjectType: "gateway", Namespace: "test", Name: "validgateway"}]
+	assert.NotEmpty(vals)
+	validgateway, ok := vals[models.IstioValidationKey{ObjectGVK: kubernetes.Gateways, Namespace: "test", Name: "validgateway"}]
 	assert.True(ok)
 
-	duplicatevalidgateway, ok := validations[models.IstioValidationKey{ObjectType: "gateway", Namespace: "test", Name: "duplicatevalidgateway"}]
+	duplicatevalidgateway, ok := vals[models.IstioValidationKey{ObjectGVK: kubernetes.Gateways, Namespace: "test", Name: "duplicatevalidgateway"}]
 	assert.True(ok)
 
 	assert.Equal(2, len(validgateway.Checks))
@@ -320,4 +458,195 @@ func TestDuplicateGatewaysErrorCount(t *testing.T) {
 	assert.Equal(2, len(duplicatevalidgateway.Checks))
 	assert.Equal("spec/servers[0]/hosts[0]", duplicatevalidgateway.Checks[0].Path)
 	assert.Equal("spec/servers[0]/hosts[1]", duplicatevalidgateway.Checks[1].Path)
+}
+
+// One Host can be defined for multiple target namespaces without conflict
+func TestNoMatchOnDifferentTargetNamespaces(t *testing.T) {
+	conf := config.NewConfig()
+	config.Set(conf)
+
+	assert := assert.New(t)
+
+	gwObject := data.AddServerToGateway(data.CreateServer(
+		[]string{
+			"test1/example.com",
+			"test2/example.com",
+		}, 80, "http", "http"),
+
+		data.CreateEmptyGateway("shouldbevalid", "test", map[string]string{
+			"app": "ingressgateway",
+		}))
+
+	gws := []*networking_v1.Gateway{gwObject}
+
+	vals := MultiMatchChecker{
+		Conf:     config.Get(),
+		Gateways: gws,
+	}.Check()
+
+	assert.Empty(vals)
+}
+
+// target Namespace '.' means that the Host is available in the Namespace of the Gateway resource
+func TestMatchOnSameTargetNamespace(t *testing.T) {
+	conf := config.NewConfig()
+	config.Set(conf)
+
+	assert := assert.New(t)
+
+	gwObject := data.AddServerToGateway(data.CreateServer(
+		[]string{
+			"test/example.com",
+			"./example.com",
+		}, 80, "http", "http"),
+
+		data.CreateEmptyGateway("shouldnotbevalid", "test", map[string]string{
+			"app": "ingressgateway",
+		}))
+
+	gws := []*networking_v1.Gateway{gwObject}
+
+	vals := MultiMatchChecker{
+		Conf:     config.Get(),
+		Gateways: gws,
+	}.Check()
+
+	assert.NotEmpty(vals)
+	assert.Equal(1, len(vals))
+	validation, ok := vals[models.IstioValidationKey{ObjectGVK: kubernetes.Gateways, Namespace: "test", Name: "shouldnotbevalid"}]
+	assert.True(ok)
+	assert.True(validation.Valid)
+}
+
+// target Namespace * means that the Host is available in all namespaces
+func TestMatchOnWildcardTargetNamespace(t *testing.T) {
+	conf := config.NewConfig()
+	config.Set(conf)
+
+	assert := assert.New(t)
+
+	gwObject := data.AddServerToGateway(data.CreateServer(
+		[]string{
+			"test/example.com",
+			"*/example.com",
+		}, 80, "http", "http"),
+
+		data.CreateEmptyGateway("shouldnotbevalid", "test", map[string]string{
+			"app": "ingressgateway",
+		}))
+
+	gws := []*networking_v1.Gateway{gwObject}
+
+	vals := MultiMatchChecker{
+		Conf:     config.Get(),
+		Gateways: gws,
+	}.Check()
+
+	assert.NotEmpty(vals)
+	assert.Equal(1, len(vals))
+	validation, ok := vals[models.IstioValidationKey{ObjectGVK: kubernetes.Gateways, Namespace: "test", Name: "shouldnotbevalid"}]
+	assert.True(ok)
+	assert.True(validation.Valid)
+}
+
+// having no target namespace set is the same as having * as target Namespace
+func TestMatchOnImplicitWildcardTargetNamespace(t *testing.T) {
+	conf := config.NewConfig()
+	config.Set(conf)
+
+	assert := assert.New(t)
+
+	gwObject := data.AddServerToGateway(data.CreateServer(
+		[]string{
+			"test/example.com",
+			"example.com",
+		}, 80, "http", "http"),
+
+		data.CreateEmptyGateway("shouldnotbevalid", "test", map[string]string{
+			"app": "ingressgateway",
+		}))
+
+	gws := []*networking_v1.Gateway{gwObject}
+
+	vals := MultiMatchChecker{
+		Conf:     config.Get(),
+		Gateways: gws,
+	}.Check()
+
+	assert.NotEmpty(vals)
+	assert.Equal(1, len(vals))
+	validation, ok := vals[models.IstioValidationKey{ObjectGVK: kubernetes.Gateways, Namespace: "test", Name: "shouldnotbevalid"}]
+	assert.True(ok)
+	assert.True(validation.Valid)
+}
+
+func TestMatchOnImplicitWildcardMatchingHosts(t *testing.T) {
+	conf := config.NewConfig()
+	config.Set(conf)
+
+	assert := assert.New(t)
+
+	gwObject := data.AddServerToGateway(data.CreateServer(
+		[]string{
+			"*.example.com",
+			"*.example.com",
+		}, 80, "http", "http"),
+
+		data.CreateEmptyGateway("shouldnotbevalid", "test", map[string]string{
+			"app": "ingressgateway",
+		}))
+
+	gws := []*networking_v1.Gateway{gwObject}
+
+	vals := MultiMatchChecker{
+		Conf:     config.Get(),
+		Gateways: gws,
+	}.Check()
+
+	assert.NotEmpty(vals)
+	assert.Equal(1, len(vals))
+	validation, ok := vals[models.IstioValidationKey{ObjectGVK: kubernetes.Gateways, Namespace: "test", Name: "shouldnotbevalid"}]
+	assert.True(ok)
+	assert.True(validation.Valid)
+}
+
+// TestMultimatchValidationValueCarriesNamespace pins the CI regression from
+// PR #10448: the IstioValidation VALUE must carry its namespace. The
+// cluster-wide GetValidations filter reads the map KEY's namespace, which is
+// authoritative (TestGetValidationsKeepsGatewayMultimatchValidations keeps an
+// entry whose value lacks it) — but a value without its namespace is
+// malformed, and it was the original cause of the CI drop: the pre-fix
+// filter read the value's Namespace field, so every collision-flagged
+// gateway lost its validation on /api/istio/config. The scenario mirrors the
+// Istio 1.31 bookinfo sample gateway (port 8080, wildcard host,
+// istio=ingressgateway selector) colliding with a wizard-created gateway.
+func TestMultimatchValidationValueCarriesNamespace(t *testing.T) {
+	conf := config.NewConfig()
+	config.Set(conf)
+
+	assert := assert.New(t)
+
+	demoGateway := data.AddServerToGateway(data.CreateServer([]string{"*"}, 8080, "http", "HTTP"),
+		data.CreateEmptyGateway("bookinfo-gateway", "bookinfo", map[string]string{
+			"istio": "ingressgateway",
+		}))
+
+	wizardGateway := data.AddServerToGateway(data.CreateServer([]string{"website.com"}, 8080, "foobar", "HTTP"),
+		data.CreateEmptyGateway("mygateway", "bookinfo", map[string]string{
+			"istio": "ingressgateway",
+		}))
+
+	vals := MultiMatchChecker{
+		Conf:     config.Get(),
+		Gateways: []*networking_v1.Gateway{demoGateway, wizardGateway},
+	}.Check()
+
+	// Both colliding gateways must be flagged: pin the count so a checker
+	// that silently produces fewer entries fails.
+	assert.Len(vals, 2)
+	for key, validation := range vals {
+		assert.Equal("bookinfo", key.Namespace)
+		assert.Equal(key.Namespace, validation.Namespace,
+			"multimatch validation value for %s must carry its namespace, matching its key", key.Name)
+	}
 }

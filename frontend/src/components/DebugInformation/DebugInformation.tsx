@@ -1,0 +1,355 @@
+import * as React from 'react';
+import { connect } from 'react-redux';
+import { CopyToClipboard } from 'react-copy-to-clipboard';
+import { serverConfig } from '../../config';
+import type { ComputedServerConfig } from '../../config/ServerConfig';
+import type { KialiAppState } from '../../store/Store';
+import {
+  Alert,
+  AlertActionCloseButton,
+  AlertVariant,
+  Button,
+  ButtonVariant,
+  Modal,
+  ModalBody,
+  ModalFooter,
+  ModalHeader,
+  ModalVariant,
+  Tab
+} from '@patternfly/react-core';
+import { yamlDumpOptions } from '../../types/IstioConfigDetails';
+import Editor from '@monaco-editor/react';
+import { ParameterizedTabs } from '../Tab/Tabs';
+import type { AuthConfig } from '../../types/Auth';
+import { authenticationConfig } from '../../config/AuthenticationConfig';
+import { basicTabStyle } from 'styles/TabStyles';
+import { editorStyle } from 'styles/EditorStyle';
+import { ColorScheme } from 'types/Common';
+import { resolveColorScheme } from 'utils/AppearanceUtils';
+import { kialiStyle } from 'styles/StyleUtils';
+import { classes } from 'typestyle';
+import { usePreviousValue } from 'utils/ReactUtils';
+import { ConfigTable } from 'components/Table/ConfigTable';
+import { useKialiTranslation } from 'utils/I18nUtils';
+import { download } from 'utils/Common';
+import { dump } from 'js-yaml';
+import { getAllPerfStats } from '../../utils/PerformanceUtils';
+
+enum CopyStatus {
+  NOT_COPIED, // We haven't copied the current output
+  COPIED, // Current output is in the clipboard
+  OLD_COPY // We copied the prev output, but there are changes in the KialiAppState
+}
+
+const debugInformationModalTitleId = 'debug-information-modal-title';
+
+type ReduxProps = {
+  appState: KialiAppState;
+};
+
+type DebugInformationProps = ReduxProps & {
+  isOpen: boolean;
+  onClose: () => void;
+};
+
+type DebugInformationData = {
+  backendConfigs: {
+    authenticationConfig: AuthConfig;
+    computedServerConfig: ComputedServerConfig;
+  };
+  currentURL: string;
+  reduxState: KialiAppState;
+};
+
+// Will be shown in Kiali Config and hidden in Additional state
+const propsToShow = [
+  'authStrategy',
+  'clusters',
+  'clusterWideAccess',
+  'gatewayAPIClasses',
+  'gatewayAPIEnabled',
+  'istioAnnotationsAction',
+  'istioConfigMap',
+  'istioIdentityDomain',
+  'istioInjectionAction',
+  'istioNamespace',
+  'istioStatusEnabled',
+  'logLevel'
+];
+
+// This should include anything that can not be stringified to JSON
+const propsToPatch = ['cyRef', 'summaryTarget', 'target', 'token', 'username'];
+
+const defaultTab = 'kialiConfig';
+
+const tabIndex: { [tab: string]: number } = {
+  kialiConfig: 0,
+  additionalState: 1,
+  perfData: 2
+};
+
+// Override basicTabStyle's flex:1 on tab content because this modal has a
+// fixed viewport — tabs should scroll internally at a fixed height rather
+// than stretching to fill the page.
+const modalStyle = kialiStyle({
+  overflowY: 'hidden',
+  $nest: {
+    '& .pf-v6-c-tab-content': {
+      flex: '0 0 auto',
+      height: '530px',
+      overflowY: 'auto'
+    }
+  }
+});
+
+const tabStyle = kialiStyle({
+  $nest: {
+    '&& .pf-v6-c-tabs__list': {
+      marginLeft: 0
+    }
+  }
+});
+
+const spanStyle = kialiStyle({
+  display: 'inline-block',
+  marginBottom: '0.25rem',
+  marginTop: '0.25rem'
+});
+
+const DebugInformationComponent: React.FC<DebugInformationProps> = (props: DebugInformationProps) => {
+  const [config, setConfig] = React.useState({});
+  const [copyStatus, setCopyStatus] = React.useState(CopyStatus.NOT_COPIED);
+  const [currentTab, setCurrentTab] = React.useState(defaultTab);
+
+  const { t } = useKialiTranslation();
+
+  React.useEffect(() => {
+    let kialiConfig = {};
+
+    for (const key in serverConfig) {
+      if (propsToShow.includes(key)) {
+        kialiConfig[key] = serverConfig[key];
+      }
+    }
+    // Order config items
+    kialiConfig = Object.keys(kialiConfig)
+      .sort()
+      .reduce((obj, key) => {
+        obj[key] = kialiConfig[key];
+        return obj;
+      }, {});
+
+    setConfig(kialiConfig);
+  }, []);
+
+  const { appState, isOpen } = props;
+
+  const prevAppState = usePreviousValue(appState);
+
+  React.useEffect(() => {
+    if (prevAppState !== appState && copyStatus === CopyStatus.COPIED) {
+      setCopyStatus(CopyStatus.OLD_COPY);
+    }
+  }, [prevAppState, appState, copyStatus]);
+
+  React.useEffect(() => {
+    if (isOpen) {
+      setCopyStatus(CopyStatus.NOT_COPIED);
+      setCurrentTab(defaultTab);
+    }
+  }, [isOpen]);
+
+  const copyCallback = (_text: string, result: boolean): void => {
+    setCopyStatus(result ? CopyStatus.COPIED : CopyStatus.NOT_COPIED);
+  };
+
+  const downloadsMap: { [key: string]: string } = {
+    kialiConfig: 'kiali_config.yaml',
+    additionalState: 'additional_state.yaml',
+    perfData: 'perf_data.yaml'
+  };
+
+  const downloadFile = (): void => {
+    const fileName = `debug_${downloadsMap[currentTab]}`;
+
+    download(copyText, fileName);
+  };
+
+  const hideAlert = (): void => {
+    setCopyStatus(CopyStatus.NOT_COPIED);
+  };
+
+  const parseConfig = (key: string, value: unknown): unknown | null => {
+    // We have to patch some runtime properties  we don't want to serialize
+    if (propsToPatch.includes(key)) {
+      return null;
+    }
+
+    return value;
+  };
+
+  // Properties shown in Kiali Config are not shown again in Additional State
+  const filterDebugInformation = (info: DebugInformationData): DebugInformationData => {
+    if (info !== null) {
+      for (const [key] of Object.entries(info)) {
+        if (propsToShow.includes(key)) {
+          delete info[key];
+          continue;
+        }
+      }
+    }
+
+    return info;
+  };
+
+  if (!props.isOpen) {
+    return null;
+  }
+
+  let debugInformation: DebugInformationData = {
+    backendConfigs: {
+      authenticationConfig: authenticationConfig,
+      computedServerConfig: serverConfig
+    },
+    currentURL: window.location.href,
+    reduxState: props.appState
+  };
+
+  debugInformation = filterDebugInformation(debugInformation);
+
+  // skip invalid regex not allowed by js-yaml dump
+  const debugInformationText = dump(debugInformation, {
+    noRefs: true,
+    replacer: parseConfig,
+    skipInvalid: true,
+    ...yamlDumpOptions
+  });
+
+  const perfMeasurements = dump(getAllPerfStats(), {
+    noRefs: true,
+    replacer: parseConfig,
+    skipInvalid: true,
+    ...yamlDumpOptions
+  });
+
+  const copyTextMap: { [key: string]: string } = {
+    kialiConfig: dump(config, yamlDumpOptions),
+    additionalState: debugInformationText,
+    perfData: perfMeasurements
+  };
+
+  const copyText = copyTextMap[currentTab];
+
+  const isDarkTheme = resolveColorScheme(props.appState.globalState.colorScheme) === ColorScheme.DARK;
+
+  const renderTabs = (): React.ReactNode[] => {
+    const kialiConfig = (
+      <Tab eventKey={0} title={t('Kiali Config')} key="kialiConfig">
+        <ConfigTable label={t('Debug Information')} configData={config} width="30%" />
+      </Tab>
+    );
+
+    const additionalState = (
+      <Tab eventKey={1} title={t('Additional State')} key="additionalState">
+        <span className={spanStyle}>{t('Please include this information when opening a bug:')}</span>
+        <div className={editorStyle} data-test="debug-editor">
+          <Editor
+            value={debugInformationText}
+            language="yaml"
+            theme={isDarkTheme ? 'vs-dark' : 'light'}
+            height="450px"
+            options={{ readOnly: true, wordWrap: 'on', scrollBeyondLastLine: false, folding: true }}
+          />
+        </div>
+      </Tab>
+    );
+
+    const perfData = (
+      <Tab eventKey={2} title={t('Performance Measurements')} key="perfData">
+        <span className={spanStyle}>
+          {t('For Performance issues troubleshooting, remove sensitive data before posting:')}
+        </span>
+        <div className={editorStyle} data-test="perf-editor">
+          <Editor
+            value={perfMeasurements}
+            language="yaml"
+            theme={isDarkTheme ? 'vs-dark' : 'light'}
+            height="450px"
+            options={{ readOnly: true, wordWrap: 'on', scrollBeyondLastLine: false, folding: true }}
+          />
+        </div>
+      </Tab>
+    );
+    return [kialiConfig, additionalState, perfData];
+  };
+
+  return (
+    <Modal
+      aria-labelledby={debugInformationModalTitleId}
+      className={modalStyle}
+      variant={ModalVariant.medium}
+      isOpen={props.isOpen}
+      onClose={props.onClose}
+    >
+      <ModalHeader labelId={debugInformationModalTitleId} title={t('Debug information')} />
+      <ModalBody>
+        {copyStatus === CopyStatus.COPIED && (
+          <Alert
+            style={{ marginBottom: '20px' }}
+            title={t('Debug information has been copied to your clipboard.')}
+            variant={AlertVariant.success}
+            isInline={true}
+            actionClose={<AlertActionCloseButton onClose={hideAlert} />}
+          />
+        )}
+
+        {copyStatus === CopyStatus.OLD_COPY && (
+          <Alert
+            style={{ marginBottom: '20px' }}
+            title={t(
+              'Debug information was copied to your clipboard, but is outdated now. It could be caused by new data received by auto refresh timers.'
+            )}
+            variant={AlertVariant.warning}
+            isInline={true}
+            actionClose={<AlertActionCloseButton onClose={hideAlert} />}
+          />
+        )}
+
+        <ParameterizedTabs
+          id="basic-tabs"
+          className={classes(basicTabStyle, tabStyle)}
+          onSelect={tabValue => {
+            setCurrentTab(tabValue);
+            hideAlert();
+          }}
+          tabMap={tabIndex}
+          defaultTab={defaultTab}
+          activeTab={currentTab}
+          mountOnEnter={true}
+          unmountOnExit={true}
+        >
+          {renderTabs()}
+        </ParameterizedTabs>
+      </ModalBody>
+      <ModalFooter>
+        <Button key="close" onClick={props.onClose}>
+          {t('Close')}
+        </Button>
+
+        <CopyToClipboard key="copy" onCopy={copyCallback} text={copyText}>
+          <Button variant={ButtonVariant.secondary}>{t('Copy')}</Button>
+        </CopyToClipboard>
+
+        <Button key="download" variant={ButtonVariant.secondary} onClick={downloadFile}>
+          {t('Download')}
+        </Button>
+      </ModalFooter>
+    </Modal>
+  );
+};
+
+const mapStateToProps = (state: KialiAppState): ReduxProps => ({
+  appState: state
+});
+
+export const DebugInformation = connect(mapStateToProps)(DebugInformationComponent);

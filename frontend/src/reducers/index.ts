@@ -1,0 +1,48 @@
+import { combineReducers } from 'redux';
+
+import { KialiAppState } from '../store/Store';
+import { NotificationCenterReducer } from './NotificationCenter';
+import { LoginStateReducer } from './LoginState';
+import { HelpDropdownStateReducer } from './HelpDropdownState';
+import { GraphDataStateReducer } from './GraphDataState';
+import { GlobalStateReducer } from './GlobalState';
+import { NamespaceStateReducer } from './NamespaceState';
+import { NamespacesListStateReducer } from './NamespacesListState';
+import { ServicesListStateReducer } from './ServicesListState';
+import { AppsListStateReducer } from './AppsListState';
+import { WorkloadsListStateReducer } from './WorkloadsListState';
+import { ClusterStateReducer } from './ClusterState';
+import { UserSettingsStateReducer } from './UserSettingsState';
+import { TourStateReducer } from './TourState';
+import { KialiAppAction } from '../actions/KialiAppAction';
+import { MeshTlsStateReducer } from './MeshTlsState';
+import { IstioStatusStateReducer } from './IstioStatusState';
+import { TracingStateReducer } from './TracingState';
+import { MetricsStatsStateReducer } from './MetricsStatsState';
+import { MeshDataStateReducer } from './MeshDataState';
+import { AiStateReducer } from './ChatAIState';
+
+export const rootReducer = combineReducers<KialiAppState, KialiAppAction>({
+  ai: AiStateReducer,
+  authentication: LoginStateReducer,
+  clusters: ClusterStateReducer,
+  globalState: GlobalStateReducer,
+  graph: GraphDataStateReducer,
+  istioStatus: IstioStatusStateReducer,
+  mesh: MeshDataStateReducer,
+  meshTLSStatus: MeshTlsStateReducer,
+  notificationCenter: NotificationCenterReducer,
+  metricsStats: MetricsStatsStateReducer,
+  namespaces: NamespaceStateReducer,
+  namespacesList: NamespacesListStateReducer,
+  servicesList: ServicesListStateReducer,
+  appsList: AppsListStateReducer,
+  workloadsList: WorkloadsListStateReducer,
+  statusState: HelpDropdownStateReducer,
+  tourState: TourStateReducer,
+  tracingState: TracingStateReducer,
+  userSettings: UserSettingsStateReducer
+});
+
+/* eslint-disable import-x/no-default-export */
+export default rootReducer;

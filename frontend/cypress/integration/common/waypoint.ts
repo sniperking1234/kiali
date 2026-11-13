@@ -1,0 +1,920 @@
+import { Then, When } from '@badeball/cypress-cucumber-preprocessor';
+import { openTab, waitForKialiApiReady } from './transition';
+import { getCellsForCol } from './table';
+import { confirmNamespaceTrafficPolicyModal, openNamespaceActionsMenu } from './namespace_actions';
+import { Pod } from 'types/IstioObjects';
+import { enableKialiFeature, USE_WAYPOINT_NAME_CONFIG } from './kiali-config';
+
+const tracingPathByTarget = (targetType: string, namespace: string, name: string): string => {
+  switch (targetType) {
+    case 'app':
+      return `${Cypress.config('baseUrl')}/api/namespaces/${namespace}/apps/${name}/traces`;
+    case 'service':
+      return `${Cypress.config('baseUrl')}/api/namespaces/${namespace}/services/${name}/traces`;
+    case 'workload':
+      return `${Cypress.config('baseUrl')}/api/namespaces/${namespace}/workloads/${name}/traces`;
+    default:
+      throw new Error(`Unsupported tracing target type: ${targetType}`);
+  }
+};
+
+// waitForWorkloadEnrolled waits until Kiali returns the namespace labels updated
+// Adding the waypoint label into the bookinfo namespace
+// This is usually enough (Slower) to have the workloads enrolled
+const waitForWorkloadEnrolled = (targetNamespace: string, maxRetries = 30, retryCount = 0): void => {
+  if (retryCount >= maxRetries) {
+    throw new Error(
+      `Condition not met after ${maxRetries} retries (waitForWorkloadEnrolled, baseUrl=${Cypress.config('baseUrl')})`
+    );
+  }
+
+  cy.request({ method: 'GET', url: `${Cypress.config('baseUrl')}/api/namespaces` }).then(response => {
+    expect(response.status).to.equal(200);
+
+    const ns = response.body;
+    let found = false;
+    let bookinfoLabels: Record<string, string> | undefined;
+
+    ns.forEach(namespace => {
+      if (namespace.name === targetNamespace) {
+        const labels = namespace.labels;
+        bookinfoLabels = labels;
+        Object.keys(labels).forEach(key => {
+          if (labels[key] === 'waypoint') {
+            found = true;
+            return;
+          }
+        });
+      }
+    });
+
+    if (found) {
+      return;
+    } else {
+      // Debug breadcrumbs for CI failures (shows in Cypress command log).
+      if (retryCount === 0 || retryCount % 5 === 0) {
+        Cypress.log({
+          name: 'waitForWorkloadEnrolled',
+          message: `retry=${retryCount}/${maxRetries} url=${Cypress.config(
+            'baseUrl'
+          )}/api/namespaces baseUrl=${Cypress.config('baseUrl')} bookinfoLabels=${JSON.stringify(
+            bookinfoLabels ?? {}
+          )} namespacesCount=${Array.isArray(ns) ? ns.length : -1} targetNamespace=${targetNamespace}`
+        });
+      }
+      return cy.wait(10000).then(() => {
+        return waitForWorkloadEnrolled(targetNamespace, maxRetries, retryCount + 1);
+      });
+    }
+  });
+};
+
+const waitForBookinfoWaypointTrafficGeneratedInGraph = (
+  targetNamespace: string,
+  ambientTraffic: string,
+  maxRetries = 60,
+  retryCount = 0,
+  lastEdgeCount = -1,
+  lastHttpEdgeCount = -1
+): void => {
+  let totalEdges = 9;
+  if (ambientTraffic === 'waypoint') {
+    totalEdges = 8;
+  }
+  // TCP-only graphs show up first; wait until HTTP edges exist too.
+  const minHttpEdges = 2;
+
+  if (retryCount >= maxRetries) {
+    throw new Error(
+      `Condition not met after ${maxRetries} retries (waitForBookinfoWaypointTrafficGeneratedInGraph, ambientTraffic=${ambientTraffic}, namespace=${targetNamespace}, lastEdgeCount=${lastEdgeCount}, lastHttpEdgeCount=${lastHttpEdgeCount}, expected>=${totalEdges}, expectedHttp>=${minHttpEdges}, baseUrl=${Cypress.config(
+        'baseUrl'
+      )})`
+    );
+  }
+
+  cy.request({
+    method: 'GET',
+    url: `${Cypress.config('baseUrl')}/api/namespaces/graph`,
+    qs: {
+      duration: '300s',
+      graphType: 'versionedApp',
+      includeIdleEdges: false,
+      injectServiceNodes: true,
+      boxBy: 'cluster,namespace,app',
+      waypoints: false,
+      ambientTraffic: ambientTraffic,
+      appenders: 'deadNode,istio,serviceEntry,meshCheck,workloadEntry,health,ambient',
+      rateGrpc: 'requests',
+      rateHttp: 'requests',
+      rateTcp: 'sent',
+      namespaces: targetNamespace
+    }
+  }).then(response => {
+    expect(response.status).to.equal(200);
+    const edges = response.body.elements?.edges ?? [];
+    const edgeCount = edges.length;
+    // Graph API puts protocol under data.traffic; UI decorates data.protocol later.
+    const httpEdgeCount = edges.filter(
+      (e: { data?: { traffic?: { protocol?: string } } }) => e.data?.traffic?.protocol === 'http'
+    ).length;
+
+    if (edgeCount >= totalEdges && httpEdgeCount >= minHttpEdges) {
+      return;
+    }
+
+    if (retryCount === 0 || retryCount % 5 === 0) {
+      Cypress.log({
+        name: 'waitForGraphTraffic',
+        message: `retry=${retryCount}/${maxRetries} url=${Cypress.config(
+          'baseUrl'
+        )}/api/namespaces/graph ambientTraffic=${ambientTraffic} edges=${edgeCount} httpEdges=${httpEdgeCount} expected>=${totalEdges} expectedHttp>=${minHttpEdges} baseUrl=${Cypress.config(
+          'baseUrl'
+        )} targetNamespace=${targetNamespace}`
+      });
+    }
+
+    return cy.wait(10000).then(() => {
+      return waitForBookinfoWaypointTrafficGeneratedInGraph(
+        targetNamespace,
+        ambientTraffic,
+        maxRetries,
+        retryCount + 1,
+        edgeCount,
+        httpEdgeCount
+      );
+    });
+  });
+};
+
+// Ambient→sidecar HTTP dest-reporter can stick with source_workload=unknown if HBONE
+// opens before ztunnel/sidecar have peer metadata (typical right after a fresh Sail
+// install). Restarting on a warm mesh opens new connections with curl-client labels.
+const restartSidecarAmbientDemoWorkloads = (): void => {
+  Cypress.log({
+    name: 'restartSidecarAmbientDemo',
+    message: 'Restart test-ambient/test-sidecar deployments so inbound HTTP is labeled curl-client'
+  });
+  ['test-sidecar', 'test-ambient'].forEach(ns => {
+    cy.exec(`kubectl rollout restart deployment -n ${ns}`);
+    cy.exec(`kubectl rollout status deployment -n ${ns} --timeout=120s`, { timeout: 150000 });
+  });
+};
+
+// Cross-ns curl clients produce 4 HTTP edges (client->service->workload x2). Ambient TCP
+// adds more for a full 8-edge graph. Wait for HTTP readiness and the full edge count.
+const waitForSidecarAmbientTrafficGeneratedInGraph = (
+  maxRetries = 30,
+  retryCount = 0,
+  lastEdgeCount = -1,
+  lastHttpEdgeCount = -1
+): void => {
+  const targetNamespace = 'test-ambient,test-sidecar';
+  const minHttpEdges = 4;
+  const minTotalEdges = 8;
+
+  if (retryCount >= maxRetries) {
+    throw new Error(
+      `Condition not met after ${maxRetries} retries (waitForSidecarAmbientTrafficGeneratedInGraph, namespace=${targetNamespace}, lastEdgeCount=${lastEdgeCount}, lastHttpEdgeCount=${lastHttpEdgeCount}, expectedHttp>=${minHttpEdges}, expectedTotal>=${minTotalEdges}, baseUrl=${Cypress.config(
+        'baseUrl'
+      )})`
+    );
+  }
+
+  cy.request({
+    method: 'GET',
+    url: `${Cypress.config('baseUrl')}/api/namespaces/graph`,
+    qs: {
+      duration: '600s',
+      graphType: 'versionedApp',
+      includeIdleEdges: false,
+      injectServiceNodes: true,
+      boxBy: 'cluster,namespace,app',
+      waypoints: false,
+      ambientTraffic: 'total',
+      appenders: 'deadNode,istio,serviceEntry,meshCheck,workloadEntry,health,ambient',
+      rateGrpc: 'requests',
+      rateHttp: 'requests',
+      rateTcp: 'sent',
+      namespaces: targetNamespace
+    }
+  }).then(response => {
+    expect(response.status).to.equal(200);
+    const edges = response.body.elements?.edges ?? [];
+    const edgeCount = edges.length;
+    // Graph API puts protocol under data.traffic; UI decorates data.protocol later.
+    const httpEdgeCount = edges.filter(
+      (e: { data?: { traffic?: { protocol?: string } } }) => e.data?.traffic?.protocol === 'http'
+    ).length;
+
+    if (httpEdgeCount >= minHttpEdges && edgeCount >= minTotalEdges) {
+      return;
+    }
+
+    if (retryCount === 0 || retryCount % 5 === 0) {
+      Cypress.log({
+        name: 'waitForSidecarAmbientTraffic',
+        message: `retry=${retryCount}/${maxRetries} edges=${edgeCount} httpEdges=${httpEdgeCount} expectedHttp>=${minHttpEdges} expectedTotal>=${minTotalEdges} targetNamespace=${targetNamespace}`
+      });
+    }
+
+    return cy.wait(10000).then(() => {
+      return waitForSidecarAmbientTrafficGeneratedInGraph(maxRetries, retryCount + 1, edgeCount, httpEdgeCount);
+    });
+  });
+};
+
+const isSyncedOrIgnored = (status: string | undefined): boolean => {
+  return status?.toLowerCase() === 'synced' || status?.toLowerCase() === 'ignored';
+};
+
+// In some ambient setups, waypoints can report CDS as "Stale" transiently (or even persistently)
+// while still being usable. We keep EDS/LDS/RDS strict but allow CDS to be Stale.
+const isSyncedOrIgnoredOrStale = (status: string | undefined): boolean => {
+  const s = status?.toLowerCase();
+  return s === 'synced' || s === 'ignored' || s === 'stale';
+};
+
+const proxyStatusHealthy = ({ proxyStatus }: Pod): boolean => {
+  return (
+    isSyncedOrIgnoredOrStale(proxyStatus?.CDS) && // Stale for Multi cluster (Istio 1.28)
+    isSyncedOrIgnored(proxyStatus?.EDS) &&
+    isSyncedOrIgnored(proxyStatus?.LDS) &&
+    isSyncedOrIgnored(proxyStatus?.RDS)
+  );
+};
+
+const waitForWorkloadTracesInApi = (
+  namespace: string,
+  workload: string,
+  clusterName?: string,
+  maxRetries = 18,
+  retryCount = 0
+): void => {
+  if (retryCount >= maxRetries) {
+    throw new Error(
+      `Waypoint traces not found after ${maxRetries} retries (namespace=${namespace}, workload=${workload} cluster=${
+        clusterName ?? ''
+      }, baseUrl=${Cypress.config('baseUrl')})`
+    );
+  }
+
+  const nowMicros = Date.now() * 1000;
+  const qs: Record<string, any> = {
+    // last 10 minutes (micros)
+    startMicros: nowMicros - 10 * 60 * 1000 * 1000,
+    endMicros: nowMicros,
+    tags: '{}',
+    limit: 100
+  };
+  if (clusterName) {
+    qs.clusterName = clusterName;
+  }
+
+  cy.request({
+    method: 'GET',
+    url: `${Cypress.config('baseUrl')}/api/namespaces/${namespace}/workloads/${workload}/traces`,
+    qs,
+    failOnStatusCode: false
+  }).then(response => {
+    expect(response.status).to.equal(200);
+    const traces = response.body?.data;
+    if (Array.isArray(traces) && traces.length > 0) {
+      return;
+    }
+
+    if (retryCount === 0 || retryCount % 5 === 0) {
+      Cypress.log({
+        name: 'waitForWorkloadTraces',
+        message: `retry=${retryCount}/${maxRetries} url=${Cypress.config(
+          'baseUrl'
+        )}/api/namespaces/${namespace}/workloads/${workload}/traces clusterName=${clusterName ?? ''} tracesCount=${
+          Array.isArray(traces) ? traces.length : -1
+        } baseUrl=${Cypress.config('baseUrl')}`
+      });
+    }
+
+    return cy
+      .wait(10000)
+      .then(() => waitForWorkloadTracesInApi(namespace, workload, clusterName, maxRetries, retryCount + 1));
+  });
+};
+
+const waitForTargetTracesInApi = (
+  targetType: string,
+  namespace: string,
+  name: string,
+  clusterName?: string,
+  maxRetries = 18,
+  retryCount = 0
+): void => {
+  if (retryCount >= maxRetries) {
+    throw new Error(
+      `Tracing data not found after ${maxRetries} retries (targetType=${targetType}, namespace=${namespace}, name=${name}, cluster=${
+        clusterName ?? ''
+      }, baseUrl=${Cypress.config('baseUrl')})`
+    );
+  }
+
+  const nowMicros = Date.now() * 1000;
+  const qs: Record<string, any> = {
+    startMicros: nowMicros - 10 * 60 * 1000 * 1000,
+    endMicros: nowMicros,
+    tags: '{}',
+    limit: 100
+  };
+  if (clusterName) {
+    qs.clusterName = clusterName;
+  }
+
+  cy.request({
+    method: 'GET',
+    url: tracingPathByTarget(targetType, namespace, name),
+    qs,
+    failOnStatusCode: false
+  }).then(response => {
+    expect(response.status).to.equal(200);
+    const traces = response.body?.data;
+    if (Array.isArray(traces) && traces.length > 0) {
+      return;
+    }
+
+    if (retryCount === 0 || retryCount % 5 === 0) {
+      Cypress.log({
+        name: 'waitForTargetTraces',
+        message: `retry=${retryCount}/${maxRetries} targetType=${targetType} namespace=${namespace} name=${name} tracesCount=${
+          Array.isArray(traces) ? traces.length : -1
+        } baseUrl=${Cypress.config('baseUrl')}`
+      });
+    }
+
+    return cy
+      .wait(10000)
+      .then(() => waitForTargetTracesInApi(targetType, namespace, name, clusterName, maxRetries, retryCount + 1));
+  });
+};
+
+const waitForHealthyWaypoint = (name: string, namespace: string, cluster?: string): void => {
+  const maxRetries = 20;
+  let requestUrl = `${Cypress.config(
+    'baseUrl'
+  )}/api/namespaces/${namespace}/workloads/${name}?validate=true&rateInterval=60s&health=true`;
+  if (cluster) {
+    requestUrl += `&clusterName=${cluster}`;
+  }
+
+  const wait = (retryCount: number, lastResponseSummary = ''): void => {
+    if (retryCount >= maxRetries) {
+      throw new Error(
+        `Condition not met after ${maxRetries} retries (waitForHealthyWaypoint name=${name} ns=${namespace} cluster=${
+          cluster ?? ''
+        }, baseUrl=${Cypress.config('baseUrl')}, url=${requestUrl}, lastResponse=${lastResponseSummary})`
+      );
+    }
+    cy.request({
+      method: 'GET',
+      url: requestUrl,
+      failOnStatusCode: false
+    }).then(response => {
+      const responseBody = response.body;
+      const responseBodyStr =
+        responseBody === undefined
+          ? 'undefined'
+          : typeof responseBody === 'string'
+            ? responseBody
+            : JSON.stringify(responseBody);
+      const responseBodyShort = responseBodyStr.length > 800 ? `${responseBodyStr.slice(0, 800)}...` : responseBodyStr;
+
+      const workload = responseBody;
+      const pods = Array.isArray(workload?.pods) ? workload.pods : [];
+      const podsLen = pods.length;
+      const proxySummary =
+        podsLen > 0
+          ? pods
+              .slice(0, 3)
+              .map(p => {
+                const ps = p?.proxyStatus ?? {};
+                return `${p?.name ?? 'pod'}(CDS=${ps.CDS ?? ''},EDS=${ps.EDS ?? ''},LDS=${ps.LDS ?? ''},RDS=${
+                  ps.RDS ?? ''
+                })`;
+              })
+              .join(',')
+          : 'no-pods';
+
+      const responseSummary = `status=${response.status} fullUrl=${requestUrl} pods=${podsLen} proxy=${proxySummary} body=${responseBodyShort}`;
+
+      if (response.status !== 200) {
+        if (retryCount === 0 || retryCount % 5 === 0) {
+          Cypress.log({
+            name: 'waitForHealthyWaypoint',
+            message: `retry=${retryCount}/${maxRetries} ${responseSummary}`
+          });
+        }
+        return cy.wait(30000).then(() => wait(retryCount + 1, responseSummary));
+      }
+
+      if (podsLen > 0 && pods.every(pod => proxyStatusHealthy(pod))) {
+        return;
+      }
+
+      if (retryCount === 0 || retryCount % 5 === 0) {
+        Cypress.log({
+          name: 'waitForHealthyWaypoint',
+          message: `retry=${retryCount}/${maxRetries} ${responseSummary}`
+        });
+      }
+
+      return cy.wait(10000).then(() => {
+        return wait(retryCount + 1, responseSummary);
+      });
+    });
+  };
+  wait(0);
+};
+
+Then('all waypoints are healthy', () => {
+  cy.exec(
+    `kubectl get deployments -A -l gateway.istio.io/managed=istio.io-mesh-controller -o jsonpath='{range .items[*]}{.metadata.name}/{.metadata.namespace} {end}'`
+  ).then(response => {
+    const waypoints = response.stdout.split(' ');
+    waypoints.forEach(waypoint => {
+      const [name, namespace] = waypoint.split('/');
+      waitForHealthyWaypoint(name, namespace, '');
+    });
+  });
+});
+
+const waitForWaypointTracesInApi = (
+  namespace: string,
+  workload: string,
+  clusterName?: string,
+  maxRetries = 30,
+  retryCount = 0
+): void => {
+  if (retryCount >= maxRetries) {
+    throw new Error(
+      `Waypoint traces not found after ${maxRetries} retries (namespace=${namespace}, cluster=${clusterName ?? ''})`
+    );
+  }
+
+  const nowMicros = Date.now() * 1000;
+  const qs: Record<string, any> = {
+    // last 10 minutes (micros)
+    startMicros: nowMicros - 10 * 60 * 1000 * 1000,
+    endMicros: nowMicros,
+    tags: '{}',
+    limit: 100
+  };
+  if (clusterName) {
+    qs.clusterName = clusterName;
+  }
+
+  cy.request({
+    method: 'GET',
+    url: `api/namespaces/${namespace}/workloads/${workload}/traces`,
+    qs,
+    failOnStatusCode: false
+  }).then(response => {
+    expect(response.status).to.equal(200);
+    const traces = response.body?.data;
+    if (Array.isArray(traces) && traces.length > 0) {
+      return;
+    }
+
+    return cy
+      .wait(10000)
+      .then(() => waitForWaypointTracesInApi(namespace, workload, clusterName, maxRetries, retryCount + 1));
+  });
+};
+
+Then('the waypoint tracing data is ready', () => {
+  waitForWaypointTracesInApi('bookinfo', 'bookinfo-gateway-istio');
+});
+
+Then('{string} namespace is labeled with the waypoint label', (namespace: string) => {
+  cy.exec(`kubectl label namespace ${namespace} istio.io/use-waypoint=waypoint`, { failOnNonZeroExit: false });
+  waitForWorkloadEnrolled(namespace);
+});
+
+Then(
+  '{string} namespace is labeled with the waypoint label for {string} and {string} contexts',
+  (namespace: string, cluster1Context: string, cluster2Context: string) => {
+    cy.exec(`kubectl label namespace ${namespace} istio.io/use-waypoint=waypoint --context="${cluster1Context}"`, {
+      failOnNonZeroExit: false
+    });
+    cy.exec(`kubectl label namespace ${namespace} istio.io/use-waypoint=waypoint --context="${cluster2Context}"`, {
+      failOnNonZeroExit: false
+    });
+    waitForWorkloadEnrolled(namespace);
+  }
+);
+
+Then('the graph page has enough data', () => {
+  waitForBookinfoWaypointTrafficGeneratedInGraph('bookinfo', 'ztunnel');
+});
+
+Then('the graph page has enough data for L7', () => {
+  waitForBookinfoWaypointTrafficGeneratedInGraph('bookinfo', 'waypoint');
+});
+
+Then('the graph page has enough data for L7 in the {string} namespace', (namespace: string) => {
+  waitForBookinfoWaypointTrafficGeneratedInGraph(namespace, 'waypoint');
+});
+
+Then('the graph page has enough data for sidecar ambient traffic', () => {
+  restartSidecarAmbientDemoWorkloads();
+  waitForSidecarAmbientTrafficGeneratedInGraph();
+});
+
+Then('the {string} tracing data is ready in the {string} namespace', (workload: string, namespace: string) => {
+  waitForWorkloadTracesInApi(namespace, workload);
+});
+
+Then(
+  'the {string} tracing data is ready in the {string} namespace for the {string} cluster',
+  (workload: string, namespace: string, clusterName: string) => {
+    waitForWaypointTracesInApi(namespace, workload, clusterName);
+  }
+);
+
+Then('the tracing data is ready for the {string} {string}', (targetType: string, namespacedName: string) => {
+  const [namespace, name] = namespacedName.split('/');
+  waitForTargetTracesInApi(targetType, namespace, name);
+});
+
+const waitForWaypointNodeInGraph = (namespace: string, maxRetries = 30, retryCount = 0): void => {
+  if (retryCount >= maxRetries) {
+    throw new Error(`Waypoint node not found in graph after ${maxRetries} retries (namespace=${namespace})`);
+  }
+
+  cy.request({
+    method: 'GET',
+    url: `${Cypress.config('baseUrl')}/api/namespaces/graph`,
+    qs: {
+      duration: '300s',
+      graphType: 'versionedApp',
+      includeIdleEdges: false,
+      injectServiceNodes: true,
+      boxBy: 'cluster,namespace,app',
+      waypoints: true,
+      ambientTraffic: 'total',
+      appenders: 'deadNode,serviceEntry,meshCheck,workloadEntry,health,istio,ambient',
+      rateGrpc: 'requests',
+      rateHttp: 'requests',
+      rateTcp: 'sent',
+      namespaces: namespace
+    }
+  }).then(response => {
+    const nodes = response.body?.elements?.nodes ?? [];
+    const waypointNode = nodes.find(
+      (n: { data: Record<string, string> }) => n.data.workload === 'waypoint' && n.data.namespace === namespace
+    );
+
+    if (waypointNode) {
+      Cypress.log({
+        name: 'waypoint-graph',
+        message: `Waypoint node found in graph after ${retryCount} retries`
+      });
+      return;
+    }
+
+    if (retryCount % 5 === 0) {
+      Cypress.log({
+        name: 'waypoint-graph',
+        message: `retry=${retryCount}/${maxRetries} waiting for waypoint node in graph`
+      });
+    }
+
+    cy.wait(10000).then(() => waitForWaypointNodeInGraph(namespace, maxRetries, retryCount + 1));
+  });
+};
+
+Then('use_waypoint_name is enabled if tracing services contain waypoint in {string}', (namespace: string) => {
+  waitForWaypointNodeInGraph(namespace);
+
+  const nowMicros = Date.now() * 1000;
+  const qs: Record<string, any> = {
+    startMicros: nowMicros - 10 * 60 * 1000 * 1000,
+    endMicros: nowMicros,
+    tags: '{}',
+    limit: 20
+  };
+
+  cy.request({
+    method: 'GET',
+    url: `${Cypress.config('baseUrl')}/api/namespaces/${namespace}/workloads/bookinfo-gateway-istio/traces`,
+    qs,
+    failOnStatusCode: false
+  }).then(response => {
+    const traces = response.body?.data ?? [];
+    const serviceNames = new Set<string>();
+    for (const trace of traces) {
+      for (const proc of Object.values(trace.processes ?? {})) {
+        serviceNames.add((proc as { serviceName: string }).serviceName);
+      }
+    }
+
+    const hasWaypoint = [...serviceNames].some(name => name.startsWith('waypoint.'));
+
+    Cypress.log({
+      name: 'use_waypoint_name',
+      message: `Tracing services: [${[...serviceNames].join(', ')}] hasWaypoint=${hasWaypoint}`
+    });
+
+    if (hasWaypoint) {
+      enableKialiFeature(USE_WAYPOINT_NAME_CONFIG);
+      waitForKialiApiReady();
+    }
+  });
+});
+
+Then('the user clicks the mode info icon and sees {string} in the popover', (text: string) => {
+  cy.get('[data-test="details-mode"]').find('svg').click();
+  cy.get('[role="dialog"]').should('be.visible').and('contain', text);
+  cy.get('body').click(0, 0);
+});
+
+Then("the user doesn't see a L7 link", () => {
+  cy.get('[data-test=workload-resources-card]').should('not.contain', 'L7');
+});
+
+Then('the workload description card has no config issues', () => {
+  cy.get('[data-test=workload-details-card]').should('be.visible').and('not.contain', 'Config Issues');
+});
+
+// Ambient L7 validation codes from AmbientPolicyChecker / AmbientWorkloadChecker (issues #7900, #10113).
+// Baseline bookinfo (sidecar or enrolled Ambient) should not produce these warnings.
+const ambientL7ValidationCodes = new Set([
+  'KIA0109',
+  'KIA0110',
+  'KIA0210',
+  'KIA0211',
+  'KIA0212',
+  'KIA1109',
+  'KIA1110',
+  'KIA1111',
+  'KIA1112',
+  'KIA1113',
+  'KIA1114',
+  'KIA1115',
+  'KIA1116',
+  'KIA1117',
+  'KIA1317'
+]);
+
+const collectAmbientL7Warnings = (validations: Record<string, any> | undefined): string[] => {
+  const found: string[] = [];
+  Object.keys(validations ?? {}).forEach(gvk => {
+    const byName = validations?.[gvk] ?? {};
+    Object.keys(byName).forEach(nameKey => {
+      const entry = byName[nameKey];
+      const checks = entry?.checks ?? [];
+      checks.forEach((check: { code?: string; message?: string }) => {
+        if (check.code && ambientL7ValidationCodes.has(check.code)) {
+          found.push(`${gvk}/${nameKey}: ${check.code} ${check.message ?? ''}`.trim());
+        }
+      });
+    });
+  });
+  return found;
+};
+
+Then('Ambient L7 validation warnings are not present in the {string} namespace', (namespace: string) => {
+  cy.request({ url: `/api/namespaces/${namespace}/istio?validate=true` }).then(response => {
+    expect(response.status).to.eq(200);
+    // Namespace-scoped API returns validations for that namespace only.
+    const found = collectAmbientL7Warnings(response.body?.validations);
+    expect(found, `unexpected Ambient L7 validation warnings in ${namespace}`).to.deep.equal([]);
+  });
+});
+
+Then(
+  'Ambient L7 validation warnings are not present for the {string} workload in the {string} namespace',
+  (workload: string, namespace: string) => {
+    cy.request({
+      url: `/api/namespaces/${namespace}/workloads/${workload}?validate=true&rateInterval=60s&health=true`
+    }).then(response => {
+      expect(response.status).to.eq(200);
+      const found = collectAmbientL7Warnings(response.body?.validations);
+      expect(found, `unexpected Ambient L7 validation warnings for workload ${namespace}/${workload}`).to.deep.equal(
+        []
+      );
+    });
+  }
+);
+
+Then('the user sees the L7 {string} link', (waypoint: string) => {
+  cy.get('[data-test=workload-resources-card]').should('contain', 'L7');
+  cy.get('[data-test=waypoint-link]').closest('li').find('span').contains('L7');
+  cy.get('[data-test=waypoint-link]').contains('a,button', waypoint);
+});
+
+Then('the link for the waypoint {string} should redirect to a valid workload details', (waypoint: string) => {
+  const isOSSMC = Cypress.env('OSSMC');
+  cy.get('[data-test=waypoint-link]')
+    .contains('a,button', waypoint)
+    .then($el => {
+      // In kiosk mode KialiLink renders a button with data-href; in normal mode it renders an anchor.
+      const target =
+        $el.prop('tagName')?.toLowerCase() === 'a' ? ($el.attr('href') ?? '') : ($el.attr('data-href') ?? '');
+      expect(target, 'standalone Kiali waypoint link target').to.include(`/workloads/${waypoint}`);
+      if (isOSSMC) {
+        // Even if the button exist, the click event doesn't work (Even with force).
+        const namespace = target.split('/')[2];
+        cy.visit({ url: `/k8s/ns/${namespace}/deployments/${waypoint}/ossmconsole` });
+      } else {
+        cy.wrap($el).click();
+      }
+    });
+  cy.get('#loading_kiali_spinner').should('not.exist');
+});
+
+Then('the waypoint link points to the {string} cluster', (cluster: string) => {
+  cy.get(`[data-test=waypoint-link]`).should('exist');
+
+  cy.get(`[data-test=waypoint-link]`).then($waypointLink => {
+    // In kiosk mode the element is a button with data-href; otherwise it's an anchor with href.
+    const $el = $waypointLink.filter('a, button').add($waypointLink.find('a, button')).first();
+    expect($el.length, 'waypoint link element').to.be.greaterThan(0);
+
+    const target = $el.is('a') ? ($el.attr('href') ?? '') : ($el.attr('data-href') ?? '');
+    expect(target).to.include(`clusterName=${cluster}`);
+  });
+});
+
+Then('the user sees the {string} option in the pod popover, and is {string}', (option: string, value: string) => {
+  cy.get(`[data-test=pod-info]`).first().click();
+  cy.get('[role="dialog"]').should('be.visible').and('contain', option);
+  cy.get('[role="dialog"]').should('be.visible').and('contain', value);
+  cy.get('[role="dialog"]').find('button[aria-label="Close"]').first().click();
+});
+
+Then('the user sees the {string} badge', (name: string) => {
+  cy.get(`#pfbadge-${name}`).should('exist').contains(name);
+});
+
+Then('the user sees the waypoint attribute', () => {
+  cy.get('[data-test="details-waypoint"]').should('exist').and('contain', 'true');
+});
+
+Then('the proxy status is {string}', (status: string) => {
+  cy.get('[data-test=workload-details-card]').find(`span[class*="icon-${status}"]`).should('be.visible');
+});
+
+Then(
+  'the waypoint {string} in namespace {string} in cluster {string} is healthy',
+  (name: string, namespace: string, cluster: string) => {
+    waitForHealthyWaypoint(name, namespace, cluster);
+  }
+);
+
+// Action skipped in ossmc
+Then('the user can see the {string} istio config and badge {string}', (config: string, badge: string) => {
+  cy.url().then(currentURL => {
+    // The istio configs for OpenShift are not the same
+    if (!currentURL?.includes('ossmconsole')) {
+      cy.get('#IstioConfigCard').should('be.visible').get(`[data-test="${config}"]`).should('exist');
+      cy.get('#IstioConfigCard').should('be.visible').get(`#${badge}`).should('exist');
+    }
+  });
+});
+
+Then('the proxy status is {string} with {string} details', (status: string, detail: string) => {
+  cy.get('[data-test=proxy-status]').get(`.icon-${status}`).should('exist');
+  cy.get('[data-test=proxy-status]').trigger('mouseenter');
+  cy.get('[role="tooltip"]').should('be.visible').and('contain', detail);
+  cy.get(`[data-test=pod-info]`).trigger('mouseleave');
+});
+
+Then('the user goes to the {string} tab', (tab: string) => {
+  openTab(tab);
+});
+
+Then('user goes to the waypoint {string} subtab', (subtab: string) => {
+  cy.get('#waypoint-details').should('be.visible').contains(subtab).click();
+});
+
+Then("the {string} subtab doesn't exist", (subtab: string) => {
+  cy.get('#waypoint-details').should('be.visible').should('not.contain', subtab);
+});
+
+Then('validates Services data', () => {
+  cy.get('[data-test="enrolled-data-title"]').should('be.visible');
+  cy.get('[role="grid"]').should('be.visible').find('td[data-label="Name"]').should('contain', 'productpage');
+  cy.get('[role="grid"]').should('be.visible').find('#pfbadge-S').should('exist');
+  cy.get('[role="grid"]').should('be.visible').find('td[data-label="Namespace"]').should('contain', 'bookinfo');
+  cy.get('[role="grid"]').should('be.visible').find('td[data-label="Labeled by"]').should('contain', 'namespace');
+});
+
+Then(
+  'validates Services data with {string} rows and {string} workload, {string} namespace, {string} label for, {string} badge',
+  (rows: number, workload: string, ns: string, label: string, badge: string) => {
+    cy.get('[data-test="enrolled-data-title"]').should('be.visible');
+    cy.get('table tbody tr').should('have.length', rows);
+    cy.get('[role="grid"]').should('be.visible').find('td[data-label="Name"]').should('contain', workload);
+    cy.get('[role="grid"]').should('be.visible').find(`#${badge}`).should('exist');
+    cy.get('[role="grid"]').should('be.visible').find('td[data-label="Namespace"]').should('contain', ns);
+    cy.get('[role="grid"]').should('be.visible').find('td[data-label="Labeled by"]').should('contain', label);
+  }
+);
+
+// When every service in the namespace overrides the default waypoint, the default gateway lists no enrolled services.
+Then('the waypoint Services subtab shows no enrolled services', () => {
+  cy.get('[data-test="enrolled-data-title"]').should('be.visible');
+  cy.get('[data-test="istio-config-empty"]').should('be.visible').and('contain', 'No enrolled services found');
+});
+
+Then('validates waypoint Info data for {string}', (type: string) => {
+  cy.get('[data-test=waypointfor-title]').should('exist').and('contain', 'Waypoint for');
+  cy.get('[data-test=waypointfor-scope]').should('exist').contains(type, { matchCase: false });
+  cy.get('[role="grid"]').should('be.visible').find('td[data-label="RDS"]').should('contain', 'IGNORED');
+});
+
+When('the user validates the Ztunnel tab for the {string} namespace', (namespace: string) => {
+  openTab('Ztunnel');
+  cy.get('#ztunnel-details').should('be.visible').contains('Services').click();
+  cy.get('[role="grid"]').should('be.visible').find('td[data-label="Service VIP"]').should('be.visible');
+  cy.get('[role="grid"]').should('be.visible').find('td[data-label="Waypoint"]');
+  cy.get('[role="grid"]').should('be.visible').find('td[data-label="Namespace"]').should('contain', 'bookinfo');
+  cy.get('#ztunnel-details').should('be.visible').contains('Workloads').click();
+  cy.get('[role="grid"]').should('be.visible').find('td[data-label="Pod Name"]').should('be.visible');
+  cy.get('[role="grid"]').should('be.visible').find('td[data-label="Node"]');
+  cy.get('[role="grid"]').should('be.visible').find('td[data-label="Namespace"]').should('contain', 'bookinfo');
+  // Validate filters in the Namespace column
+  cy.get('button#filter_select_type-toggle').click();
+  cy.contains('div#filter_select_type button', 'Namespace').click();
+  cy.get('input[placeholder="Filter by Namespace"]').type(`${namespace}{enter}`);
+  cy.get(`li[label="${namespace}"]`).should('be.visible').find('button').click();
+
+  getCellsForCol('Namespace').each($cell => {
+    cy.wrap($cell).contains(namespace);
+  });
+});
+
+Then('the user updates the log level to {string}', (level: string) => {
+  cy.get('[data-test=log-actions-dropdown]').should('exist').click();
+  cy.get(`#setLogLevel${level}`).should('exist').click();
+});
+
+When('user opens the namespace actions menu', () => {
+  openNamespaceActionsMenu();
+});
+
+Then('the option {string} does not exist in namespace actions', (option: string) => {
+  cy.get('[role="menu"]').should('be.visible');
+  cy.get('[role="menu"]').contains(option).should('not.exist');
+  cy.get('body').click(0, 0);
+  cy.get('[role="menu"]').should('not.exist');
+});
+
+When('user clicks on {string} in namespace actions', (option: string) => {
+  cy.url().then(url => {
+    const namespace = url.match(/\/(projects|namespaces)\/([^/?]+)/)?.[2] ?? '';
+    let selector = '';
+    switch (option) {
+      case 'removes auto injection':
+        selector = `remove-${namespace}-namespace-sidecar-injection`;
+        break;
+      case 'Add to Ambient':
+        selector = `add-${namespace}-namespace-ambient`;
+        break;
+      case 'remove Ambient':
+        selector = `remove-${namespace}-namespace-ambient`;
+        break;
+      case 'enable sidecar':
+        selector = `enable-${namespace}-namespace-sidecar-injection`;
+        break;
+    }
+    cy.get(`[data-test="${selector}"]`).should('be.visible').click();
+    confirmNamespaceTrafficPolicyModal();
+  });
+});
+
+Then('the namespace {string} labels do not contain {string}', (namespace: string, labelKey: string) => {
+  cy.request({ method: 'GET', url: `/api/namespaces/${namespace}/info` }).then(response => {
+    expect(response.status).to.equal(200);
+    expect(response.body.labels).to.not.have.property(labelKey);
+  });
+});
+
+Then(
+  'the namespace {string} labels contain {string} with value {string}',
+  (namespace: string, labelKey: string, labelValue: string) => {
+    cy.request({ method: 'GET', url: `/api/namespaces/${namespace}/info` }).then(response => {
+      expect(response.status).to.equal(200);
+      expect(response.body.labels[labelKey]).to.equal(labelValue);
+    });
+  }
+);
+
+When('{string} badge {string}', (badge, option: string) => {
+  let selector = 'not.exist';
+  if (option === 'exist') {
+    selector = 'exist';
+  }
+  let badgeSelector = 'control-plane-revision-badge';
+  if (badge === 'Ambient') {
+    badgeSelector = 'ambient-badge';
+  }
+
+  cy.get(`[data-test="${badgeSelector}"]`).should(selector);
+});

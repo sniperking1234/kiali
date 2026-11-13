@@ -1,0 +1,655 @@
+import * as React from 'react';
+import { KialiLink } from '../Link/KialiLink';
+import { Label as PFLabel, Tooltip, TooltipPosition } from '@patternfly/react-core';
+import { getFiltersFromURL } from '../FilterList/FilterHelper';
+import { appLabelFilter, versionLabelFilter } from '../../pages/WorkloadList/FiltersAndSorts';
+import { MissingSidecar } from '../MissingSidecar/MissingSidecar';
+import type { Renderer, Resource, SortResource, TResource } from './Config';
+import { GVKToBadge } from './Config';
+import { HealthIndicator } from '../Health/HealthIndicator';
+import { ValidationObjectSummary } from '../Validations/ValidationObjectSummary';
+import { ValidationServiceSummary } from '../Validations/ValidationServiceSummary';
+import type { WorkloadListItem } from '../../types/Workload';
+import type { IstioConfigItem } from '../../types/IstioConfigList';
+import type { AppListItem } from '../../types/AppList';
+import type { ServiceListItem } from '../../types/ServiceList';
+import type { ActiveFilter } from '../../types/Filters';
+import { renderAPILogo } from '../Logo/Logos';
+import type { Health } from '../../types/Health';
+import type { NamespaceInfo } from '../../types/NamespaceInfo';
+import { ValidationSummary } from '../Validations/ValidationSummary';
+import type { StatefulFiltersRef } from '../Filters/StatefulFilters';
+import { IstioObjectLink, GetIstioObjectUrl } from '../Link/IstioObjectLink';
+import { labelFilter } from 'components/Filters/CommonFilters';
+import { labelFilter as NsLabelFilter } from '../../pages/Namespaces/Filters';
+import { ValidationSummaryLink } from '../Link/ValidationSummaryLink';
+import type { ValidationStatus } from '../../types/IstioObjects';
+import type { PFBadgeType } from 'components/Pf/PfBadges';
+import { PFBadge, PFBadges } from 'components/Pf/PfBadges';
+import { MissingLabel } from '../MissingLabel/MissingLabel';
+import { t } from 'utils/I18nUtils';
+import { getPagePath } from 'utils/NavigationUtils';
+import {
+  getGVKTypeString,
+  getIstioObjectGVK,
+  getReconciliationCondition,
+  kindToStringIncludeK8s
+} from 'utils/IstioConfigUtils';
+import { Label } from 'components/Label/Label';
+import { isMultiCluster, INJECTION_LABEL_NAME, INJECTION_LABEL_REV } from 'config/ServerConfig';
+import { KialiIcon } from '../../config/KialiIcon';
+import { Td } from '@patternfly/react-table';
+import { kialiStyle } from 'styles/StyleUtils';
+import { hasMissingSidecar } from './Config';
+import { InstanceType } from 'types/Common';
+import { infoStyle } from 'styles/IconStyle';
+import { classes } from 'typestyle';
+import { WorkloadConfigValidation } from '../Validations/WorkloadConfigValidation';
+import { NamespaceHealthStatus } from '../../pages/Namespaces/NamespaceHealthStatus';
+import { MTLSIcon } from '../MTls/MTLSIcon';
+import { emptyDescriptor } from '../MTls/MTLSStatus';
+import { namespaceMTLSStatusDescriptors } from '../MTls/NamespaceMTLSStatusDescriptors';
+import { ControlPlaneBadge } from '../Badge/ControlPlaneBadge';
+import { DataPlaneBadge } from '../Badge/DataPlaneBadge';
+import { NotPartOfMeshBadge } from '../Badge/NotPartOfMeshBadge';
+import { getNamespaceDetailUrl, getNamespaceModeInfo, isDataPlaneNamespace } from 'utils/NamespaceUtils';
+import { isRevisionAvailable, getNamespaceRevisions } from '../../pages/Namespaces/NamespaceRevisionUtils';
+
+const revisionWarningIconStyle = kialiStyle({
+  verticalAlign: 'middle'
+});
+
+const rendererInfoStyle = kialiStyle({
+  marginBottom: '-0.125rem',
+  marginRight: '0',
+  marginTop: '0'
+});
+
+const tlsIconStyle = kialiStyle({
+  marginTop: '-1px',
+  marginRight: '0.35rem',
+  width: '1em',
+  height: '1em',
+  verticalAlign: 'middle'
+});
+
+const tlsLabelStyle = kialiStyle({
+  display: 'inline-flex',
+  alignItems: 'center',
+  paddingTop: '2px',
+  paddingBottom: '2px'
+});
+
+const getLink = (item: TResource, config: Resource, query?: string): string => {
+  let url = config.name === 'istio' ? getIstioLink(item) : `/namespaces/${item.namespace}/${config.name}/${item.name}`;
+
+  if (item.cluster && isMultiCluster && !url.includes('cluster')) {
+    if (url.includes('?')) {
+      url = `${url}&clusterName=${item.cluster}`;
+    } else {
+      url = `${url}?clusterName=${item.cluster}`;
+    }
+  }
+
+  if (query) {
+    if (url.includes('?')) {
+      url = `${url}&${query}`;
+    } else {
+      url = `${url}?${query}`;
+    }
+  }
+
+  return url;
+};
+
+const getIstioLink = (item: TResource): string => {
+  return GetIstioObjectUrl(
+    item.name,
+    item.namespace,
+    getIstioObjectGVK(item['apiVersion'], item['kind']),
+    item.cluster
+  );
+};
+
+// Cells
+export const actionRenderer = (key: string, action: React.ReactNode): React.ReactNode => {
+  return (
+    <Td role="gridcell" key={`VirtuaItem_Action_${key}`} style={{ verticalAlign: 'middle' }}>
+      {action}
+    </Td>
+  );
+};
+
+export const details: Renderer<AppListItem | WorkloadListItem | ServiceListItem> = (
+  item: AppListItem | WorkloadListItem | ServiceListItem
+) => {
+  const isWorkload = item.instanceType === InstanceType.Workload;
+  const isAmbientWaypoint = item.isWaypoint;
+  const hasMissingApp = isWorkload && !item['appLabel'] && !item.isWaypoint;
+  const hasMissingVersion = isWorkload && !item['versionLabel'] && !item.isWaypoint;
+  const additionalDetails = (item as WorkloadListItem | ServiceListItem).additionalDetailSample;
+  const spacer = isWorkload && hasMissingSidecar(item) && additionalDetails && additionalDetails.icon;
+
+  return (
+    <Td
+      role="gridcell"
+      dataLabel={t('Details')}
+      key={`VirtuaItem_Details_${item.namespace}_${item.name}`}
+      style={{ verticalAlign: 'middle', whiteSpace: 'nowrap' }}
+    >
+      <ul>
+        {isWorkload && (
+          <li>
+            <WorkloadConfigValidation namespace={item.namespace} validations={item.validations} />
+          </li>
+        )}
+
+        {(isWorkload || item.instanceType === InstanceType.App) && hasMissingSidecar(item) && (
+          <li>
+            <MissingSidecar />
+          </li>
+        )}
+
+        {isWorkload && (hasMissingApp || hasMissingVersion) && (
+          <li>
+            <MissingLabel missingApp={hasMissingApp} missingVersion={hasMissingVersion} tooltip={false} />
+          </li>
+        )}
+
+        {spacer && ' '}
+
+        {additionalDetails && additionalDetails.icon && (
+          <li style={{ marginBottom: '0.125rem' }}>
+            {renderAPILogo(additionalDetails.icon, additionalDetails.title, 0)}
+          </li>
+        )}
+
+        {item.istioReferences?.length > 0 &&
+          item.istioReferences.map(ir => (
+            <li
+              key={ir.namespace ? `${ir.objectGVK.Group}.${ir.objectGVK.Kind}_${ir.name}_${ir.namespace}` : ir.name}
+              style={{ marginBottom: '0.125rem' }}
+            >
+              <PFBadge badge={GVKToBadge[getGVKTypeString(ir.objectGVK)]} position={TooltipPosition.top} />
+              <IstioObjectLink
+                name={ir.name}
+                namespace={ir.namespace ?? ''}
+                cluster={item.cluster}
+                objectGVK={ir.objectGVK}
+              >
+                {ir.name}
+              </IstioObjectLink>
+            </li>
+          ))}
+
+        {isAmbientWaypoint && (
+          <li style={{ marginBottom: '0.125rem' }}>
+            <PFBadge badge={PFBadges.Waypoint} position={TooltipPosition.top} />
+            Waypoint Proxy
+            <Tooltip
+              key="tooltip_missing_label"
+              position={TooltipPosition.top}
+              content={t('Layer 7 service Mesh capabilities in Istio Ambient')}
+            >
+              <KialiIcon.Info className={classes(infoStyle, rendererInfoStyle)} />
+            </Tooltip>
+          </li>
+        )}
+      </ul>
+    </Td>
+  );
+};
+
+export const istioConfig: Renderer<NamespaceInfo> = (ns: NamespaceInfo) => {
+  let validations: ValidationStatus = { namespace: ns.name, objectCount: 0, errors: 0, warnings: 0 };
+
+  if (!!ns.validations) {
+    validations = ns.validations;
+  }
+
+  const status = (
+    <Td
+      role="gridcell"
+      dataLabel="Config"
+      key={`VirtuaItem_IstioConfig_${ns.name}`}
+      style={{ verticalAlign: 'middle' }}
+    >
+      <ValidationSummaryLink
+        namespace={ns.name}
+        objectCount={validations.objectCount}
+        errors={validations.errors}
+        warnings={validations.warnings}
+      >
+        <ValidationSummary
+          id={`ns-val-${ns.name}`}
+          errors={validations.errors}
+          warnings={validations.warnings}
+          objectCount={validations.objectCount}
+          type="istio"
+        />
+      </ValidationSummaryLink>
+    </Td>
+  );
+
+  return status;
+};
+
+export const getKioskParamsForListItem = (item: TResource, config: Resource): string | undefined => {
+  if (config.name === 'workloads' && 'gvk' in item) {
+    return `type=${(item as WorkloadListItem).gvk.Kind}`;
+  }
+  if (config.name === 'services' && item['serviceRegistry'] === 'External') {
+    return 'type=External';
+  }
+  return undefined;
+};
+
+export const item: Renderer<TResource> = (item: TResource, config: Resource, badge: PFBadgeType) => {
+  const key = `link_definition_${config.name}_${item.namespace}_${item.name}`;
+  let serviceBadge = badge;
+
+  if (item['serviceRegistry']) {
+    switch (item['serviceRegistry']) {
+      case 'External':
+        serviceBadge = PFBadges.ExternalService;
+        break;
+    }
+  }
+
+  const kioskParams = getKioskParamsForListItem(item, config);
+
+  return (
+    <Td
+      role="gridcell"
+      dataLabel="Name"
+      key={`VirtuaItem_Item_${item.namespace}_${item.name}`}
+      style={{ verticalAlign: 'middle' }}
+    >
+      <PFBadge badge={serviceBadge} position={TooltipPosition.top} />
+      <KialiLink key={key} to={getLink(item, config)} kioskParams={kioskParams}>
+        {item.name}
+      </KialiLink>
+    </Td>
+  );
+};
+
+// @TODO SortResource
+export const cluster: Renderer<TResource> = (item: TResource) => {
+  return (
+    <Td
+      role="gridcell"
+      dataLabel="Cluster"
+      key={`VirtuaItem_Cluster_${item.cluster}`}
+      style={{ verticalAlign: 'middle' }}
+    >
+      <PFBadge badge={PFBadges.Cluster} position={TooltipPosition.top} />
+      {item.cluster}
+    </Td>
+  );
+};
+
+export const namespace: Renderer<TResource> = (item: TResource) => {
+  return (
+    <Td
+      role="gridcell"
+      dataLabel="Namespace"
+      key={`VirtuaItem_Namespace_${item.namespace}_${item.name}`}
+      style={{ verticalAlign: 'middle' }}
+    >
+      <PFBadge badge={PFBadges.Namespace} position={TooltipPosition.top} />
+      <KialiLink to={getNamespaceDetailUrl({ name: item.namespace, cluster: item.cluster })}>
+        {item.namespace}
+      </KialiLink>
+    </Td>
+  );
+};
+
+const labelActivate = (filters: ActiveFilter[], key: string, value: string, id: string): boolean => {
+  return filters.some(filter => {
+    if (filter.category === id) {
+      if (filter.value.includes('=')) {
+        const [k, v] = filter.value.split('=');
+
+        if (k === key) {
+          return v.split(',').some(val => value.split(',').some(vl => vl.trim().startsWith(val.trim())));
+        }
+
+        return false;
+      }
+
+      return key === filter.value;
+    } else {
+      if (filter.category === appLabelFilter.category) {
+        return filter.value === 'Present' && key === 'app';
+      }
+
+      return filter.value === 'Present' && key === 'version';
+    }
+  });
+};
+
+export const labels: Renderer<SortResource | NamespaceInfo> = (
+  item: SortResource | NamespaceInfo,
+  _: Resource,
+  __: PFBadgeType,
+  ___?: Health,
+  statefulFilter?: StatefulFiltersRef
+) => {
+  const path = getPagePath();
+  const labelFilt = path === 'namespaces' ? NsLabelFilter : labelFilter;
+  const filters = getFiltersFromURL([labelFilt, appLabelFilter, versionLabelFilter]);
+
+  return (
+    <Td
+      role="gridcell"
+      dataLabel="Labels"
+      key={`VirtuaItem_Labels_${'namespace' in item && `${item.namespace}_`}${item.name}`}
+      style={{ verticalAlign: 'middle', paddingBottom: '0.25rem' }}
+    >
+      {item.labels &&
+        Object.entries(item.labels).map(([key, value], i) => {
+          const label = `${key}=${value}`;
+          const labelAct = labelActivate(filters.filters, key, value, labelFilt.category);
+
+          const isExactlyLabelFilter = getFiltersFromURL([labelFilt]).filters.some(f => f.value.includes(label));
+
+          const labelComponent = (
+            <Label
+              key={`label_${i}`}
+              name={key}
+              value={value}
+              color={labelAct ? 'yellow' : undefined}
+              style={{ cursor: isExactlyLabelFilter || !labelAct ? 'pointer' : 'not-allowed', whiteSpace: 'nowrap' }}
+              onClick={(): void => {
+                if (statefulFilter?.current) {
+                  if (labelAct) {
+                    if (isExactlyLabelFilter) {
+                      statefulFilter.current.removeFilter(labelFilt.category, label);
+                    }
+                  } else {
+                    statefulFilter.current.filterAdded(labelFilt, label);
+                  }
+                }
+              }}
+            />
+          );
+
+          return statefulFilter ? (
+            <Tooltip
+              key={`Tooltip_Label_${key}_${value}`}
+              content={
+                labelAct ? (
+                  isExactlyLabelFilter ? (
+                    <>Remove label from Filters</>
+                  ) : (
+                    <>Kiali can't remove the filter if is an expression</>
+                  )
+                ) : (
+                  <>Add label to Filters</>
+                )
+              }
+            >
+              {labelComponent}
+            </Tooltip>
+          ) : (
+            labelComponent
+          );
+        })}
+    </Td>
+  );
+};
+
+export const health: Renderer<TResource> = (item: TResource, __: Resource, _: PFBadgeType, health?: Health) => {
+  return (
+    <Td
+      role="gridcell"
+      dataLabel="Health"
+      key={`VirtuaItem_Health_${item.namespace}_${item.name}`}
+      style={{ verticalAlign: 'middle' }}
+    >
+      {health && <HealthIndicator id={item.name} health={health} />}
+    </Td>
+  );
+};
+
+export const workloadType: Renderer<WorkloadListItem> = (item: WorkloadListItem) => {
+  return (
+    <Td
+      role="gridcell"
+      dataLabel="Type"
+      key={`VirtuaItem_WorkloadType_${item.namespace}_${item.name}`}
+      style={{ verticalAlign: 'middle' }}
+    >
+      {item.gvk.Kind}
+    </Td>
+  );
+};
+
+export const istioType: Renderer<IstioConfigItem> = (item: IstioConfigItem) => {
+  return (
+    <Td
+      role="gridcell"
+      dataLabel="Type"
+      key={`VirtuaItem_IstioType_${item.namespace}_${item.name}`}
+      style={{ verticalAlign: 'middle' }}
+    >
+      {kindToStringIncludeK8s(item.apiVersion, item.kind)}
+    </Td>
+  );
+};
+
+export const istioConfiguration: Renderer<IstioConfigItem> = (item: IstioConfigItem, config: Resource) => {
+  const validation = item.validation;
+  const reconciledCondition = getReconciliationCondition(item);
+  const linkQuery: string = item['type'] ? 'list=yaml' : '';
+
+  return (
+    <Td
+      role="gridcell"
+      dataLabel="Configuration"
+      key={`VirtuaItem_Conf_${item.namespace}_${item.name}`}
+      style={{ verticalAlign: 'middle' }}
+    >
+      {validation ? (
+        <KialiLink to={`${getLink(item, config, linkQuery)}`}>
+          <ValidationObjectSummary
+            id={`${item.name}-config-validation`}
+            validations={[validation]}
+            reconciledCondition={reconciledCondition}
+          />
+        </KialiLink>
+      ) : (
+        <>N/A</>
+      )}
+    </Td>
+  );
+};
+
+export const serviceConfiguration: Renderer<ServiceListItem> = (item: ServiceListItem, config: Resource) => {
+  const validation = item.validation;
+  const linkQuery: string = item['type'] ? 'list=yaml' : '';
+
+  return (
+    <Td
+      role="gridcell"
+      dataLabel="Configuration"
+      key={`VirtuaItem_Conf_${item.namespace}_${item.name}`}
+      style={{ verticalAlign: 'middle' }}
+    >
+      {validation ? (
+        <KialiLink to={`${getLink(item, config, linkQuery)}`}>
+          <ValidationServiceSummary id={`${item.name}-service-validation`} validations={[validation]} />
+        </KialiLink>
+      ) : (
+        <>N/A</>
+      )}
+    </Td>
+  );
+};
+
+// Namespace-specific renderers
+
+export const nsItem: Renderer<NamespaceInfo> = (ns: NamespaceInfo) => {
+  return (
+    <Td
+      role="gridcell"
+      dataLabel="Namespace"
+      key={`VirtuaItem_NamespaceItem_${ns.name}`}
+      style={{ verticalAlign: 'middle' }}
+    >
+      <PFBadge badge={PFBadges.Namespace} position={TooltipPosition.top} />
+      <KialiLink key={`link_ns_${ns.cluster ?? ''}_${ns.name}`} to={getNamespaceDetailUrl(ns)}>
+        {ns.name}
+      </KialiLink>
+    </Td>
+  );
+};
+
+export const nsType: Renderer<NamespaceInfo> = (ns: NamespaceInfo) => {
+  const isDataPlane = isDataPlaneNamespace(ns);
+  const revisions = ns.isControlPlane ? getNamespaceRevisions(ns) : [];
+  const cpRevisions = revisions.length > 0 ? revisions : undefined;
+
+  return (
+    <Td role="gridcell" dataLabel="Type" key={`VirtuaItem_Type_${ns.name}`} style={{ verticalAlign: 'middle' }}>
+      {ns.isControlPlane ? (
+        <ControlPlaneBadge revisions={cpRevisions} />
+      ) : isDataPlane ? (
+        <DataPlaneBadge />
+      ) : (
+        <NotPartOfMeshBadge />
+      )}
+    </Td>
+  );
+};
+
+export const nsMode: Renderer<NamespaceInfo> = (ns: NamespaceInfo) => {
+  const modeInfo = getNamespaceModeInfo(ns);
+
+  return (
+    <Td role="gridcell" dataLabel="Mode" key={`VirtuaItem_Mode_${ns.name}`} style={{ verticalAlign: 'middle' }}>
+      <PFLabel variant="outline" color={modeInfo.color} isCompact>
+        {t(modeInfo.displayText)}
+      </PFLabel>
+    </Td>
+  );
+};
+
+export const nsRevision: Renderer<NamespaceInfo> = (ns: NamespaceInfo) => {
+  const revisions = getNamespaceRevisions(ns);
+
+  if (revisions.length === 0) {
+    return (
+      <Td
+        role="gridcell"
+        dataLabel="Revision"
+        key={`VirtuaItem_Revision_${ns.name}`}
+        style={{ verticalAlign: 'middle' }}
+      >
+        {!ns.isControlPlane && (
+          <PFLabel variant="outline" color="grey">
+            {t('Not applicable')}
+          </PFLabel>
+        )}
+      </Td>
+    );
+  }
+
+  const revAvailable = isRevisionAvailable(ns);
+
+  return (
+    <Td role="gridcell" dataLabel="Revision" key={`VirtuaItem_Revision_${ns.name}`} style={{ verticalAlign: 'middle' }}>
+      <>
+        {revisions.map((rev, idx) => (
+          <Tooltip
+            key={`${ns.name}-rev-${idx}`}
+            content={
+              <span>
+                {!revAvailable
+                  ? t('Control plane with revision "{{version}}" does not exist', { version: rev })
+                  : t('Istio revision {{version}}', { version: rev })}
+              </span>
+            }
+          >
+            <PFLabel
+              variant="outline"
+              color={!revAvailable ? 'red' : 'orange'}
+              data-test={idx === 0 ? 'data-plane-revision-badge' : undefined}
+              style={idx > 0 ? { marginLeft: '0.25rem' } : undefined}
+              icon={!revAvailable ? <KialiIcon.Warning className={revisionWarningIconStyle} /> : undefined}
+            >
+              {rev}
+            </PFLabel>
+          </Tooltip>
+        ))}
+      </>
+    </Td>
+  );
+};
+
+export const nsHealth: Renderer<NamespaceInfo> = (ns: NamespaceInfo) => {
+  return (
+    <Td role="gridcell" dataLabel="Health" key={`VirtuaItem_Status_${ns.name}`} style={{ verticalAlign: 'middle' }}>
+      <NamespaceHealthStatus
+        name={ns.name}
+        statusApp={ns.statusApp}
+        statusService={ns.statusService}
+        statusWorkload={ns.statusWorkload}
+        worstStatus={ns.worstStatus ?? 'NA'}
+      />
+    </Td>
+  );
+};
+
+export const nsTls: Renderer<NamespaceInfo> = (ns: NamespaceInfo) => {
+  const isControlPlane = !!ns.isControlPlane;
+  const isDataPlane =
+    !isControlPlane &&
+    !!ns.labels &&
+    (ns.labels[INJECTION_LABEL_NAME] === 'enabled' ||
+      (ns.labels[INJECTION_LABEL_REV] !== undefined && ns.labels[INJECTION_LABEL_REV] !== ''));
+
+  // If the namespace is not part of the mesh, mTLS does not apply.
+  // Consider ambient namespaces as part of the mesh too.
+  const isInMesh = isControlPlane || isDataPlane || !!ns.isAmbient;
+
+  if (!isInMesh) {
+    return (
+      <Td role="gridcell" dataLabel="mTLS" key={`VirtualItem_tls_${ns.name}`} style={{ verticalAlign: 'middle' }}>
+        <PFLabel variant="outline" className={tlsLabelStyle}>
+          Not applicable
+        </PFLabel>
+      </Td>
+    );
+  }
+
+  if (!ns.tlsStatus) {
+    return (
+      <Td role="gridcell" dataLabel="mTLS" key={`VirtualItem_tls_${ns.name}`} style={{ verticalAlign: 'middle' }} />
+    );
+  }
+
+  const statusDescriptor = namespaceMTLSStatusDescriptors.get(ns.tlsStatus.status) ?? emptyDescriptor;
+
+  if (!statusDescriptor.showStatus) {
+    return (
+      <Td role="gridcell" dataLabel="mTLS" key={`VirtualItem_tls_${ns.name}`} style={{ verticalAlign: 'middle' }} />
+    );
+  }
+
+  return (
+    <Td role="gridcell" dataLabel="mTLS" key={`VirtualItem_tls_${ns.name}`} style={{ verticalAlign: 'middle' }}>
+      <PFLabel variant="outline" className={tlsLabelStyle}>
+        <MTLSIcon
+          icon={statusDescriptor.icon}
+          iconClassName={tlsIconStyle}
+          backgroundColor={statusDescriptor.backgroundColor}
+          color={statusDescriptor.color}
+          tooltipText={statusDescriptor.message}
+          tooltipPosition={TooltipPosition.auto}
+        />
+        {statusDescriptor.name}
+      </PFLabel>
+    </Td>
+  );
+};

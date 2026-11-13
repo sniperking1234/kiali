@@ -1,143 +1,355 @@
 package handlers
 
 import (
+	"context"
 	"fmt"
 	"net/http"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/prometheus/common/model"
+	"github.com/rs/zerolog"
 	"gopkg.in/yaml.v2"
-	"k8s.io/client-go/tools/clientcmd/api"
 
 	"github.com/kiali/kiali/business"
+	"github.com/kiali/kiali/cache"
 	"github.com/kiali/kiali/config"
+	"github.com/kiali/kiali/istio"
 	"github.com/kiali/kiali/kubernetes"
 	"github.com/kiali/kiali/log"
+	"github.com/kiali/kiali/models"
 	"github.com/kiali/kiali/prometheus"
 )
 
 const (
-	defaultPrometheusGlobalScrapeInterval = 15 // seconds
+	defaultPrometheusGlobalScrapeInterval       = 15                // seconds
+	defaultPrometheusGlobalStorageTSDBRetention = 15 * 24 * 60 * 60 // Prometheus default is 15d
 )
 
-type ClusterInfo struct {
-	Name    string `json:"name,omitempty"`
-	Network string `json:"network,omitempty"`
-}
-
-type Iter8Config struct {
-	Enabled   bool   `json:"enabled"`
-	Namespace string `json:"namespace"`
-}
-type Extensions struct {
-	Iter8 Iter8Config `json:"iter8,omitempty"`
-}
 type IstioAnnotations struct {
+	AmbientAnnotation        string `json:"ambientAnnotation,omitempty"`
+	AmbientAnnotationEnabled string `json:"ambientAnnotationEnabled,omitempty"`
 	IstioInjectionAnnotation string `json:"istioInjectionAnnotation,omitempty"`
 }
 
 // PrometheusConfig holds actual Prometheus configuration that is useful to Kiali.
 // All durations are in seconds.
 type PrometheusConfig struct {
-	GlobalScrapeInterval int64 `json:"globalScrapeInterval,omitempty"`
-	StorageTsdbRetention int64 `json:"storageTsdbRetention,omitempty"`
+	DisabledReason       string `json:"disabledReason,omitempty"`
+	Enabled              bool   `json:"enabled"`
+	GlobalScrapeInterval int64  `json:"globalScrapeInterval,omitempty"`
+	StorageTsdbRetention int64  `json:"storageTsdbRetention,omitempty"`
+}
+
+type DeploymentConfig struct {
+	ViewOnlyMode bool `json:"viewOnlyMode,omitempty"`
+}
+
+type ProviderConfig struct {
+	Name         string    `json:"name"`
+	Description  string    `json:"description"`
+	DefaultModel string    `json:"defaultModel"`
+	Models       []AIModel `json:"models"`
+}
+
+type ChatAIStoreConfig struct {
+	Enabled bool `json:"enabled"`
+}
+
+type AIConfig struct {
+	Enabled     bool                `json:"enabled"`
+	ChatAI      ChatAIConfig        `json:"chat"`
+	Consumption AIConsumptionConfig `json:"consumption"`
+}
+
+type AIConsumptionConfig struct {
+	Enabled bool `json:"enabled"`
+	Allowed bool `json:"allowed"`
+}
+
+type ChatAIConfig struct {
+	Enabled         bool             `json:"enabled"`
+	Allowed         bool             `json:"allowed"`
+	DefaultProvider string           `json:"defaultProvider"`
+	Providers       []ProviderConfig `json:"providers"`
+}
+
+type AIModel struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	Model       string `json:"model"`
 }
 
 // PublicConfig is a subset of Kiali configuration that can be exposed to clients to
 // help them interact with the system.
 type PublicConfig struct {
-	ClusterInfo              ClusterInfo                     `json:"clusterInfo,omitempty"`
-	Clusters                 map[string]business.Cluster     `json:"clusters,omitempty"`
-	Extensions               Extensions                      `json:"extensions,omitempty"`
-	HealthConfig             config.HealthConfig             `json:"healthConfig,omitempty"`
-	InstallationTag          string                          `json:"installationTag,omitempty"`
-	IstioAnnotations         IstioAnnotations                `json:"istioAnnotations,omitempty"`
-	IstioStatusEnabled       bool                            `json:"istioStatusEnabled,omitempty"`
-	IstioIdentityDomain      string                          `json:"istioIdentityDomain,omitempty"`
-	IstioNamespace           string                          `json:"istioNamespace,omitempty"`
-	IstioComponentNamespaces config.IstioComponentNamespaces `json:"istioComponentNamespaces,omitempty"`
-	IstioLabels              config.IstioLabels              `json:"istioLabels,omitempty"`
-	IstioConfigMap           string                          `json:"istioConfigMap"`
-	KialiFeatureFlags        config.KialiFeatureFlags        `json:"kialiFeatureFlags,omitempty"`
-	Prometheus               PrometheusConfig                `json:"prometheus,omitempty"`
+	AuthStrategy               string                        `json:"authStrategy,omitempty"`
+	AmbientEnabled             bool                          `json:"ambientEnabled,omitempty"`
+	AI                         AIConfig                      `json:"ai,omitempty"`
+	Clusters                   map[string]models.KubeCluster `json:"clusters,omitempty"`
+	ClusterWideAccess          bool                          `json:"clusterWideAccess,omitempty"`
+	ControlPlanes              map[string]string             `json:"controlPlanes,omitempty"`
+	Deployment                 DeploymentConfig              `json:"deployment,omitempty"`
+	GatewayAPIClasses          []config.GatewayAPIClass      `json:"gatewayAPIClasses,omitempty"`
+	GatewayAPIEnabled          bool                          `json:"gatewayAPIEnabled,omitempty"`
+	HealthConfig               config.HealthConfig           `json:"healthConfig,omitempty"`
+	HealthStatusMetricsEnabled bool                          `json:"healthStatusMetricsEnabled,omitempty"`
+	IgnoreHomeCluster          bool                          `json:"ignoreHomeCluster,omitempty"`
+	InstallationTag            string                        `json:"installationTag,omitempty"`
+	IstioAnnotations           IstioAnnotations              `json:"istioAnnotations,omitempty"`
+	IstioAPIInstalled          bool                          `json:"istioAPIInstalled,omitempty"`
+	IstioGatewayInstalled      bool                          `json:"istioGatewayInstalled,omitempty"`
+	IstioIdentityDomain        string                        `json:"istioIdentityDomain,omitempty"`
+	IstioLabels                config.IstioLabels            `json:"istioLabels,omitempty"`
+	IstioStatusEnabled         bool                          `json:"istioStatusEnabled,omitempty"`
+	KialiFeatureFlags          config.KialiFeatureFlags      `json:"kialiFeatureFlags,omitempty"`
+	LogLevel                   string                        `json:"logLevel,omitempty"`
+	Prometheus                 PrometheusConfig              `json:"prometheus,omitempty"`
+	RunConfig                  *config.OfflineManifest       `json:"runConfig,omitempty"`
+	RunMode                    config.RunMode                `json:"runMode,omitempty"`
+}
+
+// resolvePublicIdentityDomain returns the identity domain to expose to the
+// frontend. If the user configured it explicitly it is returned as-is.
+// Otherwise it is derived from the home cluster control plane's trust domain.
+func resolvePublicIdentityDomain(ctx context.Context, conf *config.Config, discovery istio.MeshDiscovery) string {
+	var mesh *models.Mesh
+	if m, err := discovery.Mesh(ctx); err == nil {
+		mesh = m
+	} else {
+		log.FromContext(ctx).Debug().Err(err).Msgf("Failed to fetch mesh for identity domain resolution on cluster [%s]", conf.KubernetesConfig.ClusterName)
+	}
+	return business.ResolveClusterIdentityDomain(mesh, conf.KubernetesConfig.ClusterName, conf.ExternalServices.Istio.IstioIdentityDomain)
 }
 
 // Config is a REST http.HandlerFunc serving up the Kiali configuration made public to clients.
-func Config(w http.ResponseWriter, r *http.Request) {
-	defer handlePanic(w)
+func Config(conf *config.Config, cache cache.KialiCache, discovery istio.MeshDiscovery, clientFactory kubernetes.ClientFactory, prom prometheus.ClientInterface) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		defer handlePanic(r.Context(), w)
 
-	// Note that determine the Prometheus config at request time because it is not
-	// guaranteed to remain the same during the Kiali lifespan.
-	promConfig := getPrometheusConfig()
-	config := config.Get()
-	publicConfig := PublicConfig{
-		Clusters: make(map[string]business.Cluster),
-		Extensions: Extensions{
-			Iter8: Iter8Config{
-				Enabled:   config.Extensions.Iter8.Enabled,
-				Namespace: config.Extensions.Iter8.Namespace,
+		logger := log.FromRequest(r)
+		logger.Debug().Msg("Kiali configuration has been requested")
+
+		// Note that we determine the Prometheus config at request time because it is not
+		// guaranteed to remain the same during the Kiali lifespan.
+		promConfig := getPrometheusConfig(conf, prom, logger)
+
+		log.Debugf("AI Info: %+v", conf.AI.Metrics)
+		aiConfig := getAIConfig(conf, r)
+
+		publicConfig := PublicConfig{
+			AuthStrategy:      conf.Auth.Strategy,
+			AI:                aiConfig,
+			Clusters:          make(map[string]models.KubeCluster),
+			ClusterWideAccess: conf.Deployment.ClusterWideAccess,
+			ControlPlanes:     make(map[string]string),
+			Deployment: DeploymentConfig{
+				ViewOnlyMode: conf.Deployment.ViewOnlyMode,
 			},
-		},
-		InstallationTag: config.InstallationTag,
-		IstioAnnotations: IstioAnnotations{
-			IstioInjectionAnnotation: config.ExternalServices.Istio.IstioInjectionAnnotation,
-		},
-		HealthConfig:             config.HealthConfig,
-		IstioStatusEnabled:       config.ExternalServices.Istio.ComponentStatuses.Enabled,
-		IstioIdentityDomain:      config.ExternalServices.Istio.IstioIdentityDomain,
-		IstioNamespace:           config.IstioNamespace,
-		IstioComponentNamespaces: config.IstioComponentNamespaces,
-		IstioLabels:              config.IstioLabels,
-		IstioConfigMap:           config.ExternalServices.Istio.ConfigMapName,
-		KialiFeatureFlags:        config.KialiFeatureFlags,
-		Prometheus: PrometheusConfig{
-			GlobalScrapeInterval: promConfig.GlobalScrapeInterval,
-			StorageTsdbRetention: promConfig.StorageTsdbRetention,
-		},
-	}
-
-	// The following code fetches the cluster info. Cluster info is not critical.
-	// It's even possible that it cannot be resolved (because of Istio not being with MC turned on).
-	// Because of these two reasons, let's simply ignore errors in the following code.
-	token, getTokenErr := kubernetes.GetKialiToken()
-	if getTokenErr == nil {
-		layer, getLayerErr := business.Get(&api.AuthInfo{Token: token})
-		if getLayerErr == nil {
-			isMeshIdSet, mcErr := layer.Mesh.IsMeshConfigured()
-			if isMeshIdSet {
-				// Resolve home cluster
-				cluster, resolveClusterErr := layer.Mesh.ResolveKialiControlPlaneCluster(nil)
-				if cluster != nil {
-					publicConfig.ClusterInfo = ClusterInfo{
-						Name:    cluster.Name,
-						Network: cluster.Network,
-					}
-				} else if resolveClusterErr != nil {
-					log.Warningf("Failure while resolving cluster info: %s", resolveClusterErr.Error())
-				} else {
-					log.Info("Cluster ID couldn't be resolved. Most likely, no Cluster ID is set in the service mesh control plane configuration.")
-				}
-
-				// Fetch the list of all clusters in the mesh
-				// One usage of this data is to cross-link Kiali instances, when possible.
-				clusters, resolveAllClustersErr := layer.Mesh.GetClusters(r)
-				for _, c := range clusters {
-					publicConfig.Clusters[c.Name] = c
-				}
-				if resolveAllClustersErr != nil {
-					log.Warningf("Failure while listing clusters in the mesh: %s", resolveAllClustersErr.Error())
-				}
-			} else if mcErr != nil {
-				log.Warningf("Failure when checking if mesh-id is configured: %s", mcErr.Error())
-			}
-		} else {
-			log.Warningf("Failed to create business layer when resolving cluster info: %s", getLayerErr.Error())
+			InstallationTag: conf.InstallationTag,
+			IstioAnnotations: IstioAnnotations{
+				AmbientAnnotation:        config.AmbientAnnotation,
+				AmbientAnnotationEnabled: config.AmbientAnnotationEnabled,
+				IstioInjectionAnnotation: config.IstioInjectionAnnotation,
+			},
+			HealthConfig:               conf.HealthConfig,
+			HealthStatusMetricsEnabled: conf.Server.Observability.Metrics.HealthStatus.Enabled,
+			IgnoreHomeCluster:          conf.Clustering.IgnoreHomeCluster,
+			IstioStatusEnabled:         conf.ExternalServices.Istio.ComponentStatuses.Enabled,
+			IstioIdentityDomain:        resolvePublicIdentityDomain(r.Context(), conf, discovery),
+			IstioLabels:                conf.IstioLabels,
+			KialiFeatureFlags:          conf.KialiFeatureFlags,
+			LogLevel:                   log.GetLogLevel(),
+			Prometheus:                 promConfig,
+			RunMode:                    conf.RunMode,
 		}
-	} else {
-		log.Warningf("Failed to fetch Kiali token when resolving cluster info: %s", getTokenErr.Error())
+
+		if conf.RunMode == config.RunModeOffline {
+			publicConfig.RunConfig = conf.RunConfig
+		}
+
+		userClients, err := getUserClients(r, clientFactory)
+		if err != nil {
+			RespondWithError(w, http.StatusInternalServerError, "Unable to convert session token into user client: "+err.Error())
+			return
+		}
+
+		// Aggregate mesh-wide capability flags across all clusters this user can
+		// reach (home cluster is empty under ignore_home_cluster=true).
+		accessibleClusters := make([]string, 0, len(userClients))
+		for clusterName := range userClients {
+			accessibleClusters = append(accessibleClusters, clusterName)
+		}
+
+		for _, cluster := range accessibleClusters {
+			if client := userClients[cluster]; client != nil {
+				if client.IsGatewayAPI() {
+					publicConfig.GatewayAPIEnabled = true
+				}
+				if client.IsIstioGateway() {
+					publicConfig.IstioGatewayInstalled = true
+				}
+				if client.IsIstioAPI() {
+					publicConfig.IstioAPIInstalled = true
+				}
+			}
+		}
+		publicConfig.AmbientEnabled = cache.IsAmbientEnabledInAnyCluster(accessibleClusters)
+		// Dedupe gateway API classes by ClassName across clusters.
+		seenClasses := make(map[string]bool)
+		for _, cluster := range accessibleClusters {
+			for _, gwClass := range cache.GatewayAPIClasses(cluster) {
+				if !seenClasses[gwClass.ClassName] {
+					seenClasses[gwClass.ClassName] = true
+					publicConfig.GatewayAPIClasses = append(publicConfig.GatewayAPIClasses, gwClass)
+				}
+			}
+		}
+
+		// Fetch the list of all clusters in the mesh
+		// One usage of this data is to cross-link Kiali instances, when possible.
+		clusters := discovery.Clusters()
+
+		for _, cluster := range clusters {
+			publicConfig.Clusters[cluster.Name] = cluster
+
+			if client := userClients[cluster.Name]; client != nil {
+				if namespaces, found := cache.GetNamespaces(cluster.Name, client.GetCacheKey()); found {
+					for _, ns := range namespaces {
+						if discovery.IsControlPlane(r.Context(), cluster.Name, ns.Name) {
+							publicConfig.ControlPlanes[cluster.Name] = ns.Name
+						}
+					}
+				}
+			}
+		}
+
+		RespondWithJSONIndent(w, http.StatusOK, publicConfig)
+	}
+}
+
+func isUserAllowed(usernames []string, username string) bool {
+	if len(usernames) > 0 && !slices.Contains(usernames, username) {
+		return false
+	}
+	return true
+}
+
+func getAIConsumptionConfig(conf *config.Config, username string) AIConsumptionConfig {
+	if !conf.AI.Metrics {
+		return AIConsumptionConfig{
+			Enabled: false,
+			Allowed: false,
+		}
+	}
+	return AIConsumptionConfig{
+		Enabled: true,
+		Allowed: isUserAllowed(conf.AI.Consumption.AllowedUsersDashboard, username),
+	}
+}
+
+func getAIChatConfig(conf *config.Config, username string) ChatAIConfig {
+	if !conf.AI.ChatAI.Enabled {
+		return ChatAIConfig{
+			Enabled: false,
+		}
+	}
+	return ChatAIConfig{
+		Enabled: conf.AI.ChatAI.Enabled,
+		Allowed: isUserAllowed(conf.AI.ChatAI.AllowedUsers, username),
+	}
+}
+
+func getAIConfig(conf *config.Config, r *http.Request) AIConfig {
+	if !conf.AI.Enabled {
+		return AIConfig{}
 	}
 
-	RespondWithJSONIndent(w, http.StatusOK, publicConfig)
+	username := "anonymous"
+	if conf.Auth.Strategy != config.AuthStrategyAnonymous {
+		authInfo, err := getAuthInfo(r)
+		if err != nil {
+			log.Error("AI initialization error, loading config: " + err.Error())
+			return AIConfig{}
+		}
+		if clusterAuth, ok := authInfo[conf.KubernetesConfig.ClusterName]; !ok || clusterAuth == nil {
+			log.Error("AI initialization error, loading config: auth info not found for cluster %q", conf.KubernetesConfig.ClusterName)
+			return AIConfig{}
+		}
+		username = resolveChatAIUsername(r, conf, "")
+	}
+
+	aiConfig := AIConfig{
+		Enabled:     conf.AI.Enabled,
+		ChatAI:      getAIChatConfig(conf, username),
+		Consumption: getAIConsumptionConfig(conf, username),
+	}
+
+	if aiConfig.ChatAI.Enabled && aiConfig.ChatAI.Allowed {
+		var budget *config.UserBudgetConfig
+		if conf.AI.Metrics {
+			budget = conf.AI.Consumption.GetBudgetForUser(username)
+		}
+
+		providers := []ProviderConfig{}
+		for _, provider := range conf.AI.ChatAI.Providers {
+			if budget != nil && len(budget.AllowedProviders) > 0 {
+				allowed := false
+				for _, ap := range budget.AllowedProviders {
+					if provider.Type == ap {
+						allowed = true
+						break
+					}
+				}
+				if !allowed {
+					continue
+				}
+			}
+
+			models := []AIModel{}
+			if provider.Enabled {
+				for _, model := range provider.Models {
+					if model.Enabled {
+						if budget != nil && len(budget.AllowedModels) > 0 {
+							allowed := false
+							if provider.Type == config.LightSpeedProvider {
+								allowed = true
+							} else {
+								for _, am := range budget.AllowedModels {
+									if config.MatchModelPattern(am, model.Name) || config.MatchModelPattern(am, model.Model) {
+										allowed = true
+										break
+									}
+								}
+							}
+							if !allowed {
+								continue
+							}
+						}
+
+						models = append(models, AIModel{
+							Name:        model.Name,
+							Model:       model.Model,
+							Description: model.Description,
+						})
+					}
+				}
+				if len(models) > 0 {
+					providers = append(providers, ProviderConfig{
+						Name:         provider.Name,
+						Description:  provider.Description,
+						DefaultModel: provider.DefaultModel,
+						Models:       models,
+					})
+				}
+			}
+		}
+		aiConfig.ChatAI.DefaultProvider = conf.AI.ChatAI.DefaultProvider
+		aiConfig.ChatAI.Providers = providers
+	}
+	return aiConfig
+
 }
 
 type PrometheusPartialConfig struct {
@@ -146,46 +358,153 @@ type PrometheusPartialConfig struct {
 	}
 }
 
-func getPrometheusConfig() PrometheusConfig {
-	promConfig := PrometheusConfig{
-		GlobalScrapeInterval: defaultPrometheusGlobalScrapeInterval,
+func getPrometheusConfig(conf *config.Config, client prometheus.ClientInterface, logger *zerolog.Logger) PrometheusConfig {
+	var disabledReason string
+	if drp, ok := client.(prometheus.DisabledReasonProvider); ok {
+		disabledReason = drp.DisabledReason()
 	}
-
-	client, err := prometheus.NewClient()
-	if !checkErr(err, "") {
-		log.Error(err)
+	promConfig := PrometheusConfig{
+		DisabledReason:       disabledReason,
+		Enabled:              conf.ExternalServices.Prometheus.Enabled,
+		GlobalScrapeInterval: defaultPrometheusGlobalScrapeInterval,
+		StorageTsdbRetention: defaultPrometheusGlobalStorageTSDBRetention,
+	}
+	if !conf.ExternalServices.Prometheus.Enabled || disabledReason != "" || conf.RunMode == config.RunModeOffline {
 		return promConfig
 	}
-
-	configResult, err := client.GetConfiguration()
-	if checkErr(err, "Failed to fetch Prometheus configuration") {
-		var config PrometheusPartialConfig
-		if checkErr(yaml.Unmarshal([]byte(configResult.YAML), &config), "Failed to unmarshal Prometheus configuration") {
-			scrapeIntervalString := config.Global.Scrape_interval
-			scrapeInterval, err := model.ParseDuration(scrapeIntervalString)
-			if checkErr(err, fmt.Sprintf("Invalid global scrape interval [%s]", scrapeIntervalString)) {
-				promConfig.GlobalScrapeInterval = int64(time.Duration(scrapeInterval).Seconds())
+	// Check if thanosProxy
+	thanosConf := conf.ExternalServices.Prometheus.ThanosProxy
+	if thanosConf.Enabled {
+		scrapeInterval, err := model.ParseDuration(thanosConf.ScrapeInterval)
+		if checkErr(err, fmt.Sprintf("Invalid scrape interval in ThanosProxy configuration [%s]", scrapeInterval), logger) {
+			promConfig.GlobalScrapeInterval = int64(time.Duration(scrapeInterval).Seconds())
+		}
+		retention, err := model.ParseDuration(thanosConf.RetentionPeriod)
+		if checkErr(err, fmt.Sprintf("Invalid retention period in ThanosProxy configuration [%s]", retention), logger) {
+			promConfig.StorageTsdbRetention = int64(time.Duration(retention).Seconds())
+		}
+	} else {
+		configResult, err := client.GetConfiguration(context.Background())
+		if checkErr(err, "Failed to fetch Prometheus configuration", logger) {
+			var config PrometheusPartialConfig
+			if checkErr(yaml.Unmarshal([]byte(configResult.YAML), &config), "Failed to unmarshal Prometheus configuration", logger) {
+				scrapeIntervalString := config.Global.Scrape_interval
+				scrapeInterval, err := model.ParseDuration(scrapeIntervalString)
+				if checkErr(err, fmt.Sprintf("Invalid global scrape interval [%s]", scrapeIntervalString), logger) {
+					promConfig.GlobalScrapeInterval = int64(time.Duration(scrapeInterval).Seconds())
+				}
 			}
 		}
-	}
 
-	flags, err := client.GetFlags()
-	if checkErr(err, "Failed to fetch Prometheus flags") {
-		if retentionString, ok := flags["storage.tsdb.retention"]; ok {
-			retention, err := model.ParseDuration(retentionString)
-			if checkErr(err, fmt.Sprintf("Invalid storage.tsdb.retention [%s]", retentionString)) {
-				promConfig.StorageTsdbRetention = int64(time.Duration(retention).Seconds())
+		promRuntimeinfoResults, err := client.GetRuntimeinfo(context.Background())
+		if checkErr(err, "Failed to fetch Prometheus runtime info", logger) {
+			// the storage retention as reported by Prometheus endpoint /api/v1/status/runtimeinfo
+			// It will either be time-based (e.g. "1d") or size-based (e.g "10GB") or both (e.g "1d or 10GB").
+			// see: https://prometheus.io/docs/prometheus/latest/command-line/prometheus/
+			//      https://prometheus.io/docs/prometheus/latest/storage/
+			retentionStr := promRuntimeinfoResults.StorageRetention
+			// if specified with both time-based and size-base durations, strip off the size-based one that appears after the space
+			if strings.Contains(retentionStr, " ") {
+				retentionStr = (strings.Fields(retentionStr))[0]
 			}
+			// if retention is only size-based (defined in bytes), then we will fallback to the Prometheus default
+			if !strings.Contains(strings.ToLower(retentionStr), "b") {
+				retentionPeriod, err := model.ParseDuration(retentionStr)
+				if checkErr(err, "Cannot parse Promtheus retention period: "+retentionStr, logger) {
+					promConfig.StorageTsdbRetention = int64(time.Duration(retentionPeriod).Seconds())
+				}
+			}
+		} else {
+			logger.Warn().Msg("Cannot determine Prometheus retention period; ignoring...")
 		}
 	}
 
 	return promConfig
 }
 
-func checkErr(err error, message string) bool {
+func checkErr(err error, message string, logger *zerolog.Logger) bool {
 	if err != nil {
-		log.Errorf("%s: %v", message, err)
+		logger.Error().Msgf("%s: %v", message, err)
 		return false
 	}
 	return true
+}
+
+// DisabledFeatures holds information about Kiali features that are disabled
+// due to missing Istio metrics in Prometheus.
+type DisabledFeatures struct {
+	RequestSize             bool `json:"requestSize"`
+	RequestSizeAverage      bool `json:"requestSizeAverage"`
+	RequestSizePercentiles  bool `json:"requestSizePercentiles"`
+	ResponseSize            bool `json:"responseSize"`
+	ResponseSizeAverage     bool `json:"responseSizeAverage"`
+	ResponseSizePercentiles bool `json:"responseSizePercentiles"`
+	ResponseTime            bool `json:"responseTime"`
+	ResponseTimeAverage     bool `json:"responseTimeAverage"`
+	ResponseTimePercentiles bool `json:"responseTimePercentiles"`
+}
+
+// DisabledFeaturesHandler returns information about Kiali features that are disabled
+// due to missing Istio metrics in Prometheus.
+func DisabledFeaturesHandler(conf *config.Config, client prometheus.ClientInterface) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		logger := log.FromRequest(r)
+
+		defer handlePanic(r.Context(), w)
+
+		requiredMetrics := []string{
+			"istio_request_bytes_bucket",
+			"istio_request_bytes_count",
+			"istio_request_bytes_sum",
+			"istio_request_duration_milliseconds_bucket",
+			"istio_request_duration_milliseconds_count",
+			"istio_request_duration_milliseconds_sum",
+			"istio_requests_total",
+			"istio_response_bytes_bucket",
+			"istio_response_bytes_count",
+			"istio_response_bytes_sum",
+		}
+
+		// assume nothing disabled on error
+		disabledFeatures := DisabledFeatures{}
+
+		// TODO: Getting metric names is not yet supported in offline mode.
+		if conf.RunMode == config.RunModeOffline {
+			RespondWithJSONIndent(w, http.StatusOK, disabledFeatures)
+			return
+		}
+
+		existingMetrics, err := client.GetExistingMetricNames(r.Context(), requiredMetrics)
+		if !checkErr(err, "", logger) {
+			log.Error(err)
+			RespondWithJSONIndent(w, http.StatusOK, disabledFeatures)
+			return
+		}
+
+		// if we have all of the metrics then nothing is disabled, just return
+		// if we have no metrics then we have no requests (note that we check for istio_request_totals), nothing is known to be disabled
+		if len(existingMetrics) == len(requiredMetrics) || len(existingMetrics) == 0 {
+			RespondWithJSONIndent(w, http.StatusOK, disabledFeatures)
+			return
+		}
+
+		exists := make(map[string]bool, len(existingMetrics))
+		for _, metric := range existingMetrics {
+			exists[metric] = true
+		}
+
+		disabledFeatures.RequestSize = !exists["istio_request_bytes_sum"]
+		disabledFeatures.RequestSizeAverage = disabledFeatures.RequestSize || !exists["istio_request_bytes_count"]
+		disabledFeatures.RequestSizePercentiles = disabledFeatures.RequestSizeAverage || !exists["istio_request_bytes_bucket"]
+
+		disabledFeatures.ResponseSize = !exists["istio_response_bytes_sum"]
+		disabledFeatures.ResponseSizeAverage = disabledFeatures.ResponseSize || !exists["istio_response_bytes_count"]
+		disabledFeatures.ResponseSizePercentiles = disabledFeatures.ResponseSizeAverage || !exists["istio_response_bytes_bucket"]
+
+		disabledFeatures.ResponseTime = !exists["istio_request_duration_milliseconds_sum"]
+		disabledFeatures.ResponseTimeAverage = disabledFeatures.ResponseTime || !exists["istio_request_duration_milliseconds_count"]
+		disabledFeatures.ResponseTimePercentiles = disabledFeatures.ResponseTimeAverage || !exists["istio_request_duration_milliseconds_bucket"]
+
+		RespondWithJSONIndent(w, http.StatusOK, disabledFeatures)
+	}
 }

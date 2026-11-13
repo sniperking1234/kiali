@@ -1,75 +1,77 @@
 package appender
 
 import (
+	"context"
 	"testing"
 
-	osproject_v1 "github.com/openshift/api/project/v1"
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/mock"
+	api_networking_v1 "istio.io/api/networking/v1"
+	networking_v1 "istio.io/client-go/pkg/apis/networking/v1"
 	core_v1 "k8s.io/api/core/v1"
 	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	k8s_networking_v1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	"github.com/kiali/kiali/business"
 	"github.com/kiali/kiali/config"
 	"github.com/kiali/kiali/graph"
-	"github.com/kiali/kiali/kubernetes"
 	"github.com/kiali/kiali/kubernetes/kubetest"
+	"github.com/kiali/kiali/models"
 )
 
-func setupTrafficMap() (map[string]*graph.Node, string, string, string, string, string, string) {
+func setupTrafficMap() (map[string]*graph.Node, string, string, string, string, string, string, string) {
 	trafficMap := graph.NewTrafficMap()
 
-	appNode := graph.NewNode(graph.Unknown, "testNamespace", "ratings", "testNamespace", graph.Unknown, "ratings", "", graph.GraphTypeVersionedApp)
+	appNode, _ := graph.NewNode(config.DefaultClusterID, "testNamespace", "ratings", "testNamespace", graph.Unknown, "ratings", "", graph.GraphTypeVersionedApp)
 	appNode.Metadata[graph.DestServices] = graph.NewDestServicesMetadata().Add("testNamespace ratings", graph.ServiceName{Namespace: "testNamespace", Name: "ratings"})
-	trafficMap[appNode.ID] = &appNode
+	trafficMap[appNode.ID] = appNode
 
-	appNodeV1 := graph.NewNode(graph.Unknown, "testNamespace", "ratings", "testNamespace", "ratings-v1", "ratings", "v1", graph.GraphTypeVersionedApp)
+	appNodeV1, _ := graph.NewNode(config.DefaultClusterID, "testNamespace", "ratings", "testNamespace", "ratings-v1", "ratings", "v1", graph.GraphTypeVersionedApp)
 	appNodeV1.Metadata[graph.DestServices] = graph.NewDestServicesMetadata().Add("testNamespace ratings", graph.ServiceName{Namespace: "testNamespace", Name: "ratings"})
-	trafficMap[appNodeV1.ID] = &appNodeV1
+	trafficMap[appNodeV1.ID] = appNodeV1
 
-	appNodeV2 := graph.NewNode(graph.Unknown, "testNamespace", "ratings", "testNamespace", "ratings-v2", "ratings", "v2", graph.GraphTypeVersionedApp)
+	appNodeV2, _ := graph.NewNode(config.DefaultClusterID, "testNamespace", "ratings", "testNamespace", "ratings-v2", "ratings", "v2", graph.GraphTypeVersionedApp)
 	appNodeV2.Metadata[graph.DestServices] = graph.NewDestServicesMetadata().Add("testNamespace ratings", graph.ServiceName{Namespace: "testNamespace", Name: "ratings"})
-	trafficMap[appNodeV2.ID] = &appNodeV2
+	trafficMap[appNodeV2.ID] = appNodeV2
 
-	serviceNode := graph.NewNode(graph.Unknown, "testNamespace", "ratings", "testNamespace", graph.Unknown, graph.Unknown, graph.Unknown, graph.GraphTypeVersionedApp)
-	trafficMap[serviceNode.ID] = &serviceNode
+	serviceNode, _ := graph.NewNode(config.DefaultClusterID, "testNamespace", "ratings", "testNamespace", graph.Unknown, graph.Unknown, graph.Unknown, graph.GraphTypeVersionedApp)
+	trafficMap[serviceNode.ID] = serviceNode
 
-	workloadNode := graph.NewNode(graph.Unknown, "testNamespace", "ratings", "testNamespace", "ratings-v1", graph.Unknown, graph.Unknown, graph.GraphTypeWorkload)
+	workloadNode, _ := graph.NewNode(config.DefaultClusterID, "testNamespace", "ratings", "testNamespace", "ratings-v1", graph.Unknown, graph.Unknown, graph.GraphTypeWorkload)
 	workloadNode.Metadata[graph.DestServices] = graph.NewDestServicesMetadata().Add("testNamespace ratings", graph.ServiceName{Namespace: "testNamespace", Name: "ratings"})
-	trafficMap[workloadNode.ID] = &workloadNode
+	trafficMap[workloadNode.ID] = workloadNode
 
-	fooServiceNode := graph.NewNode(graph.Unknown, "testNamespace", "foo", "testNamespace", graph.Unknown, graph.Unknown, graph.Unknown, graph.GraphTypeVersionedApp)
-	trafficMap[fooServiceNode.ID] = &fooServiceNode
+	fooServiceNode, _ := graph.NewNode(config.DefaultClusterID, "testNamespace", "foo", "testNamespace", graph.Unknown, graph.Unknown, graph.Unknown, graph.GraphTypeVersionedApp)
+	trafficMap[fooServiceNode.ID] = fooServiceNode
 
-	return trafficMap, appNode.ID, appNodeV1.ID, appNodeV2.ID, serviceNode.ID, workloadNode.ID, fooServiceNode.ID
+	inaccessibleServiceNode, _ := graph.NewNode("unknown", "testNamespace", "foo", "testNamespace", graph.Unknown, graph.Unknown, graph.Unknown, graph.GraphTypeVersionedApp)
+	trafficMap[inaccessibleServiceNode.ID] = inaccessibleServiceNode
+
+	return trafficMap, appNode.ID, appNodeV1.ID, appNodeV2.ID, serviceNode.ID, workloadNode.ID, fooServiceNode.ID, inaccessibleServiceNode.ID
 }
 
 func TestCBAll(t *testing.T) {
 	assert := assert.New(t)
-	config.Set(config.NewConfig())
+	conf := config.NewConfig()
+	conf.KubernetesConfig.ClusterName = config.DefaultClusterID
+	conf.ExternalServices.Istio.IstioAPIEnabled = false
+	config.Set(conf)
 
-	k8s := kubetest.NewK8SClientMock()
-	dRule := kubernetes.GenericIstioObject{
-		ObjectMeta: meta_v1.ObjectMeta{
-			Name: "dRule-1",
-		},
-		Spec: map[string]interface{}{
-			"host":          "ratings",
-			"trafficPolicy": map[string]interface{}{"connectionPool": true},
+	dRule := &networking_v1.DestinationRule{}
+	dRule.Name = "dRule-1"
+	dRule.Namespace = "testNamespace"
+	dRule.Spec.Host = "ratings"
+	dRule.Spec.TrafficPolicy = &api_networking_v1.TrafficPolicy{
+		ConnectionPool: &api_networking_v1.ConnectionPoolSettings{
+			Http: &api_networking_v1.ConnectionPoolSettings_HTTPSettings{
+				MaxRequestsPerConnection: 30,
+			},
 		},
 	}
-	k8s.On("GetProject", mock.AnythingOfType("string")).Return(&osproject_v1.Project{}, nil)
-	k8s.On("GetIstioObjects", mock.AnythingOfType("string"), "destinationrules", "").Return([]kubernetes.IstioObject{
-		dRule.DeepCopyIstioObject(),
-	}, nil)
-	k8s.On("GetEndpoints", mock.AnythingOfType("string"), mock.AnythingOfType("string")).Return(&core_v1.Endpoints{}, nil)
-	k8s.On("GetServices", mock.AnythingOfType("string"), mock.Anything).Return([]core_v1.Service{{}}, nil)
-	k8s.On("GetIstioObjects", mock.AnythingOfType("string"), "virtualservices", "").Return([]kubernetes.IstioObject{}, nil)
+	k8s := kubetest.NewFakeK8sClient(dRule, kubetest.FakeNamespace("testNamespace"))
+	businessLayer := business.NewLayerBuilder(t, conf).WithClient(k8s).Build()
+	trafficMap, appNodeId, appNodeV1Id, appNodeV2Id, svcNodeId, wlNodeId, _, _ := setupTrafficMap()
 
-	businessLayer := business.NewWithBackends(k8s, nil, nil)
-	trafficMap, appNodeId, appNodeV1Id, appNodeV2Id, svcNodeId, wlNodeId, _ := setupTrafficMap()
-
-	assert.Equal(6, len(trafficMap))
+	assert.Equal(7, len(trafficMap))
 	assert.Equal(nil, trafficMap[appNodeId].Metadata[graph.HasCB])
 	assert.Equal(nil, trafficMap[appNodeV1Id].Metadata[graph.HasCB])
 	assert.Equal(nil, trafficMap[appNodeV2Id].Metadata[graph.HasCB])
@@ -81,14 +83,18 @@ func TestCBAll(t *testing.T) {
 	assert.Equal(nil, trafficMap[svcNodeId].Metadata[graph.HasVS])
 	assert.Equal(nil, trafficMap[wlNodeId].Metadata[graph.HasVS])
 
-	globalInfo := graph.NewAppenderGlobalInfo()
-	globalInfo.Business = businessLayer
-	namespaceInfo := graph.NewAppenderNamespaceInfo("testNamespace")
+	globalInfo := graph.NewGlobalInfo(businessLayer, nil, config.Get(), []models.KubeCluster{}, NewGlobalIstioInfo())
+	globalInfo.Clusters = []models.KubeCluster{{Name: config.DefaultClusterID}}
+	namespaceInfo := NewAppenderNamespaceInfo("testNamespace")
 
-	a := IstioAppender{}
-	a.AppendGraph(trafficMap, globalInfo, namespaceInfo)
+	a := IstioAppender{
+		AccessibleNamespaces: graph.AccessibleNamespaces{
+			graph.GetClusterSensitiveKey(config.DefaultClusterID, "testNamespace"): {Cluster: config.DefaultClusterID, Name: "testNamespace"},
+		},
+	}
+	a.AppendGraph(context.Background(), trafficMap, globalInfo, namespaceInfo)
 
-	assert.Equal(6, len(trafficMap))
+	assert.Equal(7, len(trafficMap))
 	assert.Equal(true, trafficMap[appNodeId].Metadata[graph.HasCB])
 	assert.Equal(true, trafficMap[appNodeV1Id].Metadata[graph.HasCB])
 	assert.Equal(true, trafficMap[appNodeV2Id].Metadata[graph.HasCB])
@@ -103,35 +109,37 @@ func TestCBAll(t *testing.T) {
 
 func TestCBSubset(t *testing.T) {
 	assert := assert.New(t)
-	config.Set(config.NewConfig())
+	conf := config.NewConfig()
+	conf.KubernetesConfig.ClusterName = config.DefaultClusterID
+	conf.ExternalServices.Istio.IstioAPIEnabled = false
+	config.Set(conf)
 
-	k8s := kubetest.NewK8SClientMock()
-	dRule := kubernetes.GenericIstioObject{
-		ObjectMeta: meta_v1.ObjectMeta{
-			Name: "dRule-1",
-		},
-		Spec: map[string]interface{}{
-			"host": "ratings",
-			"subsets": []interface{}{
-				map[string]interface{}{
-					"trafficPolicy": map[string]interface{}{"connectionPool": true},
-					"labels":        map[string]interface{}{"version": "v1"},
+	dRule := &networking_v1.DestinationRule{}
+	dRule.Name = "dRule-1"
+	dRule.Namespace = "testNamespace"
+	dRule.Spec.Host = "ratings"
+	dRule.Spec.Subsets = []*api_networking_v1.Subset{
+		{
+			TrafficPolicy: &api_networking_v1.TrafficPolicy{
+				ConnectionPool: &api_networking_v1.ConnectionPoolSettings{
+					Http: &api_networking_v1.ConnectionPoolSettings_HTTPSettings{
+						MaxRequestsPerConnection: 30,
+					},
 				},
+			},
+			Labels: map[string]string{
+				"version": "v1",
 			},
 		},
 	}
-	k8s.On("GetProject", mock.AnythingOfType("string")).Return(&osproject_v1.Project{}, nil)
-	k8s.On("GetIstioObjects", mock.AnythingOfType("string"), "destinationrules", "").Return([]kubernetes.IstioObject{
-		dRule.DeepCopyIstioObject(),
-	}, nil)
-	k8s.On("GetEndpoints", mock.AnythingOfType("string"), mock.AnythingOfType("string")).Return(&core_v1.Endpoints{}, nil)
-	k8s.On("GetServices", mock.AnythingOfType("string"), mock.Anything).Return([]core_v1.Service{{}}, nil)
-	k8s.On("GetIstioObjects", mock.AnythingOfType("string"), "virtualservices", "").Return([]kubernetes.IstioObject{}, nil)
+	k8s := kubetest.NewFakeK8sClient(
+		dRule,
+		kubetest.FakeNamespace("testNamespace"),
+	)
+	businessLayer := business.NewLayerBuilder(t, conf).WithClient(k8s).Build()
+	trafficMap, appNodeId, appNodeV1Id, appNodeV2Id, svcNodeId, wlNodeId, _, _ := setupTrafficMap()
 
-	businessLayer := business.NewWithBackends(k8s, nil, nil)
-	trafficMap, appNodeId, appNodeV1Id, appNodeV2Id, svcNodeId, wlNodeId, _ := setupTrafficMap()
-
-	assert.Equal(6, len(trafficMap))
+	assert.Equal(7, len(trafficMap))
 	assert.Equal(nil, trafficMap[appNodeId].Metadata[graph.HasCB])
 	assert.Equal(nil, trafficMap[appNodeV1Id].Metadata[graph.HasCB])
 	assert.Equal(nil, trafficMap[appNodeV2Id].Metadata[graph.HasCB])
@@ -143,14 +151,18 @@ func TestCBSubset(t *testing.T) {
 	assert.Equal(nil, trafficMap[svcNodeId].Metadata[graph.HasVS])
 	assert.Equal(nil, trafficMap[wlNodeId].Metadata[graph.HasVS])
 
-	globalInfo := graph.NewAppenderGlobalInfo()
-	globalInfo.Business = businessLayer
-	namespaceInfo := graph.NewAppenderNamespaceInfo("testNamespace")
+	globalInfo := graph.NewGlobalInfo(businessLayer, nil, config.Get(), []models.KubeCluster{}, NewGlobalIstioInfo())
+	globalInfo.Clusters = []models.KubeCluster{{Name: config.DefaultClusterID}}
+	namespaceInfo := NewAppenderNamespaceInfo("testNamespace")
 
-	a := IstioAppender{}
-	a.AppendGraph(trafficMap, globalInfo, namespaceInfo)
+	a := IstioAppender{
+		AccessibleNamespaces: graph.AccessibleNamespaces{
+			graph.GetClusterSensitiveKey(config.DefaultClusterID, "testNamespace"): {Cluster: config.DefaultClusterID, Name: "testNamespace"},
+		},
+	}
+	a.AppendGraph(context.Background(), trafficMap, globalInfo, namespaceInfo)
 
-	assert.Equal(6, len(trafficMap))
+	assert.Equal(7, len(trafficMap))
 	assert.Equal(true, trafficMap[appNodeId].Metadata[graph.HasCB])
 	assert.Equal(true, trafficMap[appNodeV1Id].Metadata[graph.HasCB])
 	assert.Equal(nil, trafficMap[appNodeV2Id].Metadata[graph.HasCB])
@@ -165,71 +177,239 @@ func TestCBSubset(t *testing.T) {
 
 func TestVS(t *testing.T) {
 	assert := assert.New(t)
-	config.Set(config.NewConfig())
+	conf := config.NewConfig()
+	conf.KubernetesConfig.ClusterName = config.DefaultClusterID
+	conf.ExternalServices.Istio.IstioAPIEnabled = false
+	config.Set(conf)
 
-	k8s := kubetest.NewK8SClientMock()
-	vService := kubernetes.GenericIstioObject{
-		ObjectMeta: meta_v1.ObjectMeta{
-			Name: "vService-1",
-		},
-		Spec: map[string]interface{}{
-			"hosts": []interface{}{
-				"ratings",
-			},
-			"http": []interface{}{
-				map[string]interface{}{
-					"route": []interface{}{
-						map[string]interface{}{
-							"destination": map[string]interface{}{
-								"host": "foo",
-							},
-						},
+	vService := &networking_v1.VirtualService{}
+	vService.Name = "vService-1"
+	vService.Namespace = "testNamespace"
+	vService.Spec.Hosts = []string{"ratings"}
+	vService.Spec.Http = []*api_networking_v1.HTTPRoute{
+		{
+			Route: []*api_networking_v1.HTTPRouteDestination{
+				{
+					Destination: &api_networking_v1.Destination{
+						Host: "foo",
 					},
 				},
 			},
 		},
 	}
-	k8s.On("GetProject", mock.AnythingOfType("string")).Return(&osproject_v1.Project{}, nil)
-	k8s.On("GetIstioObjects", mock.AnythingOfType("string"), "destinationrules", "").Return([]kubernetes.IstioObject{}, nil)
-	k8s.On("GetEndpoints", mock.AnythingOfType("string"), mock.AnythingOfType("string")).Return(&core_v1.Endpoints{}, nil)
-	k8s.On("GetServices", mock.AnythingOfType("string"), mock.Anything).Return([]core_v1.Service{{}}, nil)
-	k8s.On("GetIstioObjects", mock.AnythingOfType("string"), "virtualservices", "").Return([]kubernetes.IstioObject{
-		vService.DeepCopyIstioObject(),
-	}, nil)
 
-	businessLayer := business.NewWithBackends(k8s, nil, nil)
-	trafficMap, appNodeId, appNodeV1Id, appNodeV2Id, svcNodeId, wlNodeId, fooSvcNodeId := setupTrafficMap()
+	k8s := kubetest.NewFakeK8sClient(vService, kubetest.FakeNamespace("testNamespace"))
+	businessLayer := business.NewLayerBuilder(t, conf).WithClient(k8s).Build()
+	trafficMap, appNodeId, appNodeV1Id, appNodeV2Id, svcNodeId, wlNodeId, fooSvcNodeId, _ := setupTrafficMap()
 
-	assert.Equal(6, len(trafficMap))
-	assert.Equal(nil, trafficMap[appNodeId].Metadata[graph.HasCB])
-	assert.Equal(nil, trafficMap[appNodeV1Id].Metadata[graph.HasCB])
-	assert.Equal(nil, trafficMap[appNodeV2Id].Metadata[graph.HasCB])
-	assert.Equal(nil, trafficMap[svcNodeId].Metadata[graph.HasCB])
-	assert.Equal(nil, trafficMap[wlNodeId].Metadata[graph.HasCB])
-	assert.Equal(nil, trafficMap[appNodeId].Metadata[graph.HasVS])
-	assert.Equal(nil, trafficMap[appNodeV1Id].Metadata[graph.HasVS])
-	assert.Equal(nil, trafficMap[appNodeV2Id].Metadata[graph.HasVS])
-	assert.Equal(nil, trafficMap[svcNodeId].Metadata[graph.HasVS])
-	assert.Equal(nil, trafficMap[wlNodeId].Metadata[graph.HasVS])
+	assert.Equal(7, len(trafficMap))
 	assert.Equal(nil, trafficMap[fooSvcNodeId].Metadata[graph.HasVS])
 
-	globalInfo := graph.NewAppenderGlobalInfo()
-	globalInfo.Business = businessLayer
-	namespaceInfo := graph.NewAppenderNamespaceInfo("testNamespace")
+	globalInfo := graph.NewGlobalInfo(businessLayer, nil, config.Get(), []models.KubeCluster{}, NewGlobalIstioInfo())
+	globalInfo.Clusters = []models.KubeCluster{{Name: config.DefaultClusterID}}
+	namespaceInfo := NewAppenderNamespaceInfo("testNamespace")
 
-	a := IstioAppender{}
-	a.AppendGraph(trafficMap, globalInfo, namespaceInfo)
+	a := IstioAppender{
+		AccessibleNamespaces: graph.AccessibleNamespaces{
+			graph.GetClusterSensitiveKey(config.DefaultClusterID, "testNamespace"): {Cluster: config.DefaultClusterID, Name: "testNamespace"},
+		},
+	}
+	a.AppendGraph(context.Background(), trafficMap, globalInfo, namespaceInfo)
 
-	assert.Equal(6, len(trafficMap))
+	assert.Equal(7, len(trafficMap))
 	assert.Equal(nil, trafficMap[appNodeId].Metadata[graph.HasCB])
 	assert.Equal(nil, trafficMap[appNodeV1Id].Metadata[graph.HasCB])
 	assert.Equal(nil, trafficMap[appNodeV2Id].Metadata[graph.HasCB])
 	assert.Equal(nil, trafficMap[svcNodeId].Metadata[graph.HasCB])
 	assert.Equal(nil, trafficMap[wlNodeId].Metadata[graph.HasCB])
-	assert.Equal(nil, trafficMap[appNodeId].Metadata[graph.HasVS])
-	assert.Equal(nil, trafficMap[appNodeV1Id].Metadata[graph.HasVS])
-	assert.Equal(nil, trafficMap[appNodeV2Id].Metadata[graph.HasVS])
-	assert.Equal(nil, trafficMap[svcNodeId].Metadata[graph.HasVS])
-	assert.Equal(nil, trafficMap[wlNodeId].Metadata[graph.HasVS])
-	assert.Equal(true, trafficMap[fooSvcNodeId].Metadata[graph.HasVS])
+
+	assert.NotNil(trafficMap[fooSvcNodeId].Metadata[graph.HasVS])
+	assert.IsType(graph.VirtualServicesMetadata{}, trafficMap[fooSvcNodeId].Metadata[graph.HasVS])
+	assert.Len(trafficMap[fooSvcNodeId].Metadata[graph.HasVS], 1)
+	assert.Len(trafficMap[fooSvcNodeId].Metadata[graph.HasVS].(graph.VirtualServicesMetadata)["vService-1"], 1)
+	assert.Equal("ratings", trafficMap[fooSvcNodeId].Metadata[graph.HasVS].(graph.VirtualServicesMetadata)["vService-1"][0])
+}
+
+func TestVSWithRoutingBadges(t *testing.T) {
+	assert := assert.New(t)
+	conf := config.NewConfig()
+	conf.KubernetesConfig.ClusterName = config.DefaultClusterID
+	conf.ExternalServices.Istio.IstioAPIEnabled = false
+	config.Set(conf)
+
+	vService := &networking_v1.VirtualService{}
+	vService.Name = "vService-1"
+	vService.Namespace = "testNamespace"
+	vService.Spec.Hosts = []string{"ratings"}
+	vService.Spec.Http = []*api_networking_v1.HTTPRoute{
+		{
+			Route: []*api_networking_v1.HTTPRouteDestination{
+				{
+					Destination: &api_networking_v1.Destination{
+						Host: "foo",
+					},
+					Weight: 20,
+				},
+				{
+					Destination: &api_networking_v1.Destination{
+						Host: "bar",
+					},
+					Weight: 80,
+				},
+			},
+		},
+	}
+
+	k8s := kubetest.NewFakeK8sClient(vService, kubetest.FakeNamespace("testNamespace"))
+	businessLayer := business.NewLayerBuilder(t, conf).WithClient(k8s).Build()
+	trafficMap, _, _, _, _, _, fooSvcNodeId, _ := setupTrafficMap()
+
+	assert.Equal(nil, trafficMap[fooSvcNodeId].Metadata[graph.HasVS])
+	assert.Equal(nil, trafficMap[fooSvcNodeId].Metadata[graph.HasTrafficShifting])
+	assert.Equal(nil, trafficMap[fooSvcNodeId].Metadata[graph.HasRequestRouting])
+
+	globalInfo := graph.NewGlobalInfo(businessLayer, nil, config.Get(), []models.KubeCluster{}, NewGlobalIstioInfo())
+	globalInfo.Clusters = []models.KubeCluster{{Name: config.DefaultClusterID}}
+	namespaceInfo := NewAppenderNamespaceInfo("testNamespace")
+
+	a := IstioAppender{
+		AccessibleNamespaces: graph.AccessibleNamespaces{
+			graph.GetClusterSensitiveKey(config.DefaultClusterID, "testNamespace"): {Cluster: config.DefaultClusterID, Name: "testNamespace"},
+		},
+	}
+	a.AppendGraph(context.Background(), trafficMap, globalInfo, namespaceInfo)
+
+	assert.Equal(true, trafficMap[fooSvcNodeId].Metadata[graph.HasTrafficShifting])
+}
+
+func TestSEInAppBox(t *testing.T) {
+	check := assert.New(t)
+	conf := config.NewConfig()
+	conf.KubernetesConfig.ClusterName = config.DefaultClusterID
+	conf.ExternalServices.Istio.IstioAPIEnabled = false
+	config.Set(conf)
+
+	svc := &core_v1.Service{
+		ObjectMeta: meta_v1.ObjectMeta{
+			Name:      "foobar",
+			Namespace: "testNamespace",
+			Labels: map[string]string{
+				"app": "fooApp",
+			},
+		},
+	}
+	k8s := kubetest.NewFakeK8sClient(svc, kubetest.FakeNamespace("testNamespace"))
+	businessLayer := business.NewLayerBuilder(t, conf).WithClient(k8s).Build()
+
+	trafficMap := graph.NewTrafficMap()
+	serviceEntryNode, _ := graph.NewNode(config.DefaultClusterID, "testNamespace", "ratings", "", "", "", "", graph.GraphTypeVersionedApp)
+	serviceEntryNode.Metadata[graph.IsServiceEntry] = &graph.SEInfo{
+		Hosts:     []string{"foobar.com"},
+		Location:  "MESH_INTERNAL",
+		Namespace: "testNamespace",
+	}
+	trafficMap[serviceEntryNode.ID] = serviceEntryNode
+
+	globalInfo := graph.NewGlobalInfo(businessLayer, nil, config.Get(), []models.KubeCluster{}, NewGlobalIstioInfo())
+	globalInfo.Clusters = []models.KubeCluster{{Name: config.DefaultClusterID}}
+	namespaceInfo := NewAppenderNamespaceInfo("testNamespace")
+
+	a := IstioAppender{
+		AccessibleNamespaces: graph.AccessibleNamespaces{
+			graph.GetClusterSensitiveKey(config.DefaultClusterID, "testNamespace"): {Cluster: config.DefaultClusterID, Name: "testNamespace"},
+		},
+	}
+	a.AppendGraph(context.Background(), trafficMap, globalInfo, namespaceInfo)
+
+	check.Equal("fooApp", trafficMap[serviceEntryNode.ID].App)
+}
+
+// TestSkipsClustersWithoutUserClient ensures the appender skips clusters the
+// requesting user has no client for (no session on that cluster) instead of
+// failing the whole graph: globalInfo.Clusters spans every Kiali-visible
+// cluster, but the business layer only holds user clients for the session's
+// clusters, and the cluster-wide fetches error on a missing client.
+func TestSkipsClustersWithoutUserClient(t *testing.T) {
+	assert := assert.New(t)
+	conf := config.NewConfig()
+	conf.KubernetesConfig.ClusterName = config.DefaultClusterID
+	conf.ExternalServices.Istio.IstioAPIEnabled = false
+	config.Set(conf)
+
+	k8s := kubetest.NewFakeK8sClient(kubetest.FakeNamespace("testNamespace"))
+	businessLayer := business.NewLayerBuilder(t, conf).WithClient(k8s).Build()
+	trafficMap, _, _, _, _, _, _, _ := setupTrafficMap()
+
+	globalInfo := graph.NewGlobalInfo(businessLayer, nil, config.Get(), []models.KubeCluster{}, NewGlobalIstioInfo())
+	// Two discovery clusters; the user only has a session (user client) on the home cluster.
+	globalInfo.Clusters = []models.KubeCluster{{Name: config.DefaultClusterID}, {Name: "remote-cluster"}}
+	namespaceInfo := NewAppenderNamespaceInfo("testNamespace")
+
+	a := IstioAppender{
+		AccessibleNamespaces: graph.AccessibleNamespaces{
+			graph.GetClusterSensitiveKey(config.DefaultClusterID, "testNamespace"): {Cluster: config.DefaultClusterID, Name: "testNamespace"},
+		},
+	}
+
+	// Must not panic: the unguarded appender fails here via CheckError on the remote cluster.
+	assert.NotPanics(func() {
+		a.AppendGraph(context.Background(), trafficMap, globalInfo, namespaceInfo)
+	})
+
+	// The accessible cluster's fetches ran; the inaccessible cluster contributed nothing.
+	assert.Contains(globalInfo.Vendor.ClusterServiceLists, config.DefaultClusterID)
+	assert.NotContains(globalInfo.Vendor.ClusterServiceLists, "remote-cluster")
+}
+
+func TestDecorateGatewaysSkipsWaypointGatewayClass(t *testing.T) {
+	ctx := context.Background()
+	cluster := config.DefaultClusterID
+	namespace := "waypoint-forservice"
+	workloadName := "waypoint"
+
+	node, err := graph.NewNode(cluster, namespace, "echo", namespace, workloadName, "echo", "v1", graph.GraphTypeWorkload)
+	assert.NoError(t, err)
+	node.Metadata[graph.IsWaypoint] = true
+
+	workloadMap := map[graph.NodeKey]*graph.Node{
+		{Cluster: cluster, Namespace: namespace, Name: workloadName}: node,
+	}
+	gwWorkloads := []gatewayWorkload{
+		{
+			Cluster:   cluster,
+			Namespace: namespace,
+			Name:      workloadName,
+			Labels: map[string]string{
+				config.GatewayLabel:  "waypoint",
+				config.WaypointLabel: config.WaypointLabelValue,
+			},
+		},
+	}
+
+	waypointGW := &k8s_networking_v1.Gateway{
+		ObjectMeta: meta_v1.ObjectMeta{Name: "waypoint", Namespace: namespace},
+		Spec: k8s_networking_v1.GatewaySpec{
+			GatewayClassName: "istio-waypoint",
+		},
+	}
+
+	decorateGateways(ctx, gwWorkloads, workloadMap, nil, []*k8s_networking_v1.Gateway{waypointGW})
+	assert.Nil(t, node.Metadata[graph.IsGatewayAPI])
+
+	ingressGW := &k8s_networking_v1.Gateway{
+		ObjectMeta: meta_v1.ObjectMeta{Name: "ingress", Namespace: namespace},
+		Spec: k8s_networking_v1.GatewaySpec{
+			GatewayClassName: "istio",
+		},
+	}
+	gwWorkloads[0].Labels = map[string]string{config.GatewayLabel: "ingress"}
+	gwWorkloads[0].Name = "ingress-workload"
+	node, err = graph.NewNode(cluster, namespace, "echo", namespace, "ingress-workload", "echo", "v1", graph.GraphTypeWorkload)
+	assert.NoError(t, err)
+	workloadMap = map[graph.NodeKey]*graph.Node{
+		{Cluster: cluster, Namespace: namespace, Name: "ingress-workload"}: node,
+	}
+
+	decorateGateways(ctx, gwWorkloads, workloadMap, nil, []*k8s_networking_v1.Gateway{ingressGW})
+	assert.NotNil(t, node.Metadata[graph.IsGatewayAPI])
 }

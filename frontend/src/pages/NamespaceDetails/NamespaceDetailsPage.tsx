@@ -1,0 +1,449 @@
+import * as React from 'react';
+import { connect } from 'react-redux';
+import type { DispatchProp } from 'react-redux';
+import { Tab, Title, TitleSizes, TooltipPosition } from '@patternfly/react-core';
+import type { KialiAppState } from 'store/Store';
+import { durationSelector, meshWideMTLSStatusSelector, refreshIntervalSelector } from 'store/Selectors';
+import type { DurationInSeconds, IntervalInMilliseconds, TimeInMilliseconds } from 'types/Common';
+import type { NamespaceInfo } from 'types/NamespaceInfo';
+import { PromisesRegistry } from 'utils/CancelablePromises';
+import * as API from 'services/Api';
+import { addError, addSuccess } from 'utils/AlertUtils';
+import { buildMetadataPatch } from '../PageUtils';
+import { ParameterizedTabs, activeTab } from 'components/Tab/Tabs';
+import { RenderHeader } from 'components/Nav/Page/RenderHeader';
+import { ErrorSection } from 'components/ErrorSection/ErrorSection';
+import type { ErrorMsg } from 'types/ErrorMsg';
+import { connectRefresh } from 'components/Refresh/connectRefresh';
+import { HistoryManager } from 'app/History';
+import { basicTabStyle } from 'styles/TabStyles';
+import type { Namespace } from 'types/Namespace';
+import { MTLSStatuses } from 'types/TLSStatus';
+import type { TLSStatus } from 'types/TLSStatus';
+import type { ValidationStatus } from 'types/IstioObjects';
+import type { IstioConfigList } from 'types/IstioConfigList';
+import { fetchClusterNamespacesHealth } from 'services/NamespaceHealth';
+import { NamespaceDetailsOverview } from './NamespaceDetailsOverview';
+import { NamespaceActions } from 'pages/Namespaces/NamespaceActions';
+import { healthComputeDurationValidSeconds } from 'utils/HealthComputeDuration';
+import { buildNamespaceRowActions } from './namespaceDetailActions';
+import { NamespaceTrafficPolicies } from 'pages/Namespaces/NamespaceTrafficPolicies';
+import type { ControlPlane } from 'types/Mesh';
+import { IstioDashboardsDropdownLoader } from 'components/IstioDashboards/IstioDashboardsDropdown';
+import { hasIstioExternalDashboards } from 'utils/IstioDashboardUtils';
+import { setControlPlaneRevisions } from 'pages/Namespaces/NamespaceRevisionUtils';
+import { PFBadge, PFBadges } from 'components/Pf/PfBadges';
+import { TimeControl } from 'components/Time/TimeControl';
+import { detailPageTitleStyle, detailTitleRowStyle, detailTitleMainStyle } from 'styles/FlexStyles';
+import { RefreshIntervalManual } from 'config/Config';
+import { serverConfig } from 'config/ServerConfig';
+import { t } from 'utils/I18nUtils';
+import { clearChatResourceHealth, publishChatResourceHealth } from 'components/ChatBot/resourceHealth';
+import type { HealthStatusId } from 'types/Health';
+
+type ReduxProps = {
+  duration: DurationInSeconds;
+  istioAPIEnabled: boolean;
+  meshStatus: string;
+  refreshInterval: IntervalInMilliseconds;
+};
+
+type NamespaceDetailsPageProps = ReduxProps &
+  DispatchProp & {
+    lastRefreshAt: TimeInMilliseconds;
+    namespace: string;
+  };
+
+type State = {
+  cluster?: string;
+  clusterTarget?: string;
+  controlPlanes?: ControlPlane[];
+  currentTab: string;
+  error?: ErrorMsg;
+  kind: string;
+  nsInfo?: NamespaceInfo;
+  nsTarget: string;
+  opTarget: string;
+  showTrafficPoliciesModal: boolean;
+};
+
+const tabName = 'tab';
+const defaultTab = 'info';
+
+const tabIndex: { [tab: string]: number } = {
+  info: 0
+};
+
+export class NamespaceDetailsPageComponent extends React.Component<NamespaceDetailsPageProps, State> {
+  private promises = new PromisesRegistry();
+  private _isMounted = false;
+
+  constructor(props: NamespaceDetailsPageProps) {
+    super(props);
+    this.state = {
+      cluster: HistoryManager.getClusterName(),
+      clusterTarget: '',
+      currentTab: activeTab(tabName, defaultTab),
+      kind: '',
+      nsTarget: '',
+      opTarget: '',
+      showTrafficPoliciesModal: false
+    };
+  }
+
+  componentDidMount(): void {
+    this._isMounted = true;
+    this.fetchControlPlanes();
+    this.load();
+  }
+
+  componentDidUpdate(prevProps: NamespaceDetailsPageProps): void {
+    const cluster = HistoryManager.getClusterName() || this.state.cluster;
+    const currentTab = activeTab(tabName, defaultTab);
+    const mustFetch =
+      cluster !== this.state.cluster ||
+      prevProps.namespace !== this.props.namespace ||
+      prevProps.lastRefreshAt !== this.props.lastRefreshAt ||
+      this.props.duration !== prevProps.duration;
+
+    if (mustFetch || currentTab !== this.state.currentTab) {
+      if (mustFetch || currentTab === 'info') {
+        this.load(cluster)
+          .then(() => {
+            this.setState({ currentTab: currentTab, cluster: cluster });
+          })
+          .catch(() => {
+            /* error state set in load */
+          });
+      } else {
+        this.setState({ currentTab: currentTab, cluster: cluster });
+      }
+    }
+  }
+
+  componentWillUnmount(): void {
+    this._isMounted = false;
+    clearChatResourceHealth(this.props.dispatch);
+    this.promises.cancelAll();
+  }
+
+  render(): React.ReactNode {
+    const ns = this.state.nsInfo;
+    const healthListDuration = healthComputeDurationValidSeconds();
+
+    const namespaceActions = !this.state.error && ns ? this.getNamespaceActions() : [];
+    const hasActions = namespaceActions.some(a => !a.isSeparator);
+    const namespaceActionsDropdown = hasActions ? (
+      <NamespaceActions namespace={this.props.namespace} actions={namespaceActions} toggleVariant="actionsText" />
+    ) : undefined;
+
+    const mayHaveDashboards = hasIstioExternalDashboards();
+    const actionsToolbar =
+      ns?.isControlPlane && (hasActions || mayHaveDashboards) ? (
+        <IstioDashboardsDropdownLoader extra={namespaceActionsDropdown} kind="control-plane" />
+      ) : (
+        namespaceActionsDropdown
+      );
+
+    return (
+      <>
+        <RenderHeader rightToolbar={<TimeControl customDuration={false} />}>
+          {!this.state.error && ns && (
+            <div className={detailTitleRowStyle} data-test="namespace-detail-title-row">
+              <div className={detailTitleMainStyle}>
+                <PFBadge badge={PFBadges.Namespace} position={TooltipPosition.top} />
+                <Title headingLevel="h1" size={TitleSizes.xl} className={detailPageTitleStyle}>
+                  {this.props.namespace}
+                </Title>
+              </div>
+            </div>
+          )}
+        </RenderHeader>
+
+        {this.state.error && <ErrorSection error={this.state.error} />}
+
+        {!this.state.error && ns && (
+          <ParameterizedTabs
+            id="basic-tabs"
+            className={basicTabStyle}
+            actionsToolbar={actionsToolbar}
+            onSelect={tabValue => {
+              this.setState({ currentTab: tabValue });
+            }}
+            tabMap={tabIndex}
+            tabName={tabName}
+            defaultTab={defaultTab}
+            activeTab={this.state.currentTab}
+            mountOnEnter={true}
+            unmountOnExit={true}
+          >
+            <Tab eventKey={0} title={t('Overview')} key="Overview">
+              <NamespaceDetailsOverview
+                canEdit={!serverConfig.deployment.viewOnlyMode}
+                duration={this.props.duration}
+                namespace={this.props.namespace}
+                namespaceActions={namespaceActions}
+                nsInfo={ns}
+                onSaveAnnotations={this.handleSaveAnnotations}
+                onSaveLabels={this.handleSaveLabels}
+              />
+            </Tab>
+          </ParameterizedTabs>
+        )}
+
+        {this.state.nsInfo && (
+          <NamespaceTrafficPolicies
+            opTarget={this.state.opTarget}
+            isOpen={this.state.showTrafficPoliciesModal}
+            controlPlanes={this.state.controlPlanes?.filter(cp =>
+              cp.managedNamespaces?.some(
+                mn =>
+                  mn.name === this.state.nsTarget &&
+                  (!this.state.clusterTarget || mn.cluster === this.state.clusterTarget)
+              )
+            )}
+            kind={this.state.kind}
+            hideConfirmModal={this.handleHideTrafficManagement}
+            nsTarget={this.state.nsTarget}
+            nsInfo={this.state.nsInfo}
+            duration={healthListDuration}
+            load={this.handleChangeAfterPolicy}
+          />
+        )}
+      </>
+    );
+  }
+
+  private fetchControlPlanes = (): void => {
+    API.getControlPlanes()
+      .then(response => {
+        if (!this._isMounted) {
+          return;
+        }
+        const controlPlanes = response.data;
+        setControlPlaneRevisions(new Set(controlPlanes.map(cp => cp.revision)));
+        this.setState({ controlPlanes });
+      })
+      .catch(err => {
+        if (!this._isMounted) {
+          return;
+        }
+        addError(t('Error fetching control planes.'), err);
+      });
+  };
+
+  private handleHideTrafficManagement = (): void => {
+    this.setState({
+      showTrafficPoliciesModal: false,
+      nsTarget: '',
+      clusterTarget: '',
+      opTarget: '',
+      kind: ''
+    });
+  };
+
+  private handleChangeAfterPolicy = (): void => {
+    if (this.props.refreshInterval !== RefreshIntervalManual && HistoryManager.getRefresh() !== RefreshIntervalManual) {
+      this.load();
+    }
+  };
+
+  private resolveNamespaceTlsStatusForDisplay = (status: string): string => {
+    if (status !== MTLSStatuses.UNSET && status !== MTLSStatuses.NOT_ENABLED) {
+      return status;
+    }
+
+    const meshStatus = this.props.meshStatus;
+
+    if (
+      meshStatus === MTLSStatuses.ENABLED ||
+      meshStatus === MTLSStatuses.ENABLED_DEFAULT ||
+      meshStatus === MTLSStatuses.AUTO_DEFAULT
+    ) {
+      return MTLSStatuses.UNSET_INHERITED_STRICT;
+    }
+
+    if (meshStatus === MTLSStatuses.PARTIALLY || meshStatus === MTLSStatuses.PARTIALLY_DEFAULT) {
+      return MTLSStatuses.UNSET_INHERITED_PERMISSIVE;
+    }
+
+    if (meshStatus === MTLSStatuses.DISABLED) {
+      return MTLSStatuses.UNSET_INHERITED_DISABLED;
+    }
+
+    return MTLSStatuses.UNSET_INHERITED_PERMISSIVE;
+  };
+
+  private namespaceToInfo = (ns: Namespace, cluster?: string): NamespaceInfo => ({
+    annotations: ns.annotations,
+    cluster: ns.cluster ?? cluster,
+    isAmbient: ns.isAmbient,
+    isControlPlane: ns.isControlPlane,
+    labels: ns.labels,
+    name: ns.name,
+    revision: ns.revision
+  });
+
+  private buildIstioConfigForNamespace = (istioConfig: IstioConfigList, targetNamespace: string): IstioConfigList => {
+    const filtered: IstioConfigList = {
+      permissions: istioConfig.permissions || {},
+      resources: {},
+      validations: istioConfig.validations || {}
+    };
+
+    Object.entries(istioConfig.resources || {}).forEach(([key, list]) => {
+      if (!Array.isArray(list)) {
+        return;
+      }
+      const inNs = list.filter(o => o.metadata?.namespace === targetNamespace);
+      if (inNs.length > 0) {
+        filtered.resources[key] = inNs;
+      }
+    });
+
+    return filtered;
+  };
+
+  private enrichNamespaceInfo = async (nsInfo: NamespaceInfo, cluster?: string): Promise<void> => {
+    const name = nsInfo.name;
+
+    const [healthMap, tlsResponse, validationResponse, istioAllResponse] = await Promise.all([
+      fetchClusterNamespacesHealth([name], cluster, this.props.duration).catch(() => new Map()),
+      API.getClustersTls(name, cluster).catch(() => ({ data: [] as TLSStatus[] })),
+      API.getConfigValidations(name, cluster).catch(() => ({ data: [] as ValidationStatus[] })),
+      API.getIstioConfig(name, [], false, '', '', cluster).catch(() => ({
+        data: { permissions: {}, resources: {}, validations: {} } as IstioConfigList
+      }))
+    ]);
+
+    const nsHealth = healthMap.get(name);
+    if (nsHealth) {
+      nsInfo.statusApp = nsHealth.statusApp;
+      nsInfo.statusService = nsHealth.statusService;
+      nsInfo.statusWorkload = nsHealth.statusWorkload;
+      nsInfo.worstStatus = nsHealth.worstStatus;
+    }
+
+    tlsResponse.data.forEach(tls => {
+      if (tls.namespace === name && (!cluster || tls.cluster === cluster || !tls.cluster)) {
+        nsInfo.tlsStatus = {
+          status: this.resolveNamespaceTlsStatusForDisplay(tls.status),
+          autoMTLSEnabled: tls.autoMTLSEnabled,
+          minTLS: tls.minTLS
+        };
+      }
+    });
+
+    validationResponse.data.forEach(v => {
+      if (v.namespace === name && (!cluster || !v.cluster || v.cluster === cluster)) {
+        nsInfo.validations = v;
+      }
+    });
+
+    nsInfo.istioConfig = this.buildIstioConfigForNamespace(istioAllResponse.data, name);
+  };
+
+  private load = async (cluster?: string): Promise<void> => {
+    if (!cluster) {
+      cluster = this.state.cluster;
+    }
+
+    this.promises.cancelAll();
+
+    return this.promises
+      .register(
+        'namespaceDetail',
+        API.getNamespaceInfo(this.props.namespace, cluster).then(async infoResp => {
+          const base = this.namespaceToInfo(infoResp.data, cluster);
+          const effectiveCluster = base.cluster ?? cluster;
+
+          await this.enrichNamespaceInfo(base, effectiveCluster);
+
+          if (!this._isMounted) {
+            return;
+          }
+
+          publishChatResourceHealth(this.props.dispatch, {
+            clusterName: effectiveCluster,
+            namespace: base.name,
+            resourceKind: 'namespace',
+            resourceName: base.name,
+            status: base.worstStatus as HealthStatusId
+          });
+
+          this.setState({
+            nsInfo: base,
+            error: undefined,
+            cluster: effectiveCluster
+          });
+        })
+      )
+      .catch(error => {
+        if (error?.isCanceled || !this._isMounted) {
+          return;
+        }
+        clearChatResourceHealth(this.props.dispatch);
+        addError(t('Could not fetch Namespace.'), error);
+        this.setState({
+          error: {
+            title: t('Namespace not found'),
+            description: t('{{namespace}} is not available or could not be loaded', { namespace: this.props.namespace })
+          },
+          nsInfo: undefined
+        });
+      });
+  };
+
+  private getNamespaceActions = (): ReturnType<typeof buildNamespaceRowActions> => {
+    if (!this.state.nsInfo) {
+      return [];
+    }
+    return buildNamespaceRowActions({
+      controlPlanes: this.state.controlPlanes,
+      istioAPIEnabled: this.props.istioAPIEnabled,
+      nsInfo: this.state.nsInfo,
+      onOpenTrafficPoliciesModal: p =>
+        this.setState({
+          showTrafficPoliciesModal: true,
+          nsTarget: p.nsTarget,
+          clusterTarget: p.clusterTarget ?? '',
+          opTarget: p.opTarget,
+          kind: p.kind
+        })
+    });
+  };
+
+  private handleSaveMetadata = (field: 'labels' | 'annotations', updated: Record<string, string>): void => {
+    const original = (field === 'labels' ? this.state.nsInfo?.labels : this.state.nsInfo?.annotations) ?? {};
+    const jsonPatch = buildMetadataPatch(field, original, updated);
+
+    API.updateNamespace(this.props.namespace, jsonPatch, this.state.cluster)
+      .then(() => {
+        addSuccess(t('Namespace {{namespace}} {{field}} updated', { namespace: this.props.namespace, field }));
+        this.load();
+      })
+      .catch(error => {
+        addError(
+          t('Could not update namespace {{namespace}} {{field}}', { namespace: this.props.namespace, field }),
+          error
+        );
+      });
+  };
+
+  private handleSaveLabels = (labels: Record<string, string>): void => {
+    this.handleSaveMetadata('labels', labels);
+  };
+
+  private handleSaveAnnotations = (annotations: Record<string, string>): void => {
+    this.handleSaveMetadata('annotations', annotations);
+  };
+}
+
+const mapStateToProps = (state: KialiAppState): ReduxProps => ({
+  duration: durationSelector(state),
+  istioAPIEnabled: state.statusState.istioEnvironment.istioAPIEnabled,
+  meshStatus: meshWideMTLSStatusSelector(state),
+  refreshInterval: refreshIntervalSelector(state)
+});
+
+export const NamespaceDetailsPage = connectRefresh(connect(mapStateToProps)(NamespaceDetailsPageComponent));

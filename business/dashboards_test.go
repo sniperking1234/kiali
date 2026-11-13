@@ -1,40 +1,50 @@
 package business
 
 import (
-	"errors"
+	"context"
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
-	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/tools/clientcmd/api"
+	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
 
 	"github.com/kiali/kiali/config"
-	kmock "github.com/kiali/kiali/kubernetes/monitoringdashboards/mock"
-	"github.com/kiali/kiali/kubernetes/monitoringdashboards/v1alpha1"
+	"github.com/kiali/kiali/config/dashboards"
+	"github.com/kiali/kiali/grafana"
+	"github.com/kiali/kiali/kubernetes"
+	"github.com/kiali/kiali/kubernetes/kubetest"
 	"github.com/kiali/kiali/models"
+	"github.com/kiali/kiali/prometheus"
 	pmock "github.com/kiali/kiali/prometheus/prometheustest"
 )
 
-func setupService() (*DashboardsService, *kmock.ClientMock, *pmock.PromClientMock) {
-	config.Set(config.NewConfig())
-	k8s := new(kmock.ClientMock)
+func setupService(t testing.TB, conf *config.Config, namespace string, dashboards []dashboards.MonitoringDashboard) (*DashboardsService, *pmock.PromClientMock) {
+	t.Helper()
+	for _, d := range dashboards {
+		conf.CustomDashboards = append(conf.CustomDashboards, d)
+	}
 	prom := new(pmock.PromClientMock)
-	service := NewDashboardsService()
-	service.k8sClient = k8s
-	service.promClient = prom
-	return service, k8s, prom
+	ns := models.Namespace{Name: namespace}
+	grafanaSvc, err := grafana.NewService(conf, kubetest.NewFakeK8sClient())
+	require.NoError(t, err)
+	service := NewDashboardsService(conf, grafanaSvc, prom, &ns, nil)
+	return service, prom
 }
 
 func TestGetDashboard(t *testing.T) {
 	assert := assert.New(t)
 
 	// Setup mocks
-	service, k8s, prom := setupService()
-	k8s.On("GetDashboard", "my-namespace", "dashboard1").Return(fakeDashboard("1"), nil)
+	service, prom := setupService(t, config.NewConfig(), "my-namespace", []dashboards.MonitoringDashboard{*fakeDashboard("1")})
+	service.promConfig.QueryScope = map[string]string{"mesh_id": "mesh1"}
 
-	expectedLabels := "{kubernetes_namespace=\"my-namespace\",APP=\"my-app\"}"
+	expectedLabels := `{namespace="my-namespace",APP="my-app",mesh_id="mesh1"}`
+	namespace := models.Namespace{
+		Name: "my-namespace",
+	}
 	query := models.DashboardQuery{
-		Namespace: "my-namespace",
+		Namespace: namespace.Name,
 		LabelsFilters: map[string]string{
 			"APP": "my-app",
 		},
@@ -46,13 +56,12 @@ func TestGetDashboard(t *testing.T) {
 		},
 	}
 	query.FillDefaults()
-	prom.MockMetric("my_metric_1_1", expectedLabels, &query.RangeQuery, 10)
-	prom.MockHistogram("my_metric_1_2", expectedLabels, &query.RangeQuery, 11, 12)
+	prom.MockMetric(context.Background(), "my_metric_1_1", expectedLabels, &query.RangeQuery, 10)
+	prom.MockHistogram(context.Background(), "my_metric_1_2", expectedLabels, &query.RangeQuery, 11, 12)
 
-	dashboard, err := service.GetDashboard(&api.AuthInfo{Token: ""}, query, "dashboard1")
+	dashboard, err := service.GetDashboard(context.Background(), query, "dashboard1")
 
 	assert.Nil(err)
-	k8s.AssertNumberOfCalls(t, "GetDashboard", 1)
 	assert.Equal("Dashboard 1", dashboard.Title)
 	assert.Len(dashboard.Aggregations, 3)
 	assert.Len(dashboard.Charts, 2)
@@ -69,26 +78,137 @@ func TestGetDashboard(t *testing.T) {
 func TestGetDashboardFromKialiNamespace(t *testing.T) {
 	assert := assert.New(t)
 
-	// Setup mocks
-	service, k8s, prom := setupService()
-	k8s.On("GetDashboard", "my-namespace", "dashboard1").Return(nil, errors.New("denied"))
-	k8s.On("GetDashboard", "istio-system", "dashboard1").Return(fakeDashboard("1"), nil)
+	conf := config.NewConfig()
+	config.Set(conf)
+	// allows GetDashboard to get the SA client under the covers
+	kubernetes.NewTestingClientFactory(t, conf)
 
-	expectedLabels := "{kubernetes_namespace=\"my-namespace\",APP=\"my-app\"}"
+	// Setup mocks
+	service, prom := setupService(t, conf, "my-namespace", []dashboards.MonitoringDashboard{*fakeDashboard("1")})
+
+	expectedLabels := "{namespace=\"my-namespace\",APP=\"my-app\"}"
+	namespace := models.Namespace{
+		Name: "my-namespace",
+	}
 	query := models.DashboardQuery{
-		Namespace: "my-namespace",
+		Namespace: namespace.Name,
 		LabelsFilters: map[string]string{
 			"APP": "my-app",
 		},
 	}
 	query.FillDefaults()
-	prom.MockMetric("my_metric_1_1", expectedLabels, &query.RangeQuery, 10)
-	prom.MockHistogram("my_metric_1_2", expectedLabels, &query.RangeQuery, 11, 12)
+	prom.MockMetric(context.Background(), "my_metric_1_1", expectedLabels, &query.RangeQuery, 10)
+	prom.MockHistogram(context.Background(), "my_metric_1_2", expectedLabels, &query.RangeQuery, 11, 12)
 
-	dashboard, err := service.GetDashboard(&api.AuthInfo{Token: ""}, query, "dashboard1")
+	dashboard, err := service.GetDashboard(context.Background(), query, "dashboard1")
 
 	assert.Nil(err)
-	k8s.AssertNumberOfCalls(t, "GetDashboard", 2)
+	assert.Equal("Dashboard 1", dashboard.Title)
+}
+
+func TestGetDashboardEnsuresMissingDisplayNameMetrics(t *testing.T) {
+	assert := assert.New(t)
+
+	dashboardDef := &dashboards.MonitoringDashboard{
+		Name:  "envoy-memory",
+		Title: "Envoy Memory",
+		Items: []dashboards.MonitoringDashboardItem{
+			{
+				Chart: dashboards.MonitoringDashboardChart{
+					Name:     "Request rate",
+					Spans:    6,
+					Unit:     "rps",
+					DataType: dashboards.Rate,
+					Metrics: []dashboards.MonitoringDashboardMetric{
+						{
+							DisplayName:            "Upstream",
+							MetricName:             "istio_requests_total",
+							IstioMetricLabelPrefix: "source",
+							LabelRegexps:           map[string]string{"reporter": "source|waypoint"},
+						},
+						{
+							DisplayName:            "Downstream",
+							MetricName:             "istio_requests_total",
+							IstioMetricLabelPrefix: "destination",
+							Labels:                 map[string]string{"reporter": "destination"},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	conf := config.NewConfig()
+	conf.CustomDashboards = append(conf.CustomDashboards, *dashboardDef)
+	workload := &models.Workload{
+		WorkloadListItem: models.WorkloadListItem{
+			Name:      "productpage-v1",
+			Namespace: "bookinfo",
+			Labels:    map[string]string{"app": "productpage", "version": "v1"},
+		},
+	}
+	prom := new(pmock.PromClientMock)
+	ns := models.Namespace{Name: "bookinfo"}
+	grafanaSvc, err := grafana.NewService(conf, kubetest.NewFakeK8sClient())
+	require.NoError(t, err)
+	service := NewDashboardsService(conf, grafanaSvc, prom, &ns, workload)
+
+	expectedLabelsUpstream := `{source_workload_namespace="bookinfo",source_workload="productpage-v1",reporter=~"source|waypoint"}`
+	expectedLabelsDownstream := `{destination_workload_namespace="bookinfo",destination_workload="productpage-v1",reporter="destination"}`
+	query := models.DashboardQuery{
+		Namespace: "bookinfo",
+		LabelsFilters: map[string]string{
+			"app": "productpage",
+		},
+	}
+	query.FillDefaults()
+	prom.MockMetric(context.Background(), "istio_requests_total", expectedLabelsUpstream, &query.RangeQuery, 2.5)
+	prom.On("FetchRateRange", mock.Anything, "istio_requests_total", []string{expectedLabelsDownstream}, "", &query.RangeQuery).
+		Return(prometheus.Metric{})
+
+	dashboard, err := service.GetDashboard(context.Background(), query, "envoy-memory")
+
+	assert.NoError(err)
+	assert.Len(dashboard.Charts, 1)
+	assert.Len(dashboard.Charts[0].Metrics, 2)
+
+	names := []string{dashboard.Charts[0].Metrics[0].Name, dashboard.Charts[0].Metrics[1].Name}
+	assert.Contains(names, "Upstream")
+	assert.Contains(names, "Downstream")
+}
+
+func TestGetDashboardUsesLabelsFiltersEvenWithWorkload(t *testing.T) {
+	assert := assert.New(t)
+
+	conf := config.NewConfig()
+	conf.CustomDashboards = append(conf.CustomDashboards, *fakeDashboard("1"))
+	workload := &models.Workload{
+		WorkloadListItem: models.WorkloadListItem{
+			Name:      "waypoint-abc",
+			Namespace: "bookinfo",
+			Labels:    map[string]string{"gateway.networking.k8s.io/gateway-name": "waypoint"},
+		},
+	}
+	prom := new(pmock.PromClientMock)
+	ns := models.Namespace{Name: "bookinfo"}
+	grafanaSvc, err := grafana.NewService(conf, kubetest.NewFakeK8sClient())
+	require.NoError(t, err)
+	service := NewDashboardsService(conf, grafanaSvc, prom, &ns, workload)
+
+	expectedLabels := `{namespace="bookinfo",app="my-app"}`
+	query := models.DashboardQuery{
+		Namespace: "bookinfo",
+		LabelsFilters: map[string]string{
+			"app": "my-app",
+		},
+	}
+	query.FillDefaults()
+	prom.MockMetric(context.Background(), "my_metric_1_1", expectedLabels, &query.RangeQuery, 10)
+	prom.MockHistogram(context.Background(), "my_metric_1_2", expectedLabels, &query.RangeQuery, 11, 12)
+
+	dashboard, err := service.GetDashboard(context.Background(), query, "dashboard1")
+
+	assert.Nil(err)
 	assert.Equal("Dashboard 1", dashboard.Title)
 }
 
@@ -96,58 +216,50 @@ func TestGetComposedDashboard(t *testing.T) {
 	assert := assert.New(t)
 
 	composed := fakeDashboard("2")
-	composed.Spec.Items = append(composed.Spec.Items, v1alpha1.MonitoringDashboardItem{Include: "dashboard1"})
+	composed.Items = append(composed.Items, dashboards.MonitoringDashboardItem{Include: "dashboard1"})
 
 	// Setup mocks
-	service, k8s, _ := setupService()
-	k8s.On("GetDashboard", "my-namespace", "dashboard1").Return(fakeDashboard("1"), nil)
-	k8s.On("GetDashboard", "my-namespace", "dashboard2").Return(composed, nil)
+	service, _ := setupService(t, config.NewConfig(), "my-namespace", []dashboards.MonitoringDashboard{*fakeDashboard("1"), *composed})
 
-	d, err := service.loadAndResolveDashboardResource("my-namespace", "dashboard2", map[string]bool{})
+	d, err := service.loadAndResolveDashboardResource("dashboard2", map[string]bool{})
 	assert.Nil(err)
-	k8s.AssertNumberOfCalls(t, "GetDashboard", 2)
-	assert.Equal("Dashboard 2", d.Spec.Title)
-	assert.Len(d.Spec.Items, 4)
-	assert.Equal("My chart 2_1", d.Spec.Items[0].Chart.Name)
-	assert.Equal("My chart 2_2", d.Spec.Items[1].Chart.Name)
-	assert.Equal("My chart 1_1", d.Spec.Items[2].Chart.Name)
-	assert.Equal("My chart 1_2", d.Spec.Items[3].Chart.Name)
+	assert.Equal("Dashboard 2", d.Title)
+	assert.Len(d.Items, 4)
+	assert.Equal("My chart 2_1", d.Items[0].Chart.Name)
+	assert.Equal("My chart 2_2", d.Items[1].Chart.Name)
+	assert.Equal("My chart 1_1", d.Items[2].Chart.Name)
+	assert.Equal("My chart 1_2", d.Items[3].Chart.Name)
 }
 
 func TestGetComposedDashboardSingleChart(t *testing.T) {
 	assert := assert.New(t)
 
 	composed := fakeDashboard("2")
-	composed.Spec.Items = append(composed.Spec.Items, v1alpha1.MonitoringDashboardItem{Include: "dashboard1$My chart 1_2"})
+	composed.Items = append(composed.Items, dashboards.MonitoringDashboardItem{Include: "dashboard1$My chart 1_2"})
 
 	// Setup mocks
-	service, k8s, _ := setupService()
-	k8s.On("GetDashboard", "my-namespace", "dashboard1").Return(fakeDashboard("1"), nil)
-	k8s.On("GetDashboard", "my-namespace", "dashboard2").Return(composed, nil)
+	service, _ := setupService(t, config.NewConfig(), "my-namespace", []dashboards.MonitoringDashboard{*fakeDashboard("1"), *composed})
 
-	d, err := service.loadAndResolveDashboardResource("my-namespace", "dashboard2", map[string]bool{})
+	d, err := service.loadAndResolveDashboardResource("dashboard2", map[string]bool{})
 	assert.Nil(err)
-	k8s.AssertNumberOfCalls(t, "GetDashboard", 2)
-	assert.Equal("Dashboard 2", d.Spec.Title)
-	assert.Len(d.Spec.Items, 3)
-	assert.Equal("My chart 2_1", d.Spec.Items[0].Chart.Name)
-	assert.Equal("My chart 2_2", d.Spec.Items[1].Chart.Name)
-	assert.Equal("My chart 1_2", d.Spec.Items[2].Chart.Name)
+	assert.Equal("Dashboard 2", d.Title)
+	assert.Len(d.Items, 3)
+	assert.Equal("My chart 2_1", d.Items[0].Chart.Name)
+	assert.Equal("My chart 2_2", d.Items[1].Chart.Name)
+	assert.Equal("My chart 1_2", d.Items[2].Chart.Name)
 }
 
 func TestCircularDependency(t *testing.T) {
 	assert := assert.New(t)
 
 	composed := fakeDashboard("2")
-	composed.Spec.Items = append(composed.Spec.Items, v1alpha1.MonitoringDashboardItem{Include: "dashboard2"})
+	composed.Items = append(composed.Items, dashboards.MonitoringDashboardItem{Include: "dashboard2"})
 
 	// Setup mocks
-	service, k8s, _ := setupService()
-	k8s.On("GetDashboard", "my-namespace", "dashboard2").Return(composed, nil)
+	service, _ := setupService(t, config.NewConfig(), "my-namespace", []dashboards.MonitoringDashboard{*fakeDashboard("2"), *composed})
 
-	_, err := service.loadAndResolveDashboardResource("my-namespace", "dashboard2", map[string]bool{})
+	_, err := service.loadAndResolveDashboardResource("dashboard2", map[string]bool{})
 	assert.Contains(err.Error(), "circular dependency detected")
-	k8s.AssertNumberOfCalls(t, "GetDashboard", 1)
 }
 
 func TestDiscoveryMatcher(t *testing.T) {
@@ -157,7 +269,7 @@ func TestDiscoveryMatcher(t *testing.T) {
 	d2 := fakeDashboard("2")
 	d3 := fakeDashboard("3")
 
-	dashboards := make(map[string]v1alpha1.MonitoringDashboard)
+	dashboards := make(map[string]dashboards.MonitoringDashboard)
 	dashboards[d1.Name] = *d1
 	dashboards[d2.Name] = *d2
 	dashboards[d3.Name] = *d3
@@ -185,10 +297,10 @@ func TestDiscoveryMatcherWithComposition(t *testing.T) {
 
 	d1 := fakeDashboard("1")
 	d2 := fakeDashboard("2")
-	d2.Spec.Items = append(d2.Spec.Items, v1alpha1.MonitoringDashboardItem{Include: d1.Name})
+	d2.Items = append(d2.Items, dashboards.MonitoringDashboardItem{Include: d1.Name})
 	d3 := fakeDashboard("3")
 
-	dashboards := make(map[string]v1alpha1.MonitoringDashboard)
+	dashboards := make(map[string]dashboards.MonitoringDashboard)
 	dashboards[d1.Name] = *d1
 	dashboards[d2.Name] = *d2
 	dashboards[d3.Name] = *d3
@@ -211,19 +323,18 @@ func TestDiscoveryMatcherWithComposition(t *testing.T) {
 
 func TestGetCustomDashboardRefs(t *testing.T) {
 	assert := assert.New(t)
+	conf := config.NewConfig()
+	conf.IstioLabels.AppLabelName = "app"
+	conf.IstioLabels.VersionLabelName = "version"
 
 	// Setup mocks
-	service, k8s, prom := setupService()
-	d1 := fakeDashboard("1")
-	d2 := fakeDashboard("2")
-	k8s.On("GetDashboards", "my-namespace").Return([]v1alpha1.MonitoringDashboard{}, nil)
-	k8s.On("GetDashboards", "istio-system").Return([]v1alpha1.MonitoringDashboard{*d1, *d2}, nil)
-	prom.MockMetricsForLabels([]string{"my_metric_1_1", "request_count", "tcp_received", "tcp_sent"})
+	service, prom := setupService(t, conf, "my-namespace", []dashboards.MonitoringDashboard{*fakeDashboard("1"), *fakeDashboard("2")})
+
+	prom.MockMetricsForLabels(context.Background(), []string{"my_metric_1_1", "request_count", "tcp_received", "tcp_sent"})
 	pods := []*models.Pod{}
 
-	runtimes := service.GetCustomDashboardRefs("my-namespace", "app", "", pods)
+	runtimes := service.GetCustomDashboardRefs(context.Background(), "my-namespace", "app", "", pods)
 
-	k8s.AssertNumberOfCalls(t, "GetDashboards", 2)
 	prom.AssertNumberOfCalls(t, "GetMetricsForLabels", 1)
 	assert.Len(runtimes, 1)
 	assert.Equal("Runtime 1", runtimes[0].Name)
@@ -232,22 +343,35 @@ func TestGetCustomDashboardRefs(t *testing.T) {
 	assert.Equal("Dashboard 1", runtimes[0].DashboardRefs[0].Title)
 }
 
-func fakeDashboard(id string) *v1alpha1.MonitoringDashboard {
-	return &v1alpha1.MonitoringDashboard{
-		ObjectMeta: v1.ObjectMeta{
-			Name: "dashboard" + id,
+func fakeDashboard(id string) *dashboards.MonitoringDashboard {
+	return &dashboards.MonitoringDashboard{
+		Name:       "dashboard" + id,
+		Title:      "Dashboard " + id,
+		Runtime:    "Runtime " + id,
+		DiscoverOn: "my_metric_" + id + "_1",
+		Items: []dashboards.MonitoringDashboardItem{
+			{
+				Chart: fakeChart(id+"_1", dashboards.Rate),
+			},
+			{
+				Chart: fakeChart(id+"_2", dashboards.Histogram),
+			},
 		},
-		Spec: v1alpha1.MonitoringDashboardSpec{
-			Title:      "Dashboard " + id,
-			Runtime:    "Runtime " + id,
-			DiscoverOn: "my_metric_" + id + "_1",
-			Items: []v1alpha1.MonitoringDashboardItem{
-				{
-					Chart: kmock.FakeChart(id+"_1", "rate"),
-				},
-				{
-					Chart: kmock.FakeChart(id+"_2", "histogram"),
-				},
+	}
+}
+
+func fakeChart(id string, dataType string) dashboards.MonitoringDashboardChart {
+	return dashboards.MonitoringDashboardChart{
+		Name:      "My chart " + id,
+		Unit:      "s",
+		UnitScale: 10.0,
+		Spans:     6,
+		Metrics:   []dashboards.MonitoringDashboardMetric{{DisplayName: "My chart " + id, MetricName: "my_metric_" + id}},
+		DataType:  dataType,
+		Aggregations: []dashboards.MonitoringDashboardAggregation{
+			{
+				DisplayName: "Agg " + id,
+				Label:       "agg_" + id,
 			},
 		},
 	}
@@ -258,32 +382,37 @@ func TestBuildIstioDashboard(t *testing.T) {
 
 	// Setup mocks
 	conf := config.NewConfig()
-	config.Set(conf)
-	service := NewDashboardsService()
+	ns := models.Namespace{Name: "my-namespace"}
+	grafanaSvc, err := grafana.NewService(conf, kubetest.NewFakeK8sClient())
+	require.NoError(t, err)
+	prom := new(pmock.PromClientMock)
+	service := NewDashboardsService(conf, grafanaSvc, prom, &ns, nil)
 
 	dashboard := service.BuildIstioDashboard(fakeMetrics(), "inbound")
 
 	assert.Equal("Inbound Metrics", dashboard.Title)
-	assert.Len(dashboard.Aggregations, 7)
+	assert.Len(dashboard.Aggregations, 8)
 	assert.Equal("Local version", dashboard.Aggregations[0].DisplayName)
 	assert.Equal("destination_canonical_revision", dashboard.Aggregations[0].Label)
 	assert.Equal("Remote namespace", dashboard.Aggregations[1].DisplayName)
 	assert.Equal("source_workload_namespace", dashboard.Aggregations[1].Label)
 	assert.Equal("Remote app", dashboard.Aggregations[2].DisplayName)
 	assert.Equal("source_canonical_service", dashboard.Aggregations[2].Label)
-	assert.Len(dashboard.Charts, 8)
+	assert.Len(dashboard.Charts, 12)
 	assert.Equal("Request volume", dashboard.Charts[0].Name)
-	assert.Len(dashboard.Charts[0].Metrics, 1)
 	assert.Equal("Request duration", dashboard.Charts[1].Name)
 	assert.Len(dashboard.Charts[1].Metrics, 2)
-	assert.Equal("TCP sent", dashboard.Charts[7].Name)
+	assert.Equal("Request size", dashboard.Charts[2].Name)
+	assert.Len(dashboard.Charts[2].Metrics, 2)
+	assert.Equal("TCP closed", dashboard.Charts[9].Name)
 	assert.Equal(float64(10), dashboard.Charts[0].Metrics[0].Datapoints[0].Value) // Request volume (request_count)
 	assert.Equal(float64(20), dashboard.Charts[1].Metrics[0].Datapoints[0].Value) // Request duration (request_duration_millis)
-	assert.Equal(float64(13), dashboard.Charts[7].Metrics[0].Datapoints[0].Value) // TCP sent (tcp_sent)
+	assert.Equal(float64(32), dashboard.Charts[9].Metrics[0].Datapoints[0].Value) // TCP closed (tcp_closed)
 	// Absent metrics are not nil
-	assert.Equal("Request throughput", dashboard.Charts[2].Name)
-	assert.NotNil(dashboard.Charts[2].Metrics)
-	assert.Len(dashboard.Charts[2].Metrics, 0)
+	assert.Equal("Response throughput", dashboard.Charts[5].Name)
+	assert.NotNil(dashboard.Charts[5].Metrics)
+	assert.Len(dashboard.Charts[5].Metrics, 0)
+	assert.Equal("Connection Security Policy", dashboard.Aggregations[7].DisplayName)
 }
 
 func fakeCounter(value float64) []models.Metric {
@@ -312,5 +441,297 @@ func fakeMetrics() models.MetricsMap {
 		"request_duration_millis": fakeHistogram(20, 20),
 		"request_size":            fakeHistogram(21, 21),
 		"response_size":           fakeHistogram(22, 22),
+		"tcp_opened":              fakeCounter(31),
+		"tcp_closed":              fakeCounter(32),
 	}
+}
+
+// resetCustomDashboardsPromClient resets the package-level cached custom
+// dashboards Prometheus client so that each test starts with a clean state.
+func resetCustomDashboardsPromClient() {
+	customDashboardsPromClient = nil
+}
+
+// TestGetDashboardUsesCustomDashboardsPromClient verifies that when
+// custom_dashboards.prometheus.url is configured, metric queries for custom
+// dashboards are sent to a separate Prometheus client rather than the main one.
+func TestGetDashboardUsesCustomDashboardsPromClient(t *testing.T) {
+	assert := assert.New(t)
+
+	resetCustomDashboardsPromClient()
+	origFactory := newPromClient
+	t.Cleanup(func() {
+		newPromClient = origFactory
+		resetCustomDashboardsPromClient()
+	})
+
+	customProm := new(pmock.PromClientMock)
+	newPromClient = func(_ config.Config, _ config.PrometheusConfig, _ string) (prometheus.ClientInterface, error) {
+		return customProm, nil
+	}
+
+	conf := config.NewConfig()
+	conf.ExternalServices.CustomDashboards.Enabled = true
+	conf.ExternalServices.Prometheus.URL = "http://prometheus-main:9090"
+	conf.ExternalServices.CustomDashboards.Prometheus.URL = "http://prometheus-custom:9090"
+
+	conf.CustomDashboards = append(conf.CustomDashboards, *fakeDashboard("1"))
+
+	mainProm := new(pmock.PromClientMock)
+
+	ns := models.Namespace{Name: "my-namespace"}
+	grafanaSvc, err := grafana.NewService(conf, kubetest.NewFakeK8sClient())
+	require.NoError(t, err)
+	service := NewDashboardsService(conf, grafanaSvc, mainProm, &ns, nil)
+
+	expectedLabels := `{namespace="my-namespace",APP="my-app"}`
+	query := models.DashboardQuery{
+		Namespace: "my-namespace",
+		LabelsFilters: map[string]string{
+			"APP": "my-app",
+		},
+	}
+	query.FillDefaults()
+
+	customProm.MockMetric(context.Background(), "my_metric_1_1", expectedLabels, &query.RangeQuery, 10)
+	customProm.MockHistogram(context.Background(), "my_metric_1_2", expectedLabels, &query.RangeQuery, 11, 12)
+
+	dashboard, err := service.GetDashboard(context.Background(), query, "dashboard1")
+
+	require.NoError(t, err)
+	assert.Equal("Dashboard 1", dashboard.Title)
+	assert.Len(dashboard.Charts, 2)
+
+	// The custom prom client should have been called for metric fetching.
+	customProm.AssertNumberOfCalls(t, "FetchRateRange", 1)
+	customProm.AssertNumberOfCalls(t, "FetchHistogramRange", 1)
+
+	// The main prom client should NOT have been called at all.
+	mainProm.AssertNumberOfCalls(t, "FetchRateRange", 0)
+	mainProm.AssertNumberOfCalls(t, "FetchHistogramRange", 0)
+}
+
+// TestCustomDashboardsPromClientFallbackOnFactoryError verifies that when
+// the factory fails to create the custom Prometheus client, the service
+// falls back to the caller-supplied main client.
+func TestCustomDashboardsPromClientFallbackOnFactoryError(t *testing.T) {
+	assert := assert.New(t)
+
+	resetCustomDashboardsPromClient()
+	origFactory := newPromClient
+	t.Cleanup(func() {
+		newPromClient = origFactory
+		resetCustomDashboardsPromClient()
+	})
+
+	newPromClient = func(_ config.Config, _ config.PrometheusConfig, _ string) (prometheus.ClientInterface, error) {
+		return nil, fmt.Errorf("simulated TLS failure")
+	}
+
+	conf := config.NewConfig()
+	conf.ExternalServices.CustomDashboards.Enabled = true
+	conf.ExternalServices.CustomDashboards.Prometheus.URL = "http://prometheus-custom:9090"
+	conf.CustomDashboards = append(conf.CustomDashboards, *fakeDashboard("1"))
+
+	mainProm := new(pmock.PromClientMock)
+
+	ns := models.Namespace{Name: "my-namespace"}
+	grafanaSvc, err := grafana.NewService(conf, kubetest.NewFakeK8sClient())
+	require.NoError(t, err)
+	service := NewDashboardsService(conf, grafanaSvc, mainProm, &ns, nil)
+
+	expectedLabels := `{namespace="my-namespace",APP="my-app"}`
+	query := models.DashboardQuery{
+		Namespace: "my-namespace",
+		LabelsFilters: map[string]string{
+			"APP": "my-app",
+		},
+	}
+	query.FillDefaults()
+	mainProm.MockMetric(context.Background(), "my_metric_1_1", expectedLabels, &query.RangeQuery, 10)
+	mainProm.MockHistogram(context.Background(), "my_metric_1_2", expectedLabels, &query.RangeQuery, 11, 12)
+
+	dashboard, err := service.GetDashboard(context.Background(), query, "dashboard1")
+
+	require.NoError(t, err)
+	assert.Equal("Dashboard 1", dashboard.Title)
+
+	// Factory failed, so the main prom client should have been used.
+	mainProm.AssertNumberOfCalls(t, "FetchRateRange", 1)
+	mainProm.AssertNumberOfCalls(t, "FetchHistogramRange", 1)
+}
+
+// TestCustomDashboardsPromClientRetryAfterTransientError verifies that
+// after a transient factory failure, the next call retries (mutex-based
+// approach, unlike sync.Once which would lock in the failure permanently).
+func TestCustomDashboardsPromClientRetryAfterTransientError(t *testing.T) {
+	resetCustomDashboardsPromClient()
+	origFactory := newPromClient
+	t.Cleanup(func() {
+		newPromClient = origFactory
+		resetCustomDashboardsPromClient()
+	})
+
+	callCount := 0
+	customProm := new(pmock.PromClientMock)
+	newPromClient = func(_ config.Config, _ config.PrometheusConfig, _ string) (prometheus.ClientInterface, error) {
+		callCount++
+		if callCount == 1 {
+			return nil, fmt.Errorf("transient failure")
+		}
+		return customProm, nil
+	}
+
+	conf := config.NewConfig()
+	conf.ExternalServices.CustomDashboards.Enabled = true
+	conf.ExternalServices.CustomDashboards.Prometheus.URL = "http://prometheus-custom:9090"
+
+	ns := models.Namespace{Name: "ns"}
+
+	// First call: factory fails, falls back to main.
+	mainProm := new(pmock.PromClientMock)
+	svc1 := NewDashboardsService(conf, nil, mainProm, &ns, nil)
+	if svc1.promClient != mainProm {
+		t.Fatal("expected fallback to main prom after factory error")
+	}
+
+	// Second call: factory succeeds, custom client is used.
+	svc2 := NewDashboardsService(conf, nil, mainProm, &ns, nil)
+	if svc2.promClient != customProm {
+		t.Fatal("expected custom prom client after successful retry")
+	}
+
+	if callCount != 2 {
+		t.Fatalf("expected factory to be called twice (retry after failure), got %d", callCount)
+	}
+}
+
+// TestCustomDashboardsPromClientFactoryCalledOnce verifies that the factory
+// is called exactly once across multiple NewDashboardsService calls — the
+// successful result is cached and reused.
+func TestCustomDashboardsPromClientFactoryCalledOnce(t *testing.T) {
+	resetCustomDashboardsPromClient()
+	origFactory := newPromClient
+	t.Cleanup(func() {
+		newPromClient = origFactory
+		resetCustomDashboardsPromClient()
+	})
+
+	callCount := 0
+	customProm := new(pmock.PromClientMock)
+	newPromClient = func(_ config.Config, _ config.PrometheusConfig, _ string) (prometheus.ClientInterface, error) {
+		callCount++
+		return customProm, nil
+	}
+
+	conf := config.NewConfig()
+	conf.ExternalServices.CustomDashboards.Enabled = true
+	conf.ExternalServices.CustomDashboards.Prometheus.URL = "http://prometheus-custom:9090"
+
+	ns := models.Namespace{Name: "ns"}
+	mainProm := new(pmock.PromClientMock)
+
+	for i := 0; i < 5; i++ {
+		svc := NewDashboardsService(conf, nil, mainProm, &ns, nil)
+		if svc.promClient != customProm {
+			t.Fatalf("call %d: expected custom prom client", i)
+		}
+	}
+
+	if callCount != 1 {
+		t.Fatalf("expected factory to be called exactly once, got %d", callCount)
+	}
+}
+
+func TestAppendPromLabels(t *testing.T) {
+	assert.Equal(t, `{namespace="bookinfo"}`, appendPromLabels(`{namespace="bookinfo"}`, nil))
+	assert.Equal(t,
+		`{namespace="bookinfo",app="productpage",reporter="source"}`,
+		appendPromLabels(`{namespace="bookinfo",app="productpage"}`, map[string]string{"reporter": "source"}),
+	)
+	assert.Equal(t, `{reporter="destination"}`, appendPromLabels("", map[string]string{"reporter": "destination"}))
+	assert.Equal(t,
+		`{namespace="ns",a="1",b="2"}`,
+		appendPromLabels(`{namespace="ns"}`, map[string]string{"b": "2", "a": "1"}),
+	)
+	assert.Equal(t,
+		`{namespace="bookinfo",reporter=~"source|waypoint"}`,
+		appendPromLabelMatchers(`{namespace="bookinfo"}`, nil, map[string]string{"reporter": "source|waypoint"}),
+	)
+}
+
+func TestBuildIstioWorkloadMetricLabels(t *testing.T) {
+	conf := config.NewConfig()
+	ns := models.Namespace{Name: "bookinfo"}
+	workload := &models.Workload{
+		WorkloadListItem: models.WorkloadListItem{
+			Name:      "details-v1",
+			Namespace: "bookinfo",
+		},
+	}
+	svc := NewDashboardsService(conf, nil, nil, &ns, workload)
+
+	ref := dashboards.MonitoringDashboardMetric{
+		IstioMetricLabelPrefix: "source",
+		LabelRegexps:           map[string]string{"reporter": "source|waypoint"},
+	}
+	assert.Equal(t,
+		`{source_workload_namespace="bookinfo",source_workload="details-v1",reporter=~"source|waypoint"}`,
+		svc.buildIstioWorkloadMetricLabels("bookinfo", ref),
+	)
+
+	ref = dashboards.MonitoringDashboardMetric{
+		IstioMetricLabelPrefix: "destination",
+		Labels:                 map[string]string{"reporter": "destination"},
+	}
+	assert.Equal(t,
+		`{destination_workload_namespace="bookinfo",destination_workload="details-v1",reporter="destination"}`,
+		svc.buildIstioWorkloadMetricLabels("bookinfo", ref),
+	)
+}
+
+func TestBuildIstioWorkloadMetricLabelsWithQueryScope(t *testing.T) {
+	conf := config.NewConfig()
+	conf.ExternalServices.Prometheus.QueryScope = map[string]string{"mesh_id": "mesh1"}
+	ns := models.Namespace{Name: "bookinfo"}
+	workload := &models.Workload{
+		WorkloadListItem: models.WorkloadListItem{
+			Name:      "reviews-v2",
+			Namespace: "bookinfo",
+		},
+	}
+	prom := new(pmock.PromClientMock)
+	svc := NewDashboardsService(conf, nil, prom, &ns, workload)
+
+	ref := dashboards.MonitoringDashboardMetric{
+		IstioMetricLabelPrefix: "source",
+	}
+	result := svc.buildIstioWorkloadMetricLabels("bookinfo", ref)
+	assert.Contains(t, result, `source_workload="reviews-v2"`)
+	assert.Contains(t, result, `source_workload_namespace="bookinfo"`)
+	assert.Contains(t, result, `mesh_id="mesh1"`)
+}
+
+func TestBuildWorkloadPodMetricLabels(t *testing.T) {
+	conf := config.NewConfig()
+	ns := models.Namespace{Name: "bookinfo"}
+	workload := &models.Workload{
+		WorkloadListItem: models.WorkloadListItem{Namespace: "bookinfo"},
+		Pods: models.Pods{
+			&models.Pod{Name: "details-v1-abc"},
+			&models.Pod{Name: "details-v1-def"},
+		},
+	}
+	svc := NewDashboardsService(conf, nil, nil, &ns, workload)
+
+	assert.Equal(t,
+		`{namespace="bookinfo",pod=~"details-v1-abc|details-v1-def",container="istio-proxy"}`,
+		svc.buildWorkloadPodMetricLabels("bookinfo", map[string]string{"container": "istio-proxy"}),
+	)
+
+	workload.Pods = models.Pods{&models.Pod{Name: "waypoint-xyz"}}
+	assert.Equal(t,
+		`{namespace="bookinfo",pod="waypoint-xyz",container="istio-proxy"}`,
+		svc.buildWorkloadPodMetricLabels("bookinfo", map[string]string{"container": "istio-proxy"}),
+	)
 }

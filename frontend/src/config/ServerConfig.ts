@@ -1,0 +1,268 @@
+import { isEmpty, mapValues, reject } from 'lodash-es';
+import { RunMode, type ServerConfig } from '../types/ServerConfig';
+import { parseHealthConfig } from './HealthConfig';
+import type { MeshCluster } from '../types/Mesh';
+
+export type Durations = { [key: number]: string };
+
+export type ComputedServerConfig = ServerConfig & {
+  durations: Durations;
+};
+
+// Exported default label name candidates and key constants
+// note: these constants are also declared server-side in config/config.go
+export const AMBIENT_NAMESPACE_LABEL = 'istio.io/dataplane-mode';
+export const AMBIENT_NAMESPACE_LABEL_VALUE = 'ambient';
+export const AMBIENT_WAYPOINT_GATEWAY_LABEL = 'gateway.networking.k8s.io/gateway-name';
+export const INJECTION_LABEL_NAME = 'istio-injection';
+export const INJECTION_LABEL_REV = 'istio.io/rev';
+
+function getHomeCluster(cfg: ServerConfig): MeshCluster | undefined {
+  return Object.values(cfg.clusters).find(cluster => cluster.isKialiHome);
+}
+
+export const humanDurations = (cfg: ComputedServerConfig, prefix?: string, suffix?: string): Durations =>
+  mapValues(cfg.durations, v => reject([prefix, v, suffix], isEmpty).join(' '));
+
+const toDurations = (tupleArray: [number, string][]): Durations => {
+  const obj: Durations = {};
+  tupleArray.forEach(tuple => {
+    obj[tuple[0]] = tuple[1];
+  });
+  return obj;
+};
+
+const durationsTuples: [number, string][] = [
+  [60, '1m'],
+  [120, '2m'],
+  [300, '5m'],
+  [600, '10m'],
+  [1800, '30m'],
+  [3600, '1h'],
+  [10800, '3h'],
+  [21600, '6h'],
+  [43200, '12h'],
+  [86400, '1d'],
+  [604800, '7d'],
+  [2592000, '30d']
+];
+
+/** Maps duration dropdown / health_config.compute.duration labels (CRD enum) to seconds. */
+export const durationLabelToSeconds = (label: string): number | undefined => {
+  const trimmed = label.trim();
+  const found = durationsTuples.find(([, l]) => l === trimmed);
+  return found ? found[0] : undefined;
+};
+
+const computeValidDurations = (cfg: ComputedServerConfig): void => {
+  const tsdbRetention = cfg.prometheus.storageTsdbRetention;
+  const scrapeInterval = cfg.prometheus.globalScrapeInterval;
+  let filtered = durationsTuples.filter(
+    d => (!tsdbRetention || d[0] <= tsdbRetention!) && (!scrapeInterval || d[0] >= scrapeInterval * 2)
+  );
+  // Make sure we keep at least one item, even if it's silly
+  if (filtered.length === 0) {
+    filtered = [durationsTuples[0]];
+  }
+  cfg.durations = toDurations(filtered);
+};
+
+// Set some reasonable defaults. Initial values should be valid for fields
+// than may not be providedby/set on the server.
+const defaultServerConfig: ComputedServerConfig = {
+  ambientEnabled: false,
+  authStrategy: '',
+  ai: {
+    enabled: false,
+    chat: {
+      allowed: false,
+      enabled: false,
+      providers: [],
+      defaultProvider: '',
+      store: {
+        enabled: false
+      }
+    },
+    consumption: {
+      enabled: false,
+      allowed: false
+    }
+  },
+  clusters: {},
+  clusterWideAccess: true,
+  controlPlanes: { Kubernetes: 'istio-system' },
+  durations: {},
+  gatewayAPIClasses: [],
+  gatewayAPIEnabled: false,
+  logLevel: '',
+  healthConfig: {
+    rate: []
+  },
+  healthStatusMetricsEnabled: false,
+  deployment: {
+    viewOnlyMode: false
+  },
+  ignoreHomeCluster: false,
+  installationTag: 'Kiali Console',
+  istioAnnotations: {
+    ambientAnnotation: 'ambient.istio.io/redirection',
+    ambientAnnotationEnabled: 'enabled',
+    istioInjectionAnnotation: 'sidecar.istio.io/inject'
+  },
+  istioAPIInstalled: false,
+  istioGatewayInstalled: false,
+  istioIdentityDomain: '',
+  istioLabels: {
+    appLabelName: '',
+    versionLabelName: ''
+  },
+  kialiFeatureFlags: {
+    customWorkloadTypes: [],
+    disabledFeatures: [],
+    istioInjectionAction: true,
+    istioAnnotationAction: true,
+    istioUpgradeAction: false,
+    uiDefaults: {
+      graph: {
+        findOptions: [],
+        hideOptions: [],
+        settings: {
+          animation: 'point'
+        },
+        traffic: {
+          ambient: 'total',
+          grpc: 'requests',
+          http: 'requests',
+          tcp: 'sent'
+        }
+      },
+      i18n: {
+        language: '',
+        showSelector: true
+      },
+      list: {
+        includeHealth: true,
+        includeIstioResources: true,
+        includeValidations: true,
+        showIncludeToggles: false
+      },
+      mesh: {
+        findOptions: [],
+        hideOptions: []
+      },
+      tracing: { limit: 100 }
+    }
+  },
+  prometheus: {
+    enabled: true,
+    globalScrapeInterval: 15,
+    storageTsdbRetention: 21600
+  },
+  runMode: RunMode.APP
+};
+
+// Overwritten with real server config on user login. Also used for tests.
+let serverConfig = defaultServerConfig;
+computeValidDurations(serverConfig);
+export { serverConfig };
+
+let homeCluster = getHomeCluster(serverConfig);
+let isMultiCluster = isMC();
+export { homeCluster, isMultiCluster };
+
+// set when serverConfig is set
+let appLabelNames: string[] = [];
+let versionLabelNames: string[] = [];
+
+export const toValidDuration = (duration: number): number => {
+  // Check if valid
+  if (serverConfig.durations[duration]) {
+    return duration;
+  }
+  // Get closest duration
+  const validDurations = durationsTuples.filter(d => serverConfig.durations[d[0]]);
+  for (let i = validDurations.length - 1; i > 0; i--) {
+    if (duration > durationsTuples[i][0]) {
+      return validDurations[i][0];
+    }
+  }
+  return validDurations[0][0];
+};
+
+export const setServerConfig = (cfg: ServerConfig): void => {
+  serverConfig = {
+    ...defaultServerConfig,
+    ...cfg
+  };
+
+  serverConfig.healthConfig = cfg.healthConfig ? parseHealthConfig(cfg.healthConfig) : serverConfig.healthConfig;
+  computeValidDurations(serverConfig);
+
+  homeCluster = getHomeCluster(serverConfig);
+  isMultiCluster = isMC();
+  if (!serverConfig.ambientEnabled) {
+    serverConfig.kialiFeatureFlags.uiDefaults.graph.traffic.ambient = 'none';
+  }
+
+  // set the current app and version label name possibilities
+  if (cfg.istioLabels.appLabelName !== '' && cfg.istioLabels.versionLabelName !== '') {
+    appLabelNames = [cfg.istioLabels.appLabelName];
+    versionLabelNames = [cfg.istioLabels.versionLabelName];
+  } else {
+    appLabelNames = ['service.istio.io/canonical-name', 'app.kubernetes.io/name', 'app'];
+    versionLabelNames = ['service.istio.io/canonical-revision', 'app.kubernetes.io/version', 'version'];
+  }
+};
+
+export const isPrometheusAvailable = (): boolean => {
+  return serverConfig.prometheus.enabled && !serverConfig.prometheus.disabledReason;
+};
+
+const isHealthStatusMetricsEnabled = (): boolean => serverConfig.healthStatusMetricsEnabled;
+
+export const isHealthHistoryAvailable = (): boolean => {
+  return isPrometheusAvailable() && isHealthStatusMetricsEnabled();
+};
+
+export const isIstioNamespace = (namespace: string): boolean => {
+  return Object.values(serverConfig.controlPlanes).some(cpNamespace => cpNamespace === namespace);
+};
+
+export const istioNamespaces = (): string[] => {
+  const cpNamespaces = Object.values(serverConfig.controlPlanes);
+  return [...new Set(cpNamespaces)];
+};
+
+export const isHomeCluster = (cluster: string): boolean => {
+  return !isMultiCluster || cluster === homeCluster?.name;
+};
+
+// Return true if the cluster is configured for this Kiali instance
+export const isConfiguredCluster = (cluster: string): boolean => {
+  return Object.keys(serverConfig.clusters).includes(cluster);
+};
+
+function isMC(): boolean {
+  // If there is only one cluster, it is not a multi-cluster deployment.
+  // If there are multiple clusters but only one is accessible, it is not a multi-cluster deployment.
+  return (
+    Object.keys(serverConfig.clusters).length > 1 &&
+    Object.values(serverConfig.clusters).filter(c => c.accessible).length > 1
+  );
+}
+
+// getAppLabelName returns the app label name found in the labels, or undefined
+export const getAppLabelName = (labels?: { [key: string]: string }): string | undefined => {
+  if (labels) {
+    return appLabelNames.find(labelName => labels[labelName] !== undefined);
+  }
+  return undefined;
+};
+
+// getVersionLabelName returns the version label name found in the labels, or undefined
+export const getVersionLabelName = (labels?: { [key: string]: string }): string | undefined => {
+  if (labels) {
+    return versionLabelNames.find(labelName => labels[labelName] !== undefined);
+  }
+  return undefined;
+};

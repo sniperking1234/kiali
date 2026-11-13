@@ -4,9 +4,13 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
-	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	networking_v1 "istio.io/client-go/pkg/apis/networking/v1"
+	"k8s.io/apimachinery/pkg/util/yaml"
+	k8s_networking_v1 "sigs.k8s.io/gateway-api/apis/v1"
+	k8s_networking_v1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
 
 	"github.com/kiali/kiali/config"
+	"github.com/kiali/kiali/log"
 )
 
 func TestGatewayAsHost(t *testing.T) {
@@ -14,13 +18,43 @@ func TestGatewayAsHost(t *testing.T) {
 
 	conf := config.NewConfig()
 	config.Set(conf)
+	id := config.ResolveIdentityDomain(conf.ExternalServices.Istio.IstioIdentityDomain, "")
 
-	assert.Equal("mygateway.bookinfo.svc.cluster.local", ParseGatewayAsHost("mygateway", "bookinfo", "svc.cluster.local").String())
-	assert.Equal("mygateway.bookinfo.svc.cluster.local", ParseGatewayAsHost("bookinfo/mygateway", "bookinfo", "svc.cluster.local").String())
-	assert.Equal("mygateway.istio-system.svc.cluster.local", ParseGatewayAsHost("istio-system/mygateway", "bookinfo", "svc.cluster.local").String())
-	assert.Equal("mygateway.bookinfo.svc.cluster.local", ParseGatewayAsHost("mygateway.bookinfo", "bookinfo", "svc.cluster.local").String())
-	assert.Equal("mygateway.bookinfo.svc.cluster.local", ParseGatewayAsHost("mygateway.bookinfo", "bookinfo", "svc.cluster.local").String())
-	assert.Equal("mygateway.bookinfo.svc.cluster.local", ParseGatewayAsHost("mygateway.bookinfo.svc.cluster.local", "bookinfo", "svc.cluster.local").String())
+	assert.Equal("mygateway.bookinfo.svc.cluster.local", ParseGatewayAsHost("mygateway", "bookinfo", id).String())
+	assert.Equal("mygateway.bookinfo.svc.cluster.local", ParseGatewayAsHost("bookinfo/mygateway", "bookinfo", id).String())
+	assert.Equal("mygateway.istio-system.svc.cluster.local", ParseGatewayAsHost("istio-system/mygateway", "bookinfo", id).String())
+	assert.Equal("mygateway.bookinfo.svc.cluster.local", ParseGatewayAsHost("mygateway.bookinfo", "bookinfo", id).String())
+	assert.Equal("mygateway.bookinfo.svc.cluster.local", ParseGatewayAsHost("mygateway.bookinfo", "bookinfo", id).String())
+	assert.Equal("mygateway.bookinfo.svc.cluster.local", ParseGatewayAsHost("mygateway.bookinfo.svc.cluster.local", "bookinfo", id).String())
+}
+
+func TestHostWithinWildcardHost(t *testing.T) {
+	cases := []struct {
+		subdomain, wildcard string
+		expected            bool
+		reason              string
+	}{
+		{"host1.test.svc.cluster.local", "*.test.svc.cluster.local", true, "concrete host in namespace"},
+		{"*.test.svc.cluster.local", "*.test.svc.cluster.local", true, "identical wildcards"},
+		{"*.vault.svc.cluster.local", "*.local", true, "mesh-wide covers namespace wildcard"},
+		{"host.vault.svc.cluster.local", "*.local", true, "mesh-wide covers concrete host"},
+		{"en.wikipedia.org", "*.wikipedia.org", true, "external wildcard"},
+		{"*", "*", true, "bare wildcard"},
+		{"anything", "*", true, "bare wildcard matches all"},
+		{"svc.istio-test.svc.cluster.local", "*.test.svc.cluster.local", false, "ns suffix must not match across label boundary"},
+		{"*.istio-test.svc.cluster.local", "*.test.svc.cluster.local", false, "wildcard ns suffix must not match across label boundary"},
+		{"host.ntest.svc.cluster.local", "*.test.svc.cluster.local", false, "partial label suffix must not match"},
+		{"foo.mysvc.cluster.local", "*.svc.cluster.local", false, "partial domain label must not match"},
+		{"host1.test.svc.cluster.local", "host1.test.svc.cluster.local", false, "non-wildcard domain is not a wildcard"},
+		{"*.foo.com", "*.bar.com", false, "disjoint wildcards"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.reason, func(t *testing.T) {
+			assert.Equal(t, tc.expected, HostWithinWildcardHost(tc.subdomain, tc.wildcard),
+				"%s within %s", tc.subdomain, tc.wildcard)
+		})
+	}
 }
 
 func TestHasMatchingVirtualServices(t *testing.T) {
@@ -28,42 +62,93 @@ func TestHasMatchingVirtualServices(t *testing.T) {
 
 	conf := config.NewConfig()
 	config.Set(conf)
+	id := config.ResolveIdentityDomain(conf.ExternalServices.Istio.IstioIdentityDomain, "")
 
 	// Short name service
-	assert.True(HasMatchingVirtualServices(Host{Service: "reviews", Namespace: "bookinfo", Cluster: "svc.cluster.local"}, []IstioObject{createVirtualService("bookinfo", []string{"reviews"})}))
-	assert.False(HasMatchingVirtualServices(Host{Service: "reviews", Namespace: "bookinfo", Cluster: "svc.cluster.local"}, []IstioObject{createVirtualService("bogus", []string{"reviews"})}))
+	assert.True(HasMatchingVirtualServices(Host{Service: "reviews", Namespace: "bookinfo", Cluster: "svc.cluster.local"}, []*networking_v1.VirtualService{createVirtualService("bookinfo", []string{"reviews"})}, id))
+	assert.False(HasMatchingVirtualServices(Host{Service: "reviews", Namespace: "bookinfo", Cluster: "svc.cluster.local"}, []*networking_v1.VirtualService{createVirtualService("bogus", []string{"reviews"})}, id))
 
 	// Half-FQDN
-	assert.True(HasMatchingVirtualServices(Host{Service: "reviews", Namespace: "bookinfo", Cluster: "svc.cluster.local"}, []IstioObject{createVirtualService("bookinfo", []string{"reviews.bookinfo"})}))
-	assert.False(HasMatchingVirtualServices(Host{Service: "reviews", Namespace: "bookinfo", Cluster: "svc.cluster.local"}, []IstioObject{createVirtualService("bogus", []string{"reviews.bogus"})}))
+	assert.True(HasMatchingVirtualServices(Host{Service: "reviews", Namespace: "bookinfo", Cluster: "svc.cluster.local"}, []*networking_v1.VirtualService{createVirtualService("bookinfo", []string{"reviews.bookinfo"})}, id))
+	assert.False(HasMatchingVirtualServices(Host{Service: "reviews", Namespace: "bookinfo", Cluster: "svc.cluster.local"}, []*networking_v1.VirtualService{createVirtualService("bogus", []string{"reviews.bogus"})}, id))
 
 	// FQDN
-	assert.True(HasMatchingVirtualServices(Host{Service: "reviews", Namespace: "bookinfo", Cluster: "svc.cluster.local"}, []IstioObject{createVirtualService("bookinfo", []string{"reviews.bookinfo.svc.cluster.local"})}))
-	assert.False(HasMatchingVirtualServices(Host{Service: "reviews", Namespace: "bookinfo", Cluster: "svc.cluster.local"}, []IstioObject{createVirtualService("bogus", []string{"reviews.bogus.svc.cluster.local"})}))
+	assert.True(HasMatchingVirtualServices(Host{Service: "reviews", Namespace: "bookinfo", Cluster: "svc.cluster.local"}, []*networking_v1.VirtualService{createVirtualService("bookinfo", []string{"reviews.bookinfo.svc.cluster.local"})}, id))
+	assert.False(HasMatchingVirtualServices(Host{Service: "reviews", Namespace: "bookinfo", Cluster: "svc.cluster.local"}, []*networking_v1.VirtualService{createVirtualService("bogus", []string{"reviews.bogus.svc.cluster.local"})}, id))
 
 	// Wildcard
-	assert.True(HasMatchingVirtualServices(Host{Service: "reviews", Namespace: "bookinfo", Cluster: "svc.cluster.local"}, []IstioObject{createVirtualService("bookinfo", []string{"*.bookinfo.svc.cluster.local"})}))
-	assert.True(HasMatchingVirtualServices(Host{Service: "reviews", Namespace: "bookinfo", Cluster: "svc.cluster.local"}, []IstioObject{createVirtualService("bookinfo", []string{"*"})}))
-	assert.False(HasMatchingVirtualServices(Host{Service: "reviews", Namespace: "bookinfo", Cluster: "svc.cluster.local"}, []IstioObject{createVirtualService("bogus", []string{"*.bogus.svc.cluster.local"})}))
+	assert.True(HasMatchingVirtualServices(Host{Service: "reviews", Namespace: "bookinfo", Cluster: "svc.cluster.local"}, []*networking_v1.VirtualService{createVirtualService("bookinfo", []string{"*.bookinfo.svc.cluster.local"})}, id))
+	assert.True(HasMatchingVirtualServices(Host{Service: "reviews", Namespace: "bookinfo", Cluster: "svc.cluster.local"}, []*networking_v1.VirtualService{createVirtualService("bookinfo", []string{"*"})}, id))
+	assert.False(HasMatchingVirtualServices(Host{Service: "reviews", Namespace: "bookinfo", Cluster: "svc.cluster.local"}, []*networking_v1.VirtualService{createVirtualService("bogus", []string{"*.bogus.svc.cluster.local"})}, id))
 
 	// External host
-	assert.False(HasMatchingVirtualServices(Host{Service: "reviews", Namespace: "bookinfo", Cluster: "svc.cluster.local"}, []IstioObject{createVirtualService("bookinfo", []string{"foo.example.com"})}))
-	assert.False(HasMatchingVirtualServices(Host{Service: "reviews", Namespace: "bookinfo", Cluster: "svc.cluster.local"}, []IstioObject{createVirtualService("bookinfo", []string{"*.foo.example.com"})}))
+	assert.False(HasMatchingVirtualServices(Host{Service: "reviews", Namespace: "bookinfo", Cluster: "svc.cluster.local"}, []*networking_v1.VirtualService{createVirtualService("bookinfo", []string{"foo.example.com"})}, id))
+	assert.False(HasMatchingVirtualServices(Host{Service: "reviews", Namespace: "bookinfo", Cluster: "svc.cluster.local"}, []*networking_v1.VirtualService{createVirtualService("bookinfo", []string{"*.foo.example.com"})}, id))
 
-	assert.True(HasMatchingVirtualServices(Host{Service: "foo.example.com", Namespace: "", Cluster: ""}, []IstioObject{createVirtualService("bookinfo", []string{"foo.example.com"})}))
-	assert.True(HasMatchingVirtualServices(Host{Service: "new.foo.example.com", Namespace: "", Cluster: ""}, []IstioObject{createVirtualService("bookinfo", []string{"*.foo.example.com"})}))
-	assert.True(HasMatchingVirtualServices(Host{Service: "foo.example.com", Namespace: "", Cluster: ""}, []IstioObject{createVirtualService("bookinfo", []string{"*"})}))
+	assert.True(HasMatchingVirtualServices(Host{Service: "foo.example.com", Namespace: "", Cluster: ""}, []*networking_v1.VirtualService{createVirtualService("bookinfo", []string{"foo.example.com"})}, id))
+	assert.True(HasMatchingVirtualServices(Host{Service: "new.foo.example.com", Namespace: "", Cluster: ""}, []*networking_v1.VirtualService{createVirtualService("bookinfo", []string{"*.foo.example.com"})}, id))
+	assert.True(HasMatchingVirtualServices(Host{Service: "foo.example.com", Namespace: "", Cluster: ""}, []*networking_v1.VirtualService{createVirtualService("bookinfo", []string{"*"})}, id))
 }
 
-func createVirtualService(namespace string, hosts []string) IstioObject {
-	return (&GenericIstioObject{
-		ObjectMeta: meta_v1.ObjectMeta{
-			Name:        "virtual-service",
-			Namespace:   namespace,
-			ClusterName: "svc.cluster.local",
-		},
-		Spec: map[string]interface{}{
-			"hosts": hosts,
-		},
-	}).DeepCopyIstioObject()
+func TestHasMatchingReferenceGrant(t *testing.T) {
+	assert := assert.New(t)
+
+	conf := config.NewConfig()
+	config.Set(conf)
+
+	assert.True(HasMatchingReferenceGrant("bookinfo", "default", K8sHTTPRouteType, ServiceType, []*k8s_networking_v1beta1.ReferenceGrant{createReferenceGrant("test", "default", "bookinfo"), createReferenceGrant("test", "bookinfo2", "bookinfo")}))
+	assert.False(HasMatchingReferenceGrant("bookinfo", "test", K8sHTTPRouteType, ServiceType, []*k8s_networking_v1beta1.ReferenceGrant{createReferenceGrant("test", "default", "bookinfo"), createReferenceGrant("test", "bookinfo2", "bookinfo")}))
+	assert.False(HasMatchingReferenceGrant("default", "bookinfo", K8sHTTPRouteType, ServiceType, []*k8s_networking_v1beta1.ReferenceGrant{createReferenceGrant("test", "default", "bookinfo"), createReferenceGrant("test", "bookinfo2", "bookinfo")}))
+
+	// Match the second From entry (previously only Spec.From[0] was checked)
+	multiFrom := createReferenceGrant("multi", "default", "other")
+	multiFrom.Spec.From = append(multiFrom.Spec.From, k8s_networking_v1beta1.ReferenceGrantFrom{
+		Kind:      k8s_networking_v1beta1.Kind(K8sHTTPRoutes.Kind),
+		Group:     k8s_networking_v1beta1.GroupName,
+		Namespace: k8s_networking_v1.Namespace("bookinfo"),
+	})
+	assert.True(HasMatchingReferenceGrant("bookinfo", "default", K8sHTTPRouteType, ServiceType, []*k8s_networking_v1beta1.ReferenceGrant{multiFrom}))
+
+	// Match the second To entry (previously only Spec.To[0] was checked)
+	multiTo := createReferenceGrant("multi-to", "default", "bookinfo")
+	multiTo.Spec.To = []k8s_networking_v1beta1.ReferenceGrantTo{
+		{Kind: "Secret"},
+		{Kind: ServiceType},
+	}
+	assert.True(HasMatchingReferenceGrant("bookinfo", "default", K8sHTTPRouteType, ServiceType, []*k8s_networking_v1beta1.ReferenceGrant{multiTo}))
+}
+
+func createVirtualService(namespace string, hosts []string) *networking_v1.VirtualService {
+	vsYaml := []byte(`
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: virtual-service 
+spec:
+  hosts:
+  - reviews
+  http:
+  - route:
+    - destination:
+        host: reviews
+        subset: v2
+    timeout: 0.5s
+`)
+	var vs networking_v1.VirtualService
+	err := yaml.Unmarshal(vsYaml, &vs)
+	if err != nil {
+		log.Error(err)
+	}
+	vs.Namespace = namespace
+	vs.Spec.Hosts = hosts
+	return &vs
+}
+
+func createReferenceGrant(name string, namespace string, fromNamespace string) *k8s_networking_v1beta1.ReferenceGrant {
+	rg := k8s_networking_v1beta1.ReferenceGrant{}
+	rg.Name = name
+	rg.Namespace = namespace
+	rg.Spec.From = append(rg.Spec.From, k8s_networking_v1beta1.ReferenceGrantFrom{Kind: k8s_networking_v1beta1.Kind(K8sHTTPRoutes.Kind), Group: k8s_networking_v1beta1.GroupName, Namespace: k8s_networking_v1.Namespace(fromNamespace)})
+	rg.Spec.To = append(rg.Spec.To, k8s_networking_v1beta1.ReferenceGrantTo{Kind: ServiceType})
+	return &rg
 }

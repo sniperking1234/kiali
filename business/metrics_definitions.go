@@ -9,6 +9,16 @@ type istioMetric struct {
 
 var istioMetrics = []istioMetric{
 	{
+		kialiName: "grpc_received",
+		istioName: "istio_response_messages_total",
+		isHisto:   false,
+	},
+	{
+		kialiName: "grpc_sent",
+		istioName: "istio_request_messages_total",
+		isHisto:   false,
+	},
+	{
 		kialiName: "request_count",
 		istioName: "istio_requests_total",
 		isHisto:   false,
@@ -46,12 +56,22 @@ var istioMetrics = []istioMetric{
 	},
 	{
 		kialiName: "tcp_received",
-		istioName: "istio_tcp_received_bytes_total",
+		istioName: "istio_tcp_sent_bytes_total", // L4 telemetry is backwards, see https://github.com/istio/istio/issues/32399
 		isHisto:   false,
 	},
 	{
 		kialiName: "tcp_sent",
-		istioName: "istio_tcp_sent_bytes_total",
+		istioName: "istio_tcp_received_bytes_total", // L4 telemetry is backwards, see https://github.com/istio/istio/issues/32399
+		isHisto:   false,
+	},
+	{
+		kialiName: "tcp_opened",
+		istioName: "istio_tcp_connections_opened_total",
+		isHisto:   false,
+	},
+	{
+		kialiName: "tcp_closed",
+		istioName: "istio_tcp_connections_closed_total",
 		isHisto:   false,
 	},
 }

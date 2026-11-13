@@ -1,0 +1,22 @@
+// Action Creators allow us to create typesafe utilities for dispatching actions
+import type { ActionType } from 'typesafe-actions';
+import { createAction, createStandardAction } from 'typesafe-actions';
+import { ActionKeys } from './ActionKeys';
+import type { KioskData, KioskMode } from '../types/Common';
+
+export const GlobalActions = {
+  decrementLoadingCounter: createAction(ActionKeys.DECREMENT_LOADING_COUNTER),
+  incrementLoadingCounter: createAction(ActionKeys.INCREMENT_LOADING_COUNTER),
+  setKiosk: createStandardAction(ActionKeys.SET_KIOSK)<KioskMode>(),
+  setKioskData: createStandardAction(ActionKeys.SET_KIOSK_DATA)<KioskData>(),
+  setColorScheme: createStandardAction(ActionKeys.SET_COLOR_SCHEME)<string>(),
+  setContrastMode: createStandardAction(ActionKeys.SET_CONTRAST_MODE)<string>(),
+  setLanguage: createStandardAction(ActionKeys.SET_LANGUAGE)<string>(),
+  setPageVisibilityHidden: createAction(ActionKeys.SET_PAGE_VISIBILITY_HIDDEN),
+  setPageVisibilityVisible: createAction(ActionKeys.SET_PAGE_VISIBILITY_VISIBLE),
+  setTheme: createStandardAction(ActionKeys.SET_THEME)<string>(),
+  systemAppearanceChanged: createAction(ActionKeys.SYSTEM_APPEARANCE_CHANGED),
+  unknown: createAction('KIALI_UNKNOWN') // helper for testing
+};
+
+export type GlobalAction = ActionType<typeof GlobalActions>;

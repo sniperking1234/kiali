@@ -1,36 +1,77 @@
 package server
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
+	"io/fs"
 	"net/http"
 	"time"
 
 	"github.com/NYTimes/gziphandler"
 	"github.com/gorilla/mux"
+	"go.opentelemetry.io/contrib/instrumentation/github.com/gorilla/mux/otelmux"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 
 	"github.com/kiali/kiali/business"
+	"github.com/kiali/kiali/cache"
 	"github.com/kiali/kiali/config"
+	"github.com/kiali/kiali/grafana"
+	"github.com/kiali/kiali/istio"
+	"github.com/kiali/kiali/kubernetes"
 	"github.com/kiali/kiali/log"
+	"github.com/kiali/kiali/observability"
+	"github.com/kiali/kiali/perses"
+	"github.com/kiali/kiali/prometheus"
 	"github.com/kiali/kiali/routing"
+	"github.com/kiali/kiali/tracing"
 )
 
 type Server struct {
+	conf       *config.Config
 	httpServer *http.Server
 	router     *mux.Router
+	tracer     *sdktrace.TracerProvider
 }
 
 // NewServer creates a new server configured with the given settings.
 // Start and Stop it with the corresponding functions.
-func NewServer() *Server {
-	conf := config.Get()
-	// create a router that will route all incoming API server requests to different handlers
-
-	router := routing.NewRouter()
-
-	if conf.Server.CORSAllowAll {
-		router.Use(corsAllowed)
+func NewServer(ctx context.Context,
+	controlPlaneMonitor business.ControlPlaneMonitor,
+	clientFactory kubernetes.ClientFactory,
+	cache cache.KialiCache,
+	conf *config.Config,
+	grafanaSvc *grafana.Service,
+	prom prometheus.ClientInterface,
+	traceClientLoader func() tracing.ClientInterface,
+	discovery *istio.Discovery,
+	staticAssetFS fs.FS,
+) (*Server, error) {
+	persesSvc, err := perses.NewService(conf, clientFactory.GetSAHomeClusterClient())
+	if err != nil {
+		return nil, fmt.Errorf("failed to create Perses service: %w", err)
 	}
+	// create a router that will route all incoming API server requests to different handlers
+	router, err := routing.NewRouter(ctx, conf, cache, clientFactory, prom, traceClientLoader, controlPlaneMonitor, grafanaSvc, persesSvc, discovery, staticAssetFS)
+	if err != nil {
+		return nil, err
+	}
+
+	var tracingProvider *sdktrace.TracerProvider
+	if conf.Server.Observability.Tracing.Enabled {
+		log.Infof("Tracing Enabled. Initializing tracer with collector url: %s", conf.Server.Observability.Tracing.CollectorURL)
+		tracingProvider = observability.InitTracer(conf.Server.Observability.Tracing.CollectorURL)
+	}
+
+	middlewares := []mux.MiddlewareFunc{securityHeaders(conf.IsServerHTTPS())}
+	if conf.Server.CORSAllowAll {
+		middlewares = append(middlewares, corsAllowed)
+	}
+	if conf.Server.Observability.Tracing.Enabled {
+		middlewares = append(middlewares, otelmux.Middleware(observability.TracingService))
+	}
+
+	router.Use(middlewares...)
 
 	handler := http.Handler(router)
 	if conf.Server.GzipEnabled {
@@ -44,9 +85,23 @@ func NewServer() *Server {
 	http.DefaultServeMux = mux
 	http.Handle("/", handler)
 
-	// Clients must use TLS 1.2 or higher
+	// Server TLS is configured according to the resolved policy.
 	tlsConfig := &tls.Config{
-		MinVersion: tls.VersionTLS12,
+		NextProtos: []string{"h2", "http/1.1"},
+	}
+	conf.ResolvedTLSPolicy.ApplyTo(tlsConfig)
+
+	// The /debug/pprof/profiler by default needs a write timeout larger than 30s. But also, you can pass in &seconds=XY on the pprof URL
+	// and ask for any profile to extend to those number of seconds you specify, which could be larger than 30s.
+	// To limit the damage this may cause with large write timeouts, we only increase the timeout to 1 minute.
+	writeTimeout := conf.Server.WriteTimeout
+	// For backward compatibility: if WriteTimeout appears to be in nanoseconds (i.e., a small integer was parsed),
+	// multiply by time.Second to convert to seconds. Duration strings are parsed correctly by YAML unmarshaling.
+	if writeTimeout > 0 && writeTimeout < time.Millisecond {
+		writeTimeout = writeTimeout * time.Second
+	}
+	if conf.Server.Profiler.Enabled && writeTimeout < 60*time.Second {
+		writeTimeout = 1 * time.Minute
 	}
 
 	// create the server definition that will handle both console and api server traffic
@@ -54,28 +109,33 @@ func NewServer() *Server {
 		Addr:         fmt.Sprintf("%v:%v", conf.Server.Address, conf.Server.Port),
 		TLSConfig:    tlsConfig,
 		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 30 * time.Second,
+		WriteTimeout: writeTimeout,
 	}
 
 	// return our new Server
-	return &Server{
+	s := &Server{
+		conf:       conf,
 		httpServer: httpServer,
 		router:     router,
 	}
+	if conf.Server.Observability.Tracing.Enabled && tracingProvider != nil {
+		s.tracer = tracingProvider
+	}
+	return s, nil
 }
 
 // Start HTTP server asynchronously. TLS may be active depending on the global configuration.
+// TODO: Need to bubble up error somehow. Address is in use etc.
 func (s *Server) Start() {
-	conf := config.Get()
-	log.Infof("Server endpoint will start at [%v%v]", s.httpServer.Addr, conf.Server.WebRoot)
-	log.Infof("Server endpoint will serve static content from [%v]", conf.Server.StaticContentRootDirectory)
-	secure := conf.Identity.CertFile != "" && conf.Identity.PrivateKeyFile != ""
+	log.Infof("Server endpoint will start at [%v%v]", s.httpServer.Addr, s.conf.Server.WebRoot)
+
 	go func() {
 		var err error
-		if secure {
+		if s.conf.IsServerHTTPS() {
 			log.Infof("Server endpoint will require https")
+			log.Infof("Server will support protocols: %v", s.httpServer.TLSConfig.NextProtos)
 			s.router.Use(secureHttpsMiddleware)
-			err = s.httpServer.ListenAndServeTLS(conf.Identity.CertFile, conf.Identity.PrivateKeyFile)
+			err = s.httpServer.ListenAndServeTLS(s.conf.Identity.CertFile, s.conf.Identity.PrivateKeyFile)
 		} else {
 			s.router.Use(plainHttpMiddleware)
 			err = s.httpServer.ListenAndServe()
@@ -83,18 +143,37 @@ func (s *Server) Start() {
 		log.Warning(err)
 	}()
 
-	// Start the Metrics Server
-	if conf.Server.MetricsEnabled {
-		StartMetricsServer()
+	// Start the Metrics Server when general metrics or health-status export is enabled
+	if shouldStartMetricsServer(s.conf) {
+		StartMetricsServer(s.conf)
 	}
+}
+
+func shouldStartMetricsServer(conf *config.Config) bool {
+	return conf.Server.Observability.Metrics.Enabled || conf.Server.Observability.Metrics.HealthStatus.Enabled
 }
 
 // Stop the HTTP server
 func (s *Server) Stop() {
 	StopMetricsServer()
-	business.Stop()
 	log.Infof("Server endpoint will stop at [%v]", s.httpServer.Addr)
 	s.httpServer.Close()
+	observability.StopTracer(s.tracer)
+	s.conf.Close()
+}
+
+func securityHeaders(isServerHTTPS bool) mux.MiddlewareFunc {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("X-Content-Type-Options", "nosniff")
+			w.Header().Set("X-Frame-Options", "DENY")
+			w.Header().Set("X-XSS-Protection", "1; mode=block")
+			if isServerHTTPS {
+				w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
 }
 
 func corsAllowed(next http.Handler) http.Handler {

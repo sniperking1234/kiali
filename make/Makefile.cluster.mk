@@ -5,28 +5,34 @@
 # If using OpenShift, you must expose the image registry externally.
 #
 
-.prepare-ocp-image-registry: .ensure-oc-exists
+.prepare-ocp-image-registry: .ensure-oc-login
 	@if [ "$(shell ${OC} get config.imageregistry.operator.openshift.io/cluster -o jsonpath='{.spec.managementState}')" != "Managed" ]; then echo "Manually patching image registry operator to ensure it is managed"; ${OC} patch configs.imageregistry.operator.openshift.io cluster --type merge --patch '{"spec":{"managementState":"Managed"}}'; sleep 3; fi
 	@if [ "$(shell ${OC} get config.imageregistry.operator.openshift.io/cluster -o jsonpath='{.spec.defaultRoute}')" != "true" ]; then echo "Manually patching image registry operator to expose the cluster internal image registry"; ${OC} patch config.imageregistry.operator.openshift.io/cluster --patch '{"spec":{"defaultRoute":true}}' --type=merge; sleep 3; routehost="$$(${OC} get image.config.openshift.io/cluster -o custom-columns=EXT:.status.externalRegistryHostnames[0] --no-headers 2>/dev/null)"; while [ "$${routehost}" == "<none>" -o "$${routehost}" == "" ]; do echo "Waiting for image registry route to start..."; sleep 3; routehost="$$(${OC} get image.config.openshift.io/cluster -o custom-columns=EXT:.status.externalRegistryHostnames[0] --no-headers 2>/dev/null)"; done; fi
 
-.prepare-ocp: .ensure-oc-exists .prepare-ocp-image-registry
+.prepare-ocp: .prepare-ocp-image-registry
 	@$(eval CLUSTER_REPO_INTERNAL ?= $(shell ${OC} get image.config.openshift.io/cluster -o custom-columns=INT:.status.internalRegistryHostname --no-headers 2>/dev/null))
 	@$(eval CLUSTER_REPO ?= $(shell ${OC} get image.config.openshift.io/cluster -o custom-columns=EXT:.status.externalRegistryHostnames[0] --no-headers 2>/dev/null))
 	@$(eval CLUSTER_KIALI_INTERNAL_NAME ?= ${CLUSTER_REPO_INTERNAL}/${CONTAINER_NAME})
 	@$(eval CLUSTER_KIALI_NAME ?= ${CLUSTER_REPO}/${CONTAINER_NAME})
 	@$(eval CLUSTER_KIALI_TAG ?= ${CLUSTER_KIALI_NAME}:${CONTAINER_VERSION})
+	@$(eval CLUSTER_KIALI_TAG_INTERNAL ?= ${CLUSTER_KIALI_INTERNAL_NAME}:${CONTAINER_VERSION})
 	@$(eval CLUSTER_OPERATOR_INTERNAL_NAME ?= ${CLUSTER_REPO_INTERNAL}/${OPERATOR_CONTAINER_NAME})
 	@$(eval CLUSTER_OPERATOR_NAME ?= ${CLUSTER_REPO}/${OPERATOR_CONTAINER_NAME})
 	@$(eval CLUSTER_OPERATOR_TAG ?= ${CLUSTER_OPERATOR_NAME}:${OPERATOR_CONTAINER_VERSION})
+	@$(eval ALL_IMAGES_NAMESPACE ?= $(shell echo ${CLUSTER_KIALI_NAME} | sed -e 's/.*\/\(.*\)\/.*/\1/'))
+	@$(eval CLUSTER_PLUGIN_INTERNAL_NAME ?= ${CLUSTER_REPO_INTERNAL}/${PLUGIN_CONTAINER_NAME})
 	@if [ "${CLUSTER_REPO_INTERNAL}" == "" -o "${CLUSTER_REPO_INTERNAL}" == "<none>" ]; then echo "Cannot determine OCP internal registry hostname. Make sure you 'oc login' to your cluster."; exit 1; fi
 	@if [ "${CLUSTER_REPO}" == "" -o "${CLUSTER_REPO}" == "<none>" ]; then echo "Cannot determine OCP external registry hostname. The OpenShift image registry has not been made available for external client access"; exit 1; fi
 	@echo "OCP repos: external=[${CLUSTER_REPO}] internal=[${CLUSTER_REPO_INTERNAL}]"
-	@${OC} get namespace $(shell echo ${CLUSTER_KIALI_NAME} | sed -e 's/.*\/\(.*\)\/.*/\1/') > /dev/null 2>&1 || \
-     ${OC} create namespace $(shell echo ${CLUSTER_KIALI_NAME} | sed -e 's/.*\/\(.*\)\/.*/\1/') > /dev/null 2>&1
-	@${OC} policy add-role-to-group system:image-puller system:serviceaccounts:${NAMESPACE} --namespace=$(shell echo ${CLUSTER_KIALI_NAME} | sed -e 's/.*\/\(.*\)\/.*/\1/') > /dev/null 2>&1
-	@${OC} get namespace $(shell echo ${CLUSTER_OPERATOR_NAME} | sed -e 's/.*\/\(.*\)\/.*/\1/') > /dev/null 2>&1 || \
-     ${OC} create namespace $(shell echo ${CLUSTER_OPERATOR_NAME} | sed -e 's/.*\/\(.*\)\/.*/\1/') > /dev/null 2>&1
-	@${OC} policy add-role-to-group system:image-puller system:serviceaccounts:${OPERATOR_NAMESPACE} --namespace=$(shell echo ${CLUSTER_OPERATOR_NAME} | sed -e 's/.*\/\(.*\)\/.*/\1/') > /dev/null 2>&1
+	@# Make sure the image namespace exists - the image registry will get images from here
+	@${OC} get namespace ${ALL_IMAGES_NAMESPACE} &> /dev/null || \
+	  ${OC} create namespace ${ALL_IMAGES_NAMESPACE} &> /dev/null
+	@# Add image-puller role so the pods can pull the images from the internal image registry
+	@${OC} policy add-role-to-group system:image-puller system:serviceaccounts:${NAMESPACE} --namespace=${ALL_IMAGES_NAMESPACE} &> /dev/null
+	@${OC} policy add-role-to-group system:image-puller system:serviceaccounts:${OPERATOR_NAMESPACE} --namespace=${ALL_IMAGES_NAMESPACE} &> /dev/null
+	@${OC} policy add-role-to-group system:image-puller system:serviceaccounts:${OSSMCONSOLE_NAMESPACE} --namespace=${ALL_IMAGES_NAMESPACE} &> /dev/null
+	@# We need to make sure the 'default' service account is created - we'll need it later for the pull secret
+	@for i in {1..5}; do ${OC} get sa default -n ${ALL_IMAGES_NAMESPACE} &> /dev/null && break || echo -n "." && sleep 1; done; echo
 
 .prepare-minikube: .ensure-oc-exists .ensure-minikube-exists
 	@$(eval CLUSTER_REPO_INTERNAL ?= localhost:5000)
@@ -46,15 +52,15 @@
 	 fi
 
 .prepare-kind: .ensure-oc-exists .ensure-kind-exists
-	@$(eval CLUSTER_KIALI_TAG ?= ${CONTAINER_NAME}:${CONTAINER_VERSION})
-	@$(eval CLUSTER_OPERATOR_TAG ?= ${OPERATOR_CONTAINER_NAME}:${OPERATOR_CONTAINER_VERSION})
-ifeq ($(DORP),docker)
-	@$(eval CLUSTER_KIALI_INTERNAL_NAME ?= ${CONTAINER_NAME})
-	@$(eval CLUSTER_OPERATOR_INTERNAL_NAME ?= ${OPERATOR_CONTAINER_NAME})
-else
-	@$(eval CLUSTER_KIALI_INTERNAL_NAME ?= localhost/${CONTAINER_NAME})
-	@$(eval CLUSTER_OPERATOR_INTERNAL_NAME ?= localhost/${OPERATOR_CONTAINER_NAME})
-endif
+	@# If there is a docker process running with the name "kind-registry" assume it is used for the Kind cluster image registry.
+	@# "kind-registry" is the name start-kind.sh uses.
+	@# If no registry is found, the repo is just "" (it isn't accessible outside of KinD) - you must load the archive directly into Kind.
+	@$(eval CLUSTER_REPO ?= $(shell hostport="$$(${DORP} ps -f name=kind-registry --format '{{.Ports}}' 2>/dev/null | sed -E 's/(.*)->.*/\1/' | sed -E 's/127.0.0.1/localhost/')"; echo "$${hostport:-}"))
+	@$(eval CLUSTER_REPO_INTERNAL ?= ${CLUSTER_REPO})
+	@$(eval CLUSTER_KIALI_INTERNAL_NAME ?= $(shell if [ -z "${CLUSTER_REPO}" ]; then echo "localhost/${CONTAINER_NAME}"; else echo "${CLUSTER_REPO}/${CONTAINER_NAME}"; fi))
+	@$(eval CLUSTER_KIALI_TAG ?= ${CLUSTER_KIALI_INTERNAL_NAME}:${CONTAINER_VERSION})
+	@$(eval CLUSTER_OPERATOR_INTERNAL_NAME ?= $(shell if [ -z "${CLUSTER_REPO}" ]; then echo "localhost/${OPERATOR_CONTAINER_NAME}"; else echo "${CLUSTER_REPO}/${OPERATOR_CONTAINER_NAME}"; fi))
+	@$(eval CLUSTER_OPERATOR_TAG ?= ${CLUSTER_OPERATOR_INTERNAL_NAME}:${OPERATOR_CONTAINER_VERSION})
 
 .prepare-local: .ensure-oc-exists
 	@$(eval CLUSTER_KIALI_INTERNAL_NAME ?= ${CONTAINER_NAME})
@@ -122,7 +128,7 @@ else
 endif
 endif
 
-## cluster-add-users: Add two users to an OpenShift cluster - kiali (cluster admin) and johndoe (no additional permissions)
+## cluster-add-users: (OpenShift) Add two users - kiali (cluster admin), johndoe (no additional permissions); (non-OpenShift) Add one SA - testsa - with access to namespace $NAMESPACE
 ifeq ($(CLUSTER_TYPE),openshift)
 define HTPASSWD
 ---
@@ -154,7 +160,7 @@ endef
 export HTPASSWD
 
 cluster-add-users: .ensure-oc-exists
-	@echo "Creating users 'kiali' and 'johndoe'"
+	@echo "Creating users 'kiali' and 'johndoe' in OpenShift"
 	@echo "$${HTPASSWD}" | ${OC} apply -f -
 	@admintoken="$$(${OC} whoami -t)" ;\
    for i in {1..100} ; do \
@@ -169,9 +175,89 @@ cluster-add-users: .ensure-oc-exists
        fi \
      fi \
    done
-else
-cluster-add-users:
-	@echo "This target is only available when working with OpenShift (i.e. CLUSTER_TYPE=openshift)"
+
+else # ELSE ON NON-OPENSHIFT
+
+define TEST_SA_ROLE
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: testsa
+...
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: testsa-namespace-auth
+rules:
+- apiGroups: [""]
+  resources: ["namespaces", "pods/log"]
+  verbs: ["get"]
+- apiGroups: ["project.openshift.io"]
+  resources: ["projects"]
+  verbs: ["get"]
+...
+endef
+export TEST_SA_ROLE
+
+define TEST_ROLEBINDING
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: testsa-namespace-auth
+subjects:
+- kind: ServiceAccount
+  name: testsa
+  namespace: ${NAMESPACE}
+roleRef:
+  kind: ClusterRole
+  name: testsa-namespace-auth
+  apiGroup: rbac.authorization.k8s.io
+...
+endef
+export TEST_ROLEBINDING
+
+define TEST_CLUSTERROLEBINDING
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: testsa-all-namespace-auth
+subjects:
+- kind: ServiceAccount
+  name: testsa
+  namespace: ${NAMESPACE}
+roleRef:
+  kind: ClusterRole
+  name: testsa-namespace-auth
+  apiGroup: rbac.authorization.k8s.io
+...
+endef
+export TEST_CLUSTERROLEBINDING
+
+cluster-add-users: .ensure-oc-exists
+	@echo "Create ServiceAccount 'testsa' and give it permissions for namespace [${NAMESPACE}]"
+	@echo "$${TEST_SA_ROLE}" | ${OC} apply -n ${NAMESPACE} -f -
+	@echo "$${TEST_ROLEBINDING}" | ${OC} apply -n ${NAMESPACE} -f -
+	@echo
+	@echo "If you want to give the SA access to another namespace (e.g. 'foo'), create this object:"
+	@echo
+	@echo "cat <<EOM | ${OC} apply -n foo -f -"
+	@echo "$${TEST_ROLEBINDING}"
+	@echo "EOM"
+	@echo
+	@echo "If you want to give the SA access to all namespaces, create this object:"
+	@echo
+	@echo "cat <<EOM | ${OC} apply -f -"
+	@echo "$${TEST_CLUSTERROLEBINDING}"
+	@echo "EOM"
+	@echo
+	@echo "To create a token that you can use to log into Kiali:"
+	@echo
+	@echo "${OC} -n ${NAMESPACE} create token testsa"
+	@echo
 endif
 
 ## cluster-build-operator: Builds the operator image for development with a remote cluster
@@ -188,10 +274,10 @@ endif
 cluster-build-kiali: .prepare-cluster container-build-kiali
 ifeq ($(DORP),docker)
 	@echo Re-tag the already built Kiali container image for a remote cluster using docker
-	docker tag ${QUAY_TAG} ${CLUSTER_KIALI_TAG}
+	docker tag ${QUAY_TAG} ${CLUSTER_KIALI_TAG} ${CLUSTER_KIALI_TAG_INTERNAL}
 else
 	@echo Re-tag the already built Kiali container image for a remote cluster using podman
-	podman tag ${QUAY_TAG} ${CLUSTER_KIALI_TAG}
+	podman tag ${QUAY_TAG} ${CLUSTER_KIALI_TAG} ${CLUSTER_KIALI_TAG_INTERNAL}
 endif
 
 ## cluster-build: Builds the images for development with a remote cluster
@@ -200,14 +286,15 @@ cluster-build: cluster-build-operator cluster-build-kiali
 ## cluster-push-operator: Pushes Kiali operator container image to a remote cluster
 cluster-push-operator: cluster-build-operator
 ifeq ($(CLUSTER_TYPE),kind)
-ifeq ($(DORP),docker)
-	@echo Pushing Kiali operator image via docker to kind cluster: ${CLUSTER_OPERATOR_TAG}
-	${KIND} load docker-image --name ${KIND_NAME} ${CLUSTER_OPERATOR_TAG}
-else
-	@echo Pushing Kiali operator image via podman to kind cluster: ${CLUSTER_OPERATOR_TAG}
+	@echo Pushing Kiali operator image to kind cluster: ${CLUSTER_OPERATOR_TAG}
 	@rm -f /tmp/kiali-cluster-push-operator.tar
-	podman save -o /tmp/kiali-cluster-push-operator.tar ${CLUSTER_OPERATOR_TAG}
+	${DORP} save -o /tmp/kiali-cluster-push-operator.tar ${CLUSTER_OPERATOR_TAG}
 	${KIND} load image-archive /tmp/kiali-cluster-push-operator.tar --name ${KIND_NAME}
+	@# If there is an external repo used by Kind, push it there, too, so it can be loaded from there
+ifeq ($(DORP),docker)
+	@if [ -n "${CLUSTER_REPO}" ]; then docker push ${CLUSTER_OPERATOR_TAG}; fi
+else
+	@if [ -n "${CLUSTER_REPO}" ]; then podman push --tls-verify=false ${CLUSTER_OPERATOR_TAG}; fi
 endif
 else
 ifeq ($(DORP),docker)
@@ -222,14 +309,15 @@ endif
 ## cluster-push-kiali: Pushes Kiali image to a remote cluster
 cluster-push-kiali: cluster-build-kiali
 ifeq ($(CLUSTER_TYPE),kind)
-ifeq ($(DORP),docker)
-	@echo Pushing Kiali image via docker to kind cluster: ${CLUSTER_KIALI_TAG}
-	${KIND} load docker-image --name ${KIND_NAME} ${CLUSTER_KIALI_TAG}
-else
-	@echo Pushing Kiali image via podman to kind cluster: ${CLUSTER_KIALI_TAG}
+	@echo Pushing Kiali image to kind cluster: ${CLUSTER_KIALI_TAG}
 	@rm -f /tmp/kiali-cluster-push-kiali.tar
-	podman save -o /tmp/kiali-cluster-push-kiali.tar ${CLUSTER_KIALI_TAG}
+	${DORP} save -o /tmp/kiali-cluster-push-kiali.tar ${CLUSTER_KIALI_TAG}
 	${KIND} load image-archive /tmp/kiali-cluster-push-kiali.tar --name ${KIND_NAME}
+	@# If there is an external repo used by Kind, push it there, too, so it can be loaded from there
+ifeq ($(DORP),docker)
+	@if [ -n "${CLUSTER_REPO}" ]; then docker push ${CLUSTER_KIALI_TAG}; fi
+else
+	@if [ -n "${CLUSTER_REPO}" ]; then podman push --tls-verify=false ${CLUSTER_KIALI_TAG}; fi
 endif
 else
 ifeq ($(DORP),docker)

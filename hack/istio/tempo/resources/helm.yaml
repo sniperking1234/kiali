@@ -1,0 +1,24 @@
+storage:
+  trace:
+    backend: s3
+    s3:
+      access_key: 'seaweedfs'
+      secret_key: 'seaweedfs123'
+      bucket: 'tempo-data'
+      endpoint: 'seaweedfs:8333'
+      insecure: true
+minio:
+  enabled: false
+traces:
+  otlp:
+    grpc:
+      enabled: true
+    http:
+      enabled: true
+  zipkin:
+    enabled: true
+  jaeger:
+    thriftHttp:
+      enabled: false
+  opencensus:
+    enabled: false

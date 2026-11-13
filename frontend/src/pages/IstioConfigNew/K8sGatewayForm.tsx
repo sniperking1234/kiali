@@ -1,0 +1,174 @@
+import * as React from 'react';
+import type { MenuToggleElement} from '@patternfly/react-core';
+import { FormGroup, MenuToggle, Select, SelectList, SelectOption } from '@patternfly/react-core';
+import { AddressList } from './GatewayForm/AddressList';
+import type { Address, Listener} from '../../types/IstioObjects';
+import { MAX_PORT, MIN_PORT } from '../../types/IstioObjects';
+import { addSelectorLabels, ListenerList } from './GatewayForm/ListenerList';
+import { isValidHostname, isValidName, isValidTLS, SELECTOR } from './GatewayForm/ListenerBuilder';
+import { isValidAddress } from './GatewayForm/AddressBuilder';
+import { serverConfig } from '../../config';
+import { t } from 'utils/I18nUtils';
+
+type Props = {
+  k8sGateway: K8sGatewayState;
+  onChange: (k8sGateway: K8sGatewayState) => void;
+};
+
+// Gateway and Sidecar states are consolidated in the parent page
+export type K8sGatewayState = {
+  addresses: Address[];
+  gatewayClass: string;
+  listeners: Listener[];
+  listenersForm: ListenerForm[];
+  validHosts: boolean;
+};
+type K8sGatewayFormState = K8sGatewayState & {
+  isGatewayClassSelectOpen: boolean;
+};
+
+export const initK8sGateway = (): K8sGatewayState => ({
+  addresses: [],
+  gatewayClass: serverConfig.gatewayAPIClasses.length > 0 ? serverConfig.gatewayAPIClasses[0].className : '',
+  listeners: [],
+  listenersForm: [],
+  validHosts: false
+});
+
+export const isK8sGatewayStateValid = (g: K8sGatewayState): boolean => {
+  return (
+    g.listeners.length > 0 &&
+    validListeners(g.listeners) &&
+    validListenerForms(g.listenersForm) &&
+    (g.addresses.length === 0 || validAddresses(g.addresses))
+  );
+};
+
+export type ListenerForm = {
+  from: string;
+  hostname: string;
+  isHostValid: boolean;
+  isLabelSelectorValid: boolean;
+  name: string;
+  port: string;
+  protocol: string;
+  sSelectorLabels: string;
+  tlsCert: string;
+  tlsMode: string;
+};
+
+const validListeners = (listeners: Listener[]): boolean => {
+  return listeners.every((e: Listener) => {
+    return (
+      isValidName(e.name) &&
+      typeof e.port !== 'undefined' &&
+      e.port >= MIN_PORT &&
+      e.port <= MAX_PORT &&
+      isValidHostname(e.hostname) &&
+      isValidTLS(e.protocol, e.tls)
+    );
+  });
+};
+
+const validListenerForms = (listenersForm: ListenerForm[]): boolean => {
+  return listenersForm.every((e: ListenerForm) => {
+    return e.from === SELECTOR ? addSelectorLabels(e.sSelectorLabels)[0] : true;
+  });
+};
+
+const validAddresses = (address: Address[]): boolean => {
+  return address.every((a: Address) => {
+    return isValidAddress(a);
+  });
+};
+
+export class K8sGatewayForm extends React.Component<Props, K8sGatewayFormState> {
+  constructor(props: Props) {
+    super(props);
+    this.state = {
+      ...initK8sGateway(),
+      isGatewayClassSelectOpen: false
+    };
+  }
+
+  componentDidMount(): void {
+    this.setState({
+      ...this.props.k8sGateway,
+      isGatewayClassSelectOpen: false
+    });
+  }
+
+  private getFormState(): K8sGatewayState {
+    const { isGatewayClassSelectOpen, ...formState } = this.state;
+    return formState;
+  }
+
+  onChangeListener = (listeners: Listener[], listenersForm: ListenerForm[]): void => {
+    this.setState({ listeners: listeners, listenersForm: listenersForm }, () =>
+      this.props.onChange(this.getFormState())
+    );
+  };
+
+  onChangeAddress = (addresses: Address[]): void => {
+    this.setState({ addresses: addresses }, () => this.props.onChange(this.getFormState()));
+  };
+
+  render(): React.ReactNode {
+    return (
+      <>
+        {serverConfig.gatewayAPIClasses.length > 1 && (
+          <FormGroup label={t('Gateway Class')} fieldId="gatewayClass">
+            <Select
+              id="gatewayClass"
+              isOpen={this.state.isGatewayClassSelectOpen}
+              selected={this.state.gatewayClass}
+              onSelect={(_event, value) => {
+                this.setState(
+                  {
+                    gatewayClass: value as string,
+                    isGatewayClassSelectOpen: false
+                  },
+                  () => this.props.onChange(this.getFormState())
+                );
+              }}
+              onOpenChange={isGatewayClassSelectOpen => this.setState({ isGatewayClassSelectOpen })}
+              toggle={(toggleRef: React.Ref<MenuToggleElement>) => (
+                <MenuToggle
+                  id="gatewayClass-toggle"
+                  ref={toggleRef}
+                  onClick={() => this.setState({ isGatewayClassSelectOpen: !this.state.isGatewayClassSelectOpen })}
+                  isExpanded={this.state.isGatewayClassSelectOpen}
+                  isFullWidth
+                >
+                  {serverConfig.gatewayAPIClasses.find(c => c.className === this.state.gatewayClass)?.name ||
+                    this.state.gatewayClass}
+                </MenuToggle>
+              )}
+              aria-label={t('Gateway Class Select')}
+            >
+              <SelectList>
+                {serverConfig.gatewayAPIClasses.map((option, index) => (
+                  <SelectOption key={index} value={option.className}>
+                    {option.name}
+                  </SelectOption>
+                ))}
+              </SelectList>
+            </Select>
+          </FormGroup>
+        )}
+
+        <FormGroup label={t('Listeners')} fieldId="listener" isRequired={true}>
+          <ListenerList
+            onChange={this.onChangeListener}
+            listenersForm={this.state.listenersForm}
+            listeners={this.state.listeners}
+          />
+        </FormGroup>
+
+        <FormGroup label={t('Addresses')} fieldId="gwAddressList">
+          <AddressList onChange={this.onChangeAddress} addressList={this.state.addresses} />
+        </FormGroup>
+      </>
+    );
+  }
+}

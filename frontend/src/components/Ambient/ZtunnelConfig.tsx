@@ -1,0 +1,274 @@
+import * as React from 'react';
+import { Workload } from 'types/Workload';
+import { Pod, ZtunnelConfigDump } from 'types/IstioObjects';
+import * as API from '../../services/Api';
+import { addError } from '../../utils/AlertUtils';
+import { Card, CardBody, Tab, Tabs, TooltipPosition } from '@patternfly/react-core';
+import { activeTab } from '../../components/Tab/Tabs';
+import { location, router } from '../../app/History';
+import {
+  tabName as workloadTabName,
+  defaultTab as workloadDefaultTab
+} from '../../pages/WorkloadDetails/WorkloadDetailsPage';
+import { TimeInMilliseconds, TimeRange } from '../../types/Common';
+import { subTabStyle } from 'styles/TabStyles';
+import { ToolbarDropdown } from '../Dropdown/ToolbarDropdown';
+import { PFBadge, PFBadges } from '../Pf/PfBadges';
+import { kialiStyle } from '../../styles/StyleUtils';
+import { classes } from 'typestyle';
+import { tabCardStyle, constrainedScrollStyle, flexCardStyle, flexFillStyle, noShrinkStyle } from 'styles/FlexStyles';
+import { ZtunnelServicesTable } from './ZtunnelServicesTable';
+import { ZtunnelWorkloadsTable } from './ZtunnelWorkloadsTable';
+import { t } from 'utils/I18nUtils';
+import { SortableTh } from '../Table/SimpleTable';
+import { ZtunnelMetrics } from './ZtunnelMetrics';
+import { FilterSelected, StatefulFilters } from '../Filters/StatefulFilters';
+import { servicesFilters, workloadsFilters } from './Filters/ZtunnelFilters';
+import { ActiveFiltersInfo } from '../../types/Filters';
+import { runFilters } from '../FilterList/FilterHelper';
+import { ConfigType, ZtunnelLabels } from './Filters/ZtunnelLabels';
+
+const resources: string[] = ['services', 'workloads', 'metrics'];
+
+const ztunnelTabs = ['services', 'workloads', 'metrics'];
+const tabName = 'ztunnelTab';
+const defaultTab = 'services';
+
+type ZtunnelConfigProps = {
+  lastRefreshAt: TimeInMilliseconds;
+  namespace: string;
+  rangeDuration: TimeRange;
+  workload: Workload;
+};
+
+const iconStyle = kialiStyle({
+  display: 'inline-block',
+  alignSelf: 'center'
+});
+
+const toolbarStyle = kialiStyle({
+  marginBottom: '1.25rem',
+  display: 'flex',
+  alignItems: 'center'
+});
+
+const toolbarClass = kialiStyle({
+  display: 'flex',
+  paddingTop: '0'
+});
+
+export interface SortableCompareTh<T> extends SortableTh {
+  compare?: (a: T, b: T) => number;
+}
+
+export const ZtunnelConfig: React.FC<ZtunnelConfigProps> = (props: ZtunnelConfigProps) => {
+  const sortedPods = (): Pod[] => {
+    return props.workload?.pods.sort((p1: Pod, p2: Pod) => (p1.name >= p2.name ? 1 : -1));
+  };
+
+  const [pod, setPod] = React.useState(sortedPods()[0]);
+  const [config, setConfig] = React.useState<ZtunnelConfigDump>({});
+  const [fetch, setFetch] = React.useState(true);
+  const [activeKey, setActiveKey] = React.useState(ztunnelTabs.indexOf(activeTab(tabName, defaultTab)));
+  const [resource, setResource] = React.useState(activeTab(tabName, defaultTab));
+  const serviceFilters = servicesFilters(config);
+  const workloadFilters = workloadsFilters(config);
+
+  const [activeServiceFilters, setActiveServiceFilters] = React.useState<ActiveFiltersInfo>(
+    FilterSelected.init(serviceFilters)
+  );
+  const filteredServices = runFilters(config.services ? config.services : [], serviceFilters, activeServiceFilters);
+
+  const [activeWorkloadFilters, setActiveWorkloadFilters] = React.useState<ActiveFiltersInfo>(
+    FilterSelected.init(workloadFilters)
+  );
+  const filteredWorkloads = runFilters(
+    config.workloads ? config.workloads : [],
+    workloadFilters,
+    activeWorkloadFilters
+  );
+
+  const prevResource = React.createRef();
+  const prevPod = React.createRef();
+
+  const fetchZtunnelConfig = React.useCallback(async (ns, name, cluster: string) => {
+    await API.getPodZtunnelConfig(ns, name, cluster)
+      .then(resultConfig => {
+        setConfig(resultConfig.data);
+        setFetch(false);
+      })
+      .catch(error => {
+        addError(`Could not fetch ztunnel config for ${name}.`, error);
+      });
+  }, []);
+
+  React.useEffect(() => {
+    const currentTabIndex = ztunnelTabs.indexOf(activeTab(tabName, defaultTab));
+    if (
+      prevPod.current !== undefined &&
+      prevPod.current !== pod &&
+      prevResource.current !== undefined &&
+      prevResource.current !== resource &&
+      fetch === true
+    ) {
+      setFetch(false);
+      fetchZtunnelConfig(props.namespace, pod.name, props.workload.cluster ? props.workload.cluster : '');
+      if (currentTabIndex !== activeKey) {
+        setActiveKey(currentTabIndex);
+      }
+    }
+  }, [
+    resource,
+    pod,
+    activeKey,
+    prevPod,
+    prevResource,
+    fetchZtunnelConfig,
+    fetch,
+    props.namespace,
+    props.workload.cluster
+  ]);
+
+  const ztunnelHandleTabClick = (_event: React.MouseEvent, tabIndex: string | number): void => {
+    const resourceIdx: number = +tabIndex;
+    const targetResource: string = resources[resourceIdx];
+
+    if (targetResource !== resource) {
+      setConfig({});
+      setFetch(true);
+      setResource(targetResource);
+      setActiveKey(resourceIdx);
+
+      const mainTab = new URLSearchParams(location.getSearch()).get(workloadTabName) ?? workloadDefaultTab;
+      const urlParams = new URLSearchParams(location.getSearch());
+      urlParams.set(tabName, targetResource);
+      urlParams.set(workloadTabName, mainTab);
+      router.navigate(`${location.getPathname()}?${urlParams.toString()}`);
+    }
+  };
+
+  const setPodByKey = (podName: string): void => {
+    const podIdx: number = +podName;
+    const targetPod: Pod = sortedPods()[podIdx];
+
+    if (targetPod.name !== pod.name) {
+      setConfig({});
+      setPod(targetPod);
+      setFetch(true);
+    }
+  };
+
+  const tabs: JSX.Element[] = [];
+
+  const servicesTab = (
+    <Tab title={t('Services')} eventKey={0} key="services">
+      <Card className={classes(flexCardStyle, tabCardStyle)}>
+        <CardBody>
+          <div className={flexFillStyle}>
+            <div className={classes(toolbarStyle, noShrinkStyle)}>
+              <div key="service-icon" className={iconStyle}>
+                <PFBadge badge={PFBadges.Pod} position={TooltipPosition.top} />
+              </div>
+              <ToolbarDropdown
+                id="ztunnel_pods_list"
+                tooltip={t('Display ztunnel config for the selected pod')}
+                handleSelect={key => setPodByKey(key)}
+                value={pod.name}
+                label={pod.name}
+                options={props.workload.pods.map((pod: Pod) => pod.name).sort()}
+              />
+              <div style={{ marginLeft: '1.25rem', marginRight: '0.5em' }}>{t('Filter')}:</div>
+              <StatefulFilters
+                initialFilters={serviceFilters}
+                onFilterChange={active => setActiveServiceFilters(active)}
+                toolbarClass={toolbarClass}
+                cleanState
+              >
+                <ZtunnelLabels
+                  key="service-labels"
+                  filteredConfig={activeServiceFilters.filters.length > 0 ? filteredServices : config.services}
+                  total={config?.services?.length ?? filteredServices.length}
+                  type={ConfigType.SERVICE}
+                />
+              </StatefulFilters>
+            </div>
+            <ZtunnelServicesTable config={filteredServices} />
+          </div>
+        </CardBody>
+      </Card>
+    </Tab>
+  );
+  tabs.push(servicesTab);
+
+  const workloadsTab = (
+    <Tab title={t('Workloads')} eventKey={1} key="workloads">
+      <Card className={classes(flexCardStyle, tabCardStyle)}>
+        <CardBody>
+          <div className={flexFillStyle}>
+            <div className={classes(toolbarStyle, noShrinkStyle)}>
+              <div key="service-icon" className={iconStyle}>
+                <PFBadge badge={PFBadges.Pod} position={TooltipPosition.top} />
+              </div>
+              <ToolbarDropdown
+                id="envoy_pods_list"
+                tooltip={t('Display envoy config for the selected pod')}
+                handleSelect={key => setPodByKey(key)}
+                value={pod.name}
+                label={pod.name}
+                options={props.workload.pods.map((pod: Pod) => pod.name).sort()}
+              />
+              <div style={{ marginLeft: '1.25rem', marginRight: '0.5em' }}>{t('Filter')}:</div>
+              <StatefulFilters
+                initialFilters={workloadFilters}
+                onFilterChange={active => setActiveWorkloadFilters(active)}
+                toolbarClass={toolbarClass}
+                cleanState
+              >
+                <ZtunnelLabels
+                  key="workload-labels"
+                  filteredConfig={activeWorkloadFilters.filters.length > 0 ? filteredWorkloads : config?.workloads}
+                  total={config?.workloads?.length ?? filteredWorkloads.length}
+                  type={ConfigType.WORKLOAD}
+                />
+              </StatefulFilters>
+            </div>
+            <ZtunnelWorkloadsTable config={filteredWorkloads} />
+          </div>
+        </CardBody>
+      </Card>
+    </Tab>
+  );
+  tabs.push(workloadsTab);
+
+  const metricsTab = (
+    <Tab title={t('Metrics')} eventKey={2} key="metrics">
+      <Card className={classes(flexCardStyle, tabCardStyle)}>
+        <CardBody>
+          <ZtunnelMetrics
+            rangeDuration={props.rangeDuration}
+            lastRefreshAt={props.lastRefreshAt}
+            namespace={props.namespace}
+            cluster={props.workload.cluster ? props.workload.cluster : ''}
+          />
+        </CardBody>
+      </Card>
+    </Tab>
+  );
+  tabs.push(metricsTab);
+
+  return (
+    <div className={classes(flexFillStyle, constrainedScrollStyle)}>
+      <div className={subTabStyle}>
+        <Tabs
+          id="ztunnel-details"
+          activeKey={activeKey}
+          onSelect={ztunnelHandleTabClick}
+          mountOnEnter={true}
+          unmountOnExit={true}
+        >
+          {tabs}
+        </Tabs>
+      </div>
+    </div>
+  );
+};

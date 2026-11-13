@@ -1,29 +1,31 @@
 package business
 
 import (
-	"fmt"
+	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"sync"
 	"testing"
 
 	"github.com/gorilla/mux"
-	osapps_v1 "github.com/openshift/api/apps/v1"
-	osproject_v1 "github.com/openshift/api/project/v1"
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
 	apps_v1 "k8s.io/api/apps/v1"
-	batch_v1 "k8s.io/api/batch/v1"
-	batch_v1beta1 "k8s.io/api/batch/v1beta1"
 	v1 "k8s.io/api/core/v1"
 	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime"
 
+	"github.com/kiali/kiali/cache"
 	"github.com/kiali/kiali/config"
+	"github.com/kiali/kiali/istio"
+	"github.com/kiali/kiali/istio/istiotest"
 	"github.com/kiali/kiali/kubernetes"
 	"github.com/kiali/kiali/kubernetes/kubetest"
 	"github.com/kiali/kiali/log"
 	"github.com/kiali/kiali/models"
+	"github.com/kiali/kiali/tracing"
+	"github.com/kiali/kiali/tracing/tracingtest"
 )
 
 type addOnsSetup struct {
@@ -82,13 +84,13 @@ func TestComponentNotRunning(t *testing.T) {
 
 	for _, ds := range dss {
 		d := fakeDeploymentWithStatus(
-			"istio-egressgateway",
-			map[string]string{"app": "istio-egressgateway", "istio": "egressgateway"},
+			"istio=egressgateway",
+			map[string]string{"istio": "egressgateway"},
 			ds,
 		)
 		wl := &models.Workload{}
-		wl.ParseDeployment(&d)
-		assert.Equal(Unhealthy, GetWorkloadStatus(*wl))
+		wl.ParseDeployment(d, config.Get())
+		assert.Equal(kubernetes.ComponentUnhealthy, GetWorkloadStatus(*wl))
 	}
 }
 
@@ -96,8 +98,8 @@ func TestComponentRunning(t *testing.T) {
 	assert := assert.New(t)
 
 	d := fakeDeploymentWithStatus(
-		"istio-egressgateway",
-		map[string]string{"app": "istio-egressgateway"},
+		"istio=egressgateway",
+		map[string]string{"istio": "egressgateway"},
 		apps_v1.DeploymentStatus{
 			Replicas:            2,
 			AvailableReplicas:   2,
@@ -105,18 +107,17 @@ func TestComponentRunning(t *testing.T) {
 		})
 
 	wl := &models.Workload{}
-	wl.ParseDeployment(&d)
+	wl.ParseDeployment(d, config.Get())
 
-	assert.Equal(Healthy, GetWorkloadStatus(*wl))
+	assert.Equal(kubernetes.ComponentHealthy, GetWorkloadStatus(*wl))
 }
 
 func TestComponentNamespaces(t *testing.T) {
 	a := assert.New(t)
 
 	conf := confWithComponentNamespaces()
-	config.Set(conf)
 
-	nss := getComponentNamespaces()
+	nss := getComponentNamespaces(conf)
 
 	a.Contains(nss, "istio-system")
 	a.Contains(nss, "istio-admin")
@@ -124,37 +125,39 @@ func TestComponentNamespaces(t *testing.T) {
 	a.Len(nss, 4)
 }
 
-func mockAddOnsCalls(ds []apps_v1.Deployment, daemonSets []apps_v1.DaemonSet, pods []v1.Pod, isIstioReachable bool, overrideAddonURLs bool) (*kubetest.K8SClientMock, *httptest.Server, *int, *int, *int) {
+func mockAddOnsCalls(t *testing.T, objects []runtime.Object, _ bool, overrideAddonURLs bool) (kubernetes.UserClientInterface, *int, *int, *int) {
 	// Prepare the Call counts for each Addon
-	jaegerCalls, grafanaCalls, prometheusCalls := 0, 0, 0
+	grafanaCalls, persesCalls, prometheusCalls := 0, 0, 0
 
-	// Mock k8s api calls
-	k8s := mockDeploymentCall(ds, daemonSets, pods, isIstioReachable)
-	routes := mockAddOnCalls(defaultAddOnCalls(&jaegerCalls, &grafanaCalls, &prometheusCalls))
-	httpServer := mockServer(routes)
+	objects = append(objects, &v1.Namespace{ObjectMeta: meta_v1.ObjectMeta{Name: "istio-system"}})
+
+	k8s := kubetest.NewFakeK8sClient(objects...)
+	k8s.OpenShift = true
+	routes := mockAddOnCalls(defaultAddOnCalls(&grafanaCalls, &persesCalls, &prometheusCalls))
+	httpServer := mockServer(t, routes)
 
 	// Adapt the AddOns URLs to the mock Server
 	conf := addonAddMockUrls(httpServer.URL, config.NewConfig(), overrideAddonURLs)
 	config.Set(conf)
 
-	return k8s, httpServer, &jaegerCalls, &grafanaCalls, &prometheusCalls
+	return k8s, &grafanaCalls, &persesCalls, &prometheusCalls
 }
 
-func sampleIstioComponent() ([]apps_v1.Deployment, []apps_v1.DaemonSet, []v1.Pod, bool, bool) {
-	return []apps_v1.Deployment{
-			fakeDeploymentWithStatus(
-				"istio-egressgateway",
-				map[string]string{"app": "istio-egressgateway"},
-				apps_v1.DeploymentStatus{
-					Replicas:            2,
-					AvailableReplicas:   2,
-					UnavailableReplicas: 0,
-				}),
-		},
-		[]apps_v1.DaemonSet{},
-		healthyIstiods(),
-		true,
-		false
+func sampleIstioComponent() ([]runtime.Object, bool, bool) {
+	deployment := fakeDeploymentWithStatus(
+		"istio=egressgateway",
+		map[string]string{"istio": "egressgateway"},
+		apps_v1.DeploymentStatus{
+			Replicas:            2,
+			AvailableReplicas:   2,
+			UnavailableReplicas: 0,
+		})
+	objects := []runtime.Object{deployment}
+	for _, obj := range healthyIstiods() {
+		o := obj
+		objects = append(objects, &o)
+	}
+	return objects, true, false
 }
 
 func healthyIstiods() []v1.Pod {
@@ -179,228 +182,343 @@ func fakePod(name, namespace, appLabel, phase string) v1.Pod {
 			Phase: v1.PodPhase(phase),
 		},
 	}
-
 }
 
 func TestGrafanaWorking(t *testing.T) {
 	assert := assert.New(t)
 
-	k8s, httpServ, jaegerCalls, grafanaCalls, promCalls := mockAddOnsCalls(sampleIstioComponent())
-	defer httpServ.Close()
+	objs, b1, b2 := sampleIstioComponent()
+	k8s, grafanaCalls, persesCalls, promCalls := mockAddOnsCalls(t, objs, b1, b2)
 
-	iss := NewWithBackends(k8s, nil, nil).IstioStatus
-	icsl, error := iss.GetStatus()
+	conf := config.Get()
+	config.Set(conf)
+
+	iss := NewLayerBuilder(t, conf).WithClient(k8s).WithTraceLoader(mockJaeger).Build().IstioStatus
+	icsl, error := iss.GetStatus(context.TODO())
 	assert.NoError(error)
 
 	// Requests to AddOns have to be 1
 	assert.Equal(1, *grafanaCalls)
-	assert.Equal(1, *jaegerCalls)
 	assert.Equal(1, *promCalls)
+	assert.Equal(1, *persesCalls)
 
-	assertNotPresent(assert, icsl, "grafana")
-	assertNotPresent(assert, icsl, "prometheus")
-	assertNotPresent(assert, icsl, "jaeger")
-	assertNotPresent(assert, icsl, "custom dashboards")
+	// All services are healthy
+	assertComponent(assert, icsl, "grafana", kubernetes.ComponentHealthy, false)
+	assertComponent(assert, icsl, "prometheus", kubernetes.ComponentHealthy, false)
+	assertComponent(assert, icsl, "tracing", kubernetes.ComponentHealthy, false)
+	assertComponent(assert, icsl, "custom dashboards", kubernetes.ComponentHealthy, false)
 }
 
 func TestGrafanaDisabled(t *testing.T) {
 	assert := assert.New(t)
 
-	k8s, httpServ, jaegerCalls, grafanaCalls, promCalls := mockAddOnsCalls(sampleIstioComponent())
-	defer httpServ.Close()
-
+	objects := []runtime.Object{
+		fakeDeploymentWithStatus(
+			"istio=egressgateway",
+			map[string]string{"istio": "egressgateway"},
+			apps_v1.DeploymentStatus{
+				Replicas:            2,
+				AvailableReplicas:   2,
+				UnavailableReplicas: 0,
+			}),
+	}
+	k8s, grafanaCalls, persesCalls, promCalls := mockAddOnsCalls(t, objects, true, false)
 	// Disable Grafana
 	conf := config.Get()
 	conf.ExternalServices.Grafana.Enabled = false
 	config.Set(conf)
 
-	iss := NewWithBackends(k8s, nil, nil).IstioStatus
-	icsl, error := iss.GetStatus()
+	iss := NewLayerBuilder(t, conf).WithClient(k8s).WithTraceLoader(mockJaeger).Build().IstioStatus
+	icsl, error := iss.GetStatus(context.TODO())
 	assert.NoError(error)
-
-	// Only two Istio components are missing
-	assert.Equal(2, len(icsl))
 
 	// No request performed to Grafana endpoint
 	assert.Zero(*grafanaCalls)
 
-	// Requests to Jaeger and Prometheus performed once
-	assert.Equal(1, *jaegerCalls)
+	// Requests to Tracing and Prometheus performed once
 	assert.Equal(1, *promCalls)
 
+	assert.Equal(1, *persesCalls)
+	// Grafana is disabled
 	assertNotPresent(assert, icsl, "grafana")
+
+	// istiod component is missing
+	assertComponent(assert, icsl, "istiod", kubernetes.ComponentNotFound, true)
+
+	// The rest of the components are healthy
+	assertComponent(assert, icsl, "istio=egressgateway", kubernetes.ComponentHealthy, false)
+	assertComponent(assert, icsl, "prometheus", kubernetes.ComponentHealthy, false)
+	assertComponent(assert, icsl, "tracing", kubernetes.ComponentHealthy, false)
+	assertComponent(assert, icsl, "custom dashboards", kubernetes.ComponentHealthy, false)
+}
+
+func TestPrometheusDisabled(t *testing.T) {
+	assert := assert.New(t)
+
+	objects := []runtime.Object{
+		fakeDeploymentWithStatus(
+			"istio=egressgateway",
+			map[string]string{"istio": "egressgateway"},
+			apps_v1.DeploymentStatus{
+				Replicas:            2,
+				AvailableReplicas:   2,
+				UnavailableReplicas: 0,
+			}),
+	}
+	k8s, grafanaCalls, _, promCalls := mockAddOnsCalls(t, objects, true, false)
+	conf := config.Get()
+	conf.ExternalServices.Prometheus.Enabled = false
+	config.Set(conf)
+
+	iss := NewLayerBuilder(t, conf).WithClient(k8s).WithTraceLoader(mockJaeger).Build().IstioStatus
+	icsl, error := iss.GetStatus(context.TODO())
+	assert.NoError(error)
+
+	assert.Zero(*promCalls)
 	assertNotPresent(assert, icsl, "prometheus")
-	assertNotPresent(assert, icsl, "jaeger")
-	assertNotPresent(assert, icsl, "custom dashboards")
+
+	assert.NotZero(*grafanaCalls)
+	assertComponent(assert, icsl, "grafana", kubernetes.ComponentHealthy, false)
 }
 
 func TestGrafanaNotWorking(t *testing.T) {
 	assert := assert.New(t)
-	jaegerCalls, grafanaCalls, prometheusCalls := 0, 0, 0
-	dps, ds, pods, istiodReachable, _ := sampleIstioComponent()
-	k8s := mockDeploymentCall(dps, ds, pods, istiodReachable)
-	addOnsStetup := defaultAddOnCalls(&jaegerCalls, &grafanaCalls, &prometheusCalls)
+	grafanaCalls, persesCalls, prometheusCalls := 0, 0, 0
+	objects := []runtime.Object{
+		fakeDeploymentWithStatus(
+			"istio=egressgateway",
+			map[string]string{"istio": "egressgateway"},
+			apps_v1.DeploymentStatus{
+				Replicas:            2,
+				AvailableReplicas:   2,
+				UnavailableReplicas: 0,
+			}),
+	}
+	objects = append(objects, &v1.Namespace{ObjectMeta: meta_v1.ObjectMeta{Name: "istio-system"}})
+	addOnsStetup := defaultAddOnCalls(&grafanaCalls, &persesCalls, &prometheusCalls)
 	addOnsStetup["grafana"] = addOnsSetup{
 		Url:        "/grafana/mock",
 		StatusCode: 501,
 		CallCount:  &grafanaCalls,
 	}
 	routes := mockAddOnCalls(addOnsStetup)
-	httpServer := mockServer(routes)
-	defer httpServer.Close()
+	httpServer := mockServer(t, routes)
 
 	// Adapt the AddOns URLs to the mock Server
 	conf := addonAddMockUrls(httpServer.URL, config.NewConfig(), false)
 	config.Set(conf)
 
-	iss := NewWithBackends(k8s, nil, nil).IstioStatus
-	icsl, error := iss.GetStatus()
-	assert.NoError(error)
+	k8s := kubetest.NewFakeK8sClient(objects...)
+	k8s.OpenShift = true
 
-	// Grafana and two Istio comps missing
-	assert.Equal(3, len(icsl))
+	iss := NewLayerBuilder(t, conf).WithClient(k8s).WithTraceLoader(mockJaeger).Build().IstioStatus
+	icsl, error := iss.GetStatus(context.TODO())
+	assert.NoError(error)
 
 	// Requests to AddOns have to be 1
 	assert.Equal(1, grafanaCalls)
-	assert.Equal(1, jaegerCalls)
 	assert.Equal(1, prometheusCalls)
 
-	assertComponent(assert, icsl, "grafana", Unreachable, false)
-	assertNotPresent(assert, icsl, "prometheus")
-	assertNotPresent(assert, icsl, "jaeger")
-	assertNotPresent(assert, icsl, "custom dashboards")
+	// Grafana and istiod comp missing
+	assertComponent(assert, icsl, "grafana", kubernetes.ComponentUnreachable, false)
+	assertComponent(assert, icsl, "istiod", kubernetes.ComponentNotFound, true)
+
+	// The rest of the components are healthy
+	assertComponent(assert, icsl, "istio=egressgateway", kubernetes.ComponentHealthy, false)
+	assertComponent(assert, icsl, "prometheus", kubernetes.ComponentHealthy, false)
+	assertComponent(assert, icsl, "tracing", kubernetes.ComponentHealthy, false)
+	assertComponent(assert, icsl, "custom dashboards", kubernetes.ComponentHealthy, false)
+}
+
+func TestFailingTracingService(t *testing.T) {
+	assert := assert.New(t)
+
+	objs, b1, b2 := sampleIstioComponent()
+	k8s, grafanaCalls, persesCalls, promCalls := mockAddOnsCalls(t, objs, b1, b2)
+
+	conf := config.Get()
+	config.Set(conf)
+
+	iss := NewLayerBuilder(t, conf).WithClient(k8s).WithTraceLoader(mockFailingJaeger).Build().IstioStatus
+	icsl, error := iss.GetStatus(context.TODO())
+	assert.NoError(error)
+
+	// Requests to AddOns have to be 1
+	assert.Equal(1, *grafanaCalls)
+	assert.Equal(1, *promCalls)
+	assert.Equal(1, *persesCalls)
+
+	// Tracing service is unreachable
+	assertComponent(assert, icsl, "tracing", kubernetes.ComponentUnreachable, false)
+
+	// The rest of the services are healthy
+	assertComponent(assert, icsl, "grafana", kubernetes.ComponentHealthy, false)
+	assertComponent(assert, icsl, "prometheus", kubernetes.ComponentHealthy, false)
+	assertComponent(assert, icsl, "custom dashboards", kubernetes.ComponentHealthy, false)
 }
 
 func TestOverriddenUrls(t *testing.T) {
 	assert := assert.New(t)
 
-	dps, ds, pods, idReachable, _ := sampleIstioComponent()
-	k8s, httpServ, jaegerCalls, grafanaCalls, promCalls := mockAddOnsCalls(dps, ds, pods, idReachable, true)
-	defer httpServ.Close()
+	objects, idReachable, _ := sampleIstioComponent()
+	k8s, grafanaCalls, persesCalls, promCalls := mockAddOnsCalls(t, objects, idReachable, true)
 
-	iss := NewWithBackends(k8s, nil, nil).IstioStatus
-	icsl, error := iss.GetStatus()
+	// conf set in mockAddOnsCalls
+	conf := config.Get()
+
+	iss := NewLayerBuilder(t, conf).WithClient(k8s).WithTraceLoader(mockJaeger).Build().IstioStatus
+	icsl, error := iss.GetStatus(context.TODO())
 	assert.NoError(error)
 
 	// Requests to AddOns have to be 1
 	assert.Equal(1, *grafanaCalls)
-	assert.Equal(1, *jaegerCalls)
 	assert.Equal(1, *promCalls)
+	assert.Equal(1, *persesCalls)
 
-	assertNotPresent(assert, icsl, "grafana")
-	assertNotPresent(assert, icsl, "prometheus")
-	assertNotPresent(assert, icsl, "jaeger")
-	assertNotPresent(assert, icsl, "custom dashboards")
+	// All the services are healthy
+	assertComponent(assert, icsl, "grafana", kubernetes.ComponentHealthy, false)
+	assertComponent(assert, icsl, "prometheus", kubernetes.ComponentHealthy, false)
+	assertComponent(assert, icsl, "tracing", kubernetes.ComponentHealthy, false)
+	assertComponent(assert, icsl, "custom dashboards", kubernetes.ComponentHealthy, false)
 }
 
 func TestCustomDashboardsMainPrometheus(t *testing.T) {
 	assert := assert.New(t)
 
-	k8s, httpServ, jaegerCalls, grafanaCalls, promCalls := mockAddOnsCalls(sampleIstioComponent())
-	defer httpServ.Close()
+	objs, b1, b2 := sampleIstioComponent()
+	k8s, grafanaCalls, persesCalls, promCalls := mockAddOnsCalls(t, objs, b1, b2)
 
 	// Custom Dashboard prom URL forced to be empty
 	conf := config.Get()
 	conf.ExternalServices.CustomDashboards.Prometheus.URL = ""
 	config.Set(conf)
 
-	iss := NewWithBackends(k8s, nil, nil).IstioStatus
-	icsl, error := iss.GetStatus()
+	iss := NewLayerBuilder(t, conf).WithClient(k8s).WithTraceLoader(mockJaeger).Build().IstioStatus
+	icsl, error := iss.GetStatus(context.TODO())
 	assert.NoError(error)
 
 	// Requests to AddOns have to be 1
 	assert.Equal(1, *grafanaCalls)
-	assert.Equal(1, *jaegerCalls)
 	assert.Equal(2, *promCalls)
+	assert.Equal(1, *persesCalls)
 
-	assertNotPresent(assert, icsl, "grafana")
-	assertNotPresent(assert, icsl, "prometheus")
-	assertNotPresent(assert, icsl, "jaeger")
-	assertNotPresent(assert, icsl, "custom dashboards")
+	// All the services are healthy
+	assertComponent(assert, icsl, "grafana", kubernetes.ComponentHealthy, false)
+	assertComponent(assert, icsl, "prometheus", kubernetes.ComponentHealthy, false)
+	assertComponent(assert, icsl, "tracing", kubernetes.ComponentHealthy, false)
+	assertComponent(assert, icsl, "custom dashboards", kubernetes.ComponentHealthy, false)
 }
 
 func TestNoIstioComponentFoundError(t *testing.T) {
 	assert := assert.New(t)
 
-	k8s, httpServ, _, _, _ := mockAddOnsCalls([]apps_v1.Deployment{}, []apps_v1.DaemonSet{}, []v1.Pod{}, true, false)
-	defer httpServ.Close()
+	k8s, _, _, _ := mockAddOnsCalls(t, []runtime.Object{}, true, false)
 
-	iss := NewWithBackends(k8s, nil, nil).IstioStatus
-	_, error := iss.GetStatus()
-	assert.Error(error)
+	conf := config.Get()
+
+	iss := NewLayerBuilder(t, conf).WithClient(k8s).WithTraceLoader(mockJaeger).Build().IstioStatus
+	icsl, error := iss.GetStatus(context.TODO())
+	assert.NoError(error)
+	assertComponent(assert, icsl, "istiod", kubernetes.ComponentNotFound, true)
 }
 
 func TestDefaults(t *testing.T) {
 	assert := assert.New(t)
 
-	var dss []apps_v1.DaemonSet
-	depl := []apps_v1.Deployment{
-		fakeDeploymentWithStatus("istio-egressgateway", map[string]string{"app": "istio-egressgateway", "istio": "egressgateway"}, unhealthyStatus),
+	objects := []runtime.Object{
+		fakeDeploymentWithStatus("istio=egressgateway", map[string]string{"istio": "egressgateway"}, unhealthyStatus),
 		fakeDeploymentWithStatus("istiod", map[string]string{"app": "istiod", "istio": "pilot"}, healthyStatus),
 	}
 
-	k8s, httpServer, jaegerCalls, grafanaCalls, promCalls := mockAddOnsCalls(depl, dss, healthyIstiods(), true, false)
-	defer httpServer.Close()
+	for _, obj := range healthyIstiods() {
+		o := obj
+		objects = append(objects, &o)
+	}
 
-	iss := NewWithBackends(k8s, nil, nil).IstioStatus
+	k8s, grafanaCalls, persesCalls, promCalls := mockAddOnsCalls(t, objects, true, false)
 
-	icsl, error := iss.GetStatus()
-	assert.NoError(error)
-	assertComponent(assert, icsl, "istio-ingressgateway", NotFound, true)
-	assertComponent(assert, icsl, "istio-egressgateway", Unhealthy, false)
+	// conf set in mockAddOnsCalls
+	conf := config.Get()
+	config.Set(conf)
 
-	// Don't return healthy deployments
-	assertNotPresent(assert, icsl, "istiod")
-	assertNotPresent(assert, icsl, "grafana")
-	assertNotPresent(assert, icsl, "prometheus")
-	assertNotPresent(assert, icsl, "jaeger")
+	discovery := &istiotest.FakeDiscovery{
+		MeshReturn: models.Mesh{
+			ControlPlanes: []models.ControlPlane{{Cluster: &models.KubeCluster{Name: conf.KubernetesConfig.ClusterName}, IstiodName: "istiod", Status: kubernetes.ComponentHealthy}},
+		},
+	}
+
+	iss := NewLayerBuilder(t, conf).WithClient(k8s).WithDiscovery(discovery).WithTraceLoader(mockJaeger).Build().IstioStatus
+
+	icsl, err := iss.GetStatus(context.TODO())
+	assert.NoError(err)
+
+	// One istio component is not found or unhealthy
+	assertComponent(assert, icsl, "istio=egressgateway", kubernetes.ComponentUnhealthy, false)
+
+	// The rest of the components are healthy
+	assertComponent(assert, icsl, "istiod", kubernetes.ComponentHealthy, true)
+	assertComponent(assert, icsl, "grafana", kubernetes.ComponentHealthy, false)
+	assertComponent(assert, icsl, "prometheus", kubernetes.ComponentHealthy, false)
+	assertComponent(assert, icsl, "tracing", kubernetes.ComponentHealthy, false)
+	assertComponent(assert, icsl, "custom dashboards", kubernetes.ComponentHealthy, false)
 
 	// Requests to AddOns have to be 1
 	assert.Equal(1, *grafanaCalls)
-	assert.Equal(1, *jaegerCalls)
 	assert.Equal(1, *promCalls)
+	assert.Equal(1, *persesCalls)
 }
 
 func TestNonDefaults(t *testing.T) {
 	assert := assert.New(t)
 
-	var dss []apps_v1.DaemonSet
-	pods := []apps_v1.Deployment{
-		fakeDeploymentWithStatus("istio-egressgateway", map[string]string{"app": "istio-egressgateway", "istio": "egressgateway"}, unhealthyStatus),
+	objects := []runtime.Object{
+		fakeDeploymentWithStatus("istio=egressgateway", map[string]string{"istio": "egressgateway"}, healthyStatus),
+		fakeDeploymentWithStatus("istio=ingressgateway", map[string]string{"istio": "ingressgateway"}, healthyStatus),
+		fakeDeploymentWithStatus("istio=eastwestgateway", map[string]string{"istio": "ingressgateway"}, healthyStatus),
 		fakeDeploymentWithStatus("istiod", map[string]string{"app": "istiod", "istio": "pilot"}, healthyStatus),
 	}
 
-	k8s, httpServer, jaegerCalls, grafanaCalls, promCalls := mockAddOnsCalls(pods, dss, healthyIstiods(), true, false)
-	defer httpServer.Close()
+	for _, obj := range healthyIstiods() {
+		o := obj
+		objects = append(objects, &o)
+	}
 
-	c := config.Get()
-	c.ExternalServices.Istio.ComponentStatuses = config.ComponentStatuses{
+	k8s, grafanaCalls, persesCalls, promCalls := mockAddOnsCalls(t, objects, true, false)
+
+	conf := config.Get()
+	conf.ExternalServices.Istio.ComponentStatuses = config.ComponentStatuses{
 		Enabled: true,
-		Components: []config.ComponentStatus{
-			{AppLabel: "istiod", IsCore: false},
-			{AppLabel: "istio-egressgateway", IsCore: false},
-			{AppLabel: "istio-ingressgateway", IsCore: false},
+	}
+	config.Set(conf)
+
+	discovery := &istiotest.FakeDiscovery{
+		MeshReturn: models.Mesh{
+			ControlPlanes: []models.ControlPlane{{Cluster: &models.KubeCluster{Name: conf.KubernetesConfig.ClusterName}, IstiodName: "istiod", Status: kubernetes.ComponentHealthy}},
 		},
 	}
-	config.Set(c)
 
-	iss := NewWithBackends(k8s, nil, nil).IstioStatus
+	iss := NewLayerBuilder(t, conf).WithClient(k8s).WithDiscovery(discovery).WithTraceLoader(mockJaeger).Build().IstioStatus
 
-	icsl, error := iss.GetStatus()
+	icsl, error := iss.GetStatus(context.TODO())
 	assert.NoError(error)
-	assertComponent(assert, icsl, "istio-ingressgateway", NotFound, false)
-	assertComponent(assert, icsl, "istio-egressgateway", Unhealthy, false)
 
-	// Don't return healthy deployments
-	assertNotPresent(assert, icsl, "istiod")
-	assertNotPresent(assert, icsl, "grafana")
-	assertNotPresent(assert, icsl, "prometheus")
-	assertNotPresent(assert, icsl, "jaeger")
+	// All Istio components are healthy
+	assertComponent(assert, icsl, "istio=ingressgateway", kubernetes.ComponentHealthy, false)
+	assertComponent(assert, icsl, "istio=egressgateway", kubernetes.ComponentHealthy, false)
+	// ComponentStatus was used for custom eastwestgateway
+	assertComponent(assert, icsl, "istio=eastwestgateway", kubernetes.ComponentHealthy, false)
+
+	// The rest of the components are healthy
+	assertComponent(assert, icsl, "istiod", kubernetes.ComponentHealthy, true)
+	assertComponent(assert, icsl, "grafana", kubernetes.ComponentHealthy, false)
+	assertComponent(assert, icsl, "prometheus", kubernetes.ComponentHealthy, false)
+	assertComponent(assert, icsl, "tracing", kubernetes.ComponentHealthy, false)
+	assertComponent(assert, icsl, "custom dashboards", kubernetes.ComponentHealthy, false)
 
 	// Requests to AddOns have to be 1
 	assert.Equal(1, *grafanaCalls)
-	assert.Equal(1, *jaegerCalls)
 	assert.Equal(1, *promCalls)
+	assert.Equal(1, *persesCalls)
 }
 
 // Istiod replicas is downscaled to 0
@@ -408,96 +526,48 @@ func TestNonDefaults(t *testing.T) {
 func TestIstiodNotReady(t *testing.T) {
 	assert := assert.New(t)
 
-	var dss []apps_v1.DaemonSet
-	pods := []apps_v1.Deployment{
-		fakeDeploymentWithStatus("istio-egressgateway", map[string]string{"app": "istio-egressgateway", "istio": "egressgateway"}, unhealthyStatus),
+	objects := []runtime.Object{
+		fakeDeploymentWithStatus("istio=egressgateway", map[string]string{"istio": "egressgateway"}, unhealthyStatus),
 		fakeDeploymentWithStatus("istiod", map[string]string{"app": "istiod", "istio": "pilot"}, notReadyStatus),
 	}
 
-	k8s, httpServer, jaegerCalls, grafanaCalls, promCalls := mockAddOnsCalls(pods, dss, healthyIstiods(), false, false)
-	defer httpServer.Close()
+	k8s, grafanaCalls, persesCalls, promCalls := mockAddOnsCalls(t, objects, false, false)
 
-	c := config.Get()
-	c.IstioLabels.AppLabelName = "app.kubernetes.io/name"
-	c.ExternalServices.Istio.ComponentStatuses = config.ComponentStatuses{
+	conf := config.Get()
+	conf.IstioLabels.AppLabelName = "app.kubernetes.io/name"
+	conf.ExternalServices.Istio.ComponentStatuses = config.ComponentStatuses{
 		Enabled: true,
-		Components: []config.ComponentStatus{
-			{AppLabel: "istiod", IsCore: true},
-			{AppLabel: "istio-egressgateway", IsCore: false},
-			{AppLabel: "istio-ingressgateway", IsCore: false},
+	}
+	config.Set(conf)
+
+	discovery := &istiotest.FakeDiscovery{
+		MeshReturn: models.Mesh{
+			ControlPlanes: []models.ControlPlane{{Cluster: &models.KubeCluster{Name: conf.KubernetesConfig.ClusterName}, IstiodName: "istiod", Status: kubernetes.ComponentNotReady}},
 		},
 	}
-	config.Set(c)
 
-	iss := NewWithBackends(k8s, nil, nil).IstioStatus
+	iss := NewLayerBuilder(t, conf).WithClient(k8s).WithDiscovery(discovery).WithTraceLoader(mockJaeger).Build().IstioStatus
 
-	icsl, error := iss.GetStatus()
+	icsl, error := iss.GetStatus(context.TODO())
 	assert.NoError(error)
-	assertComponent(assert, icsl, "istio-ingressgateway", NotFound, false)
-	assertComponent(assert, icsl, "istio-egressgateway", Unhealthy, false)
-	assertComponent(assert, icsl, "istiod", NotReady, true)
 
-	// Don't return healthy deployments
-	assertNotPresent(assert, icsl, "grafana")
-	assertNotPresent(assert, icsl, "prometheus")
-	assertNotPresent(assert, icsl, "jaeger")
+	// Two istio components are unhealthy, not found or not ready
+	assertComponent(assert, icsl, "istio=egressgateway", kubernetes.ComponentUnhealthy, false)
+	assertComponent(assert, icsl, "istiod", kubernetes.ComponentNotReady, true)
+
+	// The rest of the components are healthy
+	assertComponent(assert, icsl, "grafana", kubernetes.ComponentHealthy, false)
+	assertComponent(assert, icsl, "prometheus", kubernetes.ComponentHealthy, false)
+	assertComponent(assert, icsl, "tracing", kubernetes.ComponentHealthy, false)
+
+	// Terminating pods are not present
 	assertNotPresent(assert, icsl, "istiod-x3v1kn0l-terminating")
 	assertNotPresent(assert, icsl, "istiod-x3v1kn1l-terminating")
 
 	// Requests to AddOns have to be 1
 	assert.Equal(1, *grafanaCalls)
-	assert.Equal(1, *jaegerCalls)
 	assert.Equal(1, *promCalls)
-
-}
-
-// Istiod pods are not reachable from kiali
-// Kiali should notify that in the Istio Component Status
-func TestIstiodUnreachable(t *testing.T) {
-	assert := assert.New(t)
-
-	var dss []apps_v1.DaemonSet
-	pods := []apps_v1.Deployment{
-		fakeDeploymentWithStatus("istio-egressgateway", map[string]string{"app": "istio-egressgateway", "istio": "egressgateway"}, unhealthyStatus),
-		fakeDeploymentWithStatus("istiod", map[string]string{"app": "istiod", "istio": "pilot"}, healthyStatus),
-	}
-
-	k8s, httpServer, jaegerCalls, grafanaCalls, promCalls := mockAddOnsCalls(pods, dss, healthyIstiods(), false, false)
-	defer httpServer.Close()
-
-	c := config.Get()
-	c.IstioLabels.AppLabelName = "app.kubernetes.io/name"
-	c.ExternalServices.Istio.ComponentStatuses = config.ComponentStatuses{
-		Enabled: true,
-		Components: []config.ComponentStatus{
-			{AppLabel: "istiod", IsCore: true},
-			{AppLabel: "istio-egressgateway", IsCore: false},
-			{AppLabel: "istio-ingressgateway", IsCore: false},
-		},
-	}
-	config.Set(c)
-
-	iss := NewWithBackends(k8s, nil, nil).IstioStatus
-
-	icsl, error := iss.GetStatus()
-	assert.NoError(error)
-	assertComponent(assert, icsl, "istio-ingressgateway", NotFound, false)
-	assertComponent(assert, icsl, "istio-egressgateway", Unhealthy, false)
-	assertComponent(assert, icsl, "istiod-x3v1kn0l-running", Unreachable, true)
-	assertComponent(assert, icsl, "istiod-x3v1kn1l-running", Unreachable, true)
-
-	// Don't return healthy deployments
-	assertNotPresent(assert, icsl, "grafana")
-	assertNotPresent(assert, icsl, "prometheus")
-	assertNotPresent(assert, icsl, "jaeger")
-	assertNotPresent(assert, icsl, "istiod-x3v1kn0l-terminating")
-	assertNotPresent(assert, icsl, "istiod-x3v1kn1l-terminating")
-
-	// Requests to AddOns have to be 1
-	assert.Equal(1, *grafanaCalls)
-	assert.Equal(1, *jaegerCalls)
-	assert.Equal(1, *promCalls)
-
+	assert.Equal(1, *persesCalls)
 }
 
 // Istio deployments only have the "app" app_label.
@@ -505,140 +575,151 @@ func TestIstiodUnreachable(t *testing.T) {
 func TestCustomizedAppLabel(t *testing.T) {
 	assert := assert.New(t)
 
-	var dss []apps_v1.DaemonSet
-	depls := []apps_v1.Deployment{
-		fakeDeploymentWithStatus("istio-egressgateway", map[string]string{"app": "istio-egressgateway", "istio": "egressgateway"}, unhealthyStatus),
+	objects := []runtime.Object{
+		fakeDeploymentWithStatus("istio=egressgateway", map[string]string{"istio": "egressgateway"}, unhealthyStatus),
 		fakeDeploymentWithStatus("istiod", map[string]string{"app": "istiod", "istio": "pilot"}, healthyStatus),
 	}
 
-	k8s, httpServer, jaegerCalls, grafanaCalls, promCalls := mockAddOnsCalls(depls, dss, healthyIstiods(), true, false)
-	defer httpServer.Close()
+	for _, obj := range healthyIstiods() {
+		o := obj
+		objects = append(objects, &o)
+	}
 
-	c := config.Get()
-	c.IstioLabels.AppLabelName = "app.kubernetes.io/name"
-	c.ExternalServices.Istio.ComponentStatuses = config.ComponentStatuses{
+	k8s, grafanaCalls, persesCalls, promCalls := mockAddOnsCalls(t, objects, true, false)
+
+	conf := config.Get()
+	conf.IstioLabels.AppLabelName = "app.kubernetes.io/name"
+	conf.ExternalServices.Istio.ComponentStatuses = config.ComponentStatuses{
 		Enabled: true,
-		Components: []config.ComponentStatus{
-			{AppLabel: "istiod", IsCore: false},
-			{AppLabel: "istio-egressgateway", IsCore: false},
-			{AppLabel: "istio-ingressgateway", IsCore: false},
+	}
+	config.Set(conf)
+
+	discovery := &istiotest.FakeDiscovery{
+		MeshReturn: models.Mesh{
+			ControlPlanes: []models.ControlPlane{{Cluster: &models.KubeCluster{Name: conf.KubernetesConfig.ClusterName}, IstiodName: "istiod", Status: kubernetes.ComponentHealthy}},
 		},
 	}
-	config.Set(c)
 
-	iss := NewWithBackends(k8s, nil, nil).IstioStatus
+	iss := NewLayerBuilder(t, conf).WithClient(k8s).WithDiscovery(discovery).WithTraceLoader(mockJaeger).Build().IstioStatus
 
-	icsl, error := iss.GetStatus()
+	icsl, error := iss.GetStatus(context.TODO())
 	assert.NoError(error)
-	assertComponent(assert, icsl, "istio-ingressgateway", NotFound, false)
-	assertComponent(assert, icsl, "istio-egressgateway", Unhealthy, false)
 
-	// Don't return healthy deployments
-	assertNotPresent(assert, icsl, "istiod")
-	assertNotPresent(assert, icsl, "grafana")
-	assertNotPresent(assert, icsl, "prometheus")
-	assertNotPresent(assert, icsl, "jaeger")
+	// istio component not found or unhealthy
+	assertComponent(assert, icsl, "istio=egressgateway", kubernetes.ComponentUnhealthy, false)
+
+	// The rest of the components are healthy
+	assertComponent(assert, icsl, "istiod", kubernetes.ComponentHealthy, true)
+	assertComponent(assert, icsl, "grafana", kubernetes.ComponentHealthy, false)
+	assertComponent(assert, icsl, "prometheus", kubernetes.ComponentHealthy, false)
+	assertComponent(assert, icsl, "tracing", kubernetes.ComponentHealthy, false)
+	assertComponent(assert, icsl, "custom dashboards", kubernetes.ComponentHealthy, false)
 
 	// Requests to AddOns have to be 1
 	assert.Equal(1, *grafanaCalls)
-	assert.Equal(1, *jaegerCalls)
 	assert.Equal(1, *promCalls)
+	assert.Equal(1, *persesCalls)
 }
 
 func TestDaemonSetComponentHealthy(t *testing.T) {
 	assert := assert.New(t)
 
-	dss := []apps_v1.DaemonSet{
-		fakeDaemonSetWithStatus("istio-ingressgateway", map[string]string{"app": "istio-ingressgateway", "istio": "ingressgateway"}, healthyDaemonSetStatus),
-	}
-
-	depls := []apps_v1.Deployment{
-		fakeDeploymentWithStatus("istio-egressgateway", map[string]string{"app": "istio-egressgateway", "istio": "egressgateway"}, unhealthyStatus),
+	objects := []runtime.Object{
+		fakeDaemonSetWithStatus("istio=ingressgateway", map[string]string{"istio": "ingressgateway"}, healthyDaemonSetStatus),
+		fakeDeploymentWithStatus("istio=egressgateway", map[string]string{"istio": "egressgateway"}, unhealthyStatus),
 		fakeDeploymentWithStatus("istiod", map[string]string{"app": "istiod", "istio": "pilot"}, healthyStatus),
 	}
 
-	k8s, httpServer, jaegerCalls, grafanaCalls, promCalls := mockAddOnsCalls(depls, dss, healthyIstiods(), true, false)
-	defer httpServer.Close()
+	for _, obj := range healthyIstiods() {
+		o := obj
+		objects = append(objects, &o)
+	}
 
-	c := config.Get()
-	c.IstioLabels.AppLabelName = "app.kubernetes.io/name"
-	c.ExternalServices.Istio.ComponentStatuses = config.ComponentStatuses{
+	k8s, grafanaCalls, persesCalls, promCalls := mockAddOnsCalls(t, objects, true, false)
+
+	conf := config.Get()
+	conf.IstioLabels.AppLabelName = "app.kubernetes.io/name"
+	conf.ExternalServices.Istio.ComponentStatuses = config.ComponentStatuses{
 		Enabled: true,
-		Components: []config.ComponentStatus{
-			{AppLabel: "istiod", IsCore: false},
-			{AppLabel: "istio-egressgateway", IsCore: false},
-			{AppLabel: "istio-ingressgateway", IsCore: false},
+	}
+	config.Set(conf)
+
+	discovery := &istiotest.FakeDiscovery{
+		MeshReturn: models.Mesh{
+			ControlPlanes: []models.ControlPlane{{Cluster: &models.KubeCluster{Name: conf.KubernetesConfig.ClusterName}, IstiodName: "istiod", Status: kubernetes.ComponentHealthy}},
 		},
 	}
-	config.Set(c)
 
-	iss := NewWithBackends(k8s, nil, nil).IstioStatus
+	iss := NewLayerBuilder(t, conf).WithClient(k8s).WithDiscovery(discovery).WithTraceLoader(mockJaeger).Build().IstioStatus
 
-	icsl, error := iss.GetStatus()
+	icsl, error := iss.GetStatus(context.TODO())
 	assert.NoError(error)
-	assertComponent(assert, icsl, "istio-egressgateway", Unhealthy, false)
 
-	// Don't return healthy deployments
-	assertNotPresent(assert, icsl, "istio-ingressgateway")
-	assertNotPresent(assert, icsl, "istiod")
-	assertNotPresent(assert, icsl, "grafana")
-	assertNotPresent(assert, icsl, "prometheus")
-	assertNotPresent(assert, icsl, "jaeger")
+	// One istio components is unhealthy
+	assertComponent(assert, icsl, "istio=egressgateway", kubernetes.ComponentUnhealthy, false)
+
+	// The rest of the components are healthy
+	assertComponent(assert, icsl, "istio=ingressgateway", kubernetes.ComponentHealthy, false)
+	assertComponent(assert, icsl, "istiod", kubernetes.ComponentHealthy, true)
+	assertComponent(assert, icsl, "grafana", kubernetes.ComponentHealthy, false)
+	assertComponent(assert, icsl, "prometheus", kubernetes.ComponentHealthy, false)
+	assertComponent(assert, icsl, "tracing", kubernetes.ComponentHealthy, false)
+	assertComponent(assert, icsl, "custom dashboards", kubernetes.ComponentHealthy, false)
 
 	// Requests to AddOns have to be 1
 	assert.Equal(1, *grafanaCalls)
-	assert.Equal(1, *jaegerCalls)
 	assert.Equal(1, *promCalls)
+	assert.Equal(1, *persesCalls)
 }
 
 // Users may use DaemonSets to deploy istio components
 func TestDaemonSetComponentUnhealthy(t *testing.T) {
 	assert := assert.New(t)
 
-	dss := []apps_v1.DaemonSet{
-		fakeDaemonSetWithStatus("istio-ingressgateway", map[string]string{"app": "istio-ingressgateway", "istio": "ingressgateway"}, unhealthyDaemonSetStatus),
-	}
-
-	depls := []apps_v1.Deployment{
-		fakeDeploymentWithStatus("istio-egressgateway", map[string]string{"app": "istio-egressgateway", "istio": "egressgateway"}, unhealthyStatus),
+	objects := []runtime.Object{
+		fakeDaemonSetWithStatus("istio=ingressgateway", map[string]string{"istio": "ingressgateway"}, unhealthyDaemonSetStatus),
+		fakeDeploymentWithStatus("istio=egressgateway", map[string]string{"istio": "egressgateway"}, unhealthyStatus),
 		fakeDeploymentWithStatus("istiod", map[string]string{"app": "istiod", "istio": "pilot"}, healthyStatus),
 	}
 
-	k8s, httpServer, jaegerCalls, grafanaCalls, promCalls := mockAddOnsCalls(depls, dss, healthyIstiods(), true, false)
-	defer httpServer.Close()
+	k8s, grafanaCalls, persesCalls, promCalls := mockAddOnsCalls(t, objects, true, false)
 
-	c := config.Get()
-	c.IstioLabels.AppLabelName = "app.kubernetes.io/name"
-	c.ExternalServices.Istio.ComponentStatuses = config.ComponentStatuses{
+	conf := config.Get()
+	conf.IstioLabels.AppLabelName = "app.kubernetes.io/name"
+	conf.ExternalServices.Istio.ComponentStatuses = config.ComponentStatuses{
 		Enabled: true,
-		Components: []config.ComponentStatus{
-			{AppLabel: "istiod", IsCore: false},
-			{AppLabel: "istio-egressgateway", IsCore: false},
-			{AppLabel: "istio-ingressgateway", IsCore: false},
+	}
+	config.Set(conf)
+
+	// Set global cache var
+	discovery := &istiotest.FakeDiscovery{
+		MeshReturn: models.Mesh{
+			ControlPlanes: []models.ControlPlane{{Cluster: &models.KubeCluster{Name: conf.KubernetesConfig.ClusterName}, IstiodName: "istiod", Status: kubernetes.ComponentHealthy}},
 		},
 	}
-	config.Set(c)
+	iss := NewLayerBuilder(t, conf).WithClient(k8s).WithDiscovery(discovery).WithTraceLoader(mockJaeger).Build().IstioStatus
 
-	iss := NewWithBackends(k8s, nil, nil).IstioStatus
-
-	icsl, error := iss.GetStatus()
+	icsl, error := iss.GetStatus(context.TODO())
 	assert.NoError(error)
-	assertComponent(assert, icsl, "istio-ingressgateway", Unhealthy, false)
-	assertComponent(assert, icsl, "istio-egressgateway", Unhealthy, false)
 
-	// Don't return healthy deployments
-	assertNotPresent(assert, icsl, "istiod")
-	assertNotPresent(assert, icsl, "grafana")
-	assertNotPresent(assert, icsl, "prometheus")
-	assertNotPresent(assert, icsl, "jaeger")
+	// Two istio components are unhealthy
+	assertComponent(assert, icsl, "istio=ingressgateway", kubernetes.ComponentUnhealthy, false)
+	assertComponent(assert, icsl, "istio=egressgateway", kubernetes.ComponentUnhealthy, false)
+
+	// The rest of the components are healthy
+	assertComponent(assert, icsl, "istiod", kubernetes.ComponentHealthy, true)
+	assertComponent(assert, icsl, "grafana", kubernetes.ComponentHealthy, false)
+	assertComponent(assert, icsl, "prometheus", kubernetes.ComponentHealthy, false)
+	assertComponent(assert, icsl, "tracing", kubernetes.ComponentHealthy, false)
+	assertComponent(assert, icsl, "custom dashboards", kubernetes.ComponentHealthy, false)
 
 	// Requests to AddOns have to be 1
 	assert.Equal(1, *grafanaCalls)
-	assert.Equal(1, *jaegerCalls)
 	assert.Equal(1, *promCalls)
+	assert.Equal(1, *persesCalls)
 }
 
-func assertComponent(assert *assert.Assertions, icsl IstioComponentStatus, name string, status string, isCore bool) {
+func assertComponent(assert *assert.Assertions, icsl kubernetes.IstioComponentStatus, name string, status string, isCore bool) {
 	componentFound := false
 	for _, ics := range icsl {
 		if ics.Name == name {
@@ -651,7 +732,7 @@ func assertComponent(assert *assert.Assertions, icsl IstioComponentStatus, name 
 	assert.True(componentFound)
 }
 
-func assertNotPresent(assert *assert.Assertions, icsl IstioComponentStatus, name string) {
+func assertNotPresent(assert *assert.Assertions, icsl kubernetes.IstioComponentStatus, name string) {
 	componentFound := false
 	for _, ics := range icsl {
 		if ics.Name == name {
@@ -661,39 +742,24 @@ func assertNotPresent(assert *assert.Assertions, icsl IstioComponentStatus, name
 	assert.False(componentFound)
 }
 
-// Setup K8S api call to fetch Pods
-func mockDeploymentCall(deployments []apps_v1.Deployment, daemonSets []apps_v1.DaemonSet, pods []v1.Pod, isIstioReachable bool) *kubetest.K8SClientMock {
-	k8s := new(kubetest.K8SClientMock)
-	k8s.On("GetDaemonSets", mock.AnythingOfType("string"), mock.AnythingOfType("string")).Return(daemonSets, nil)
-	k8s.On("GetDeployments", mock.AnythingOfType("string"), mock.AnythingOfType("string")).Return(deployments, nil)
-	k8s.On("GetPods", mock.AnythingOfType("string"), labels.Set(map[string]string{"app": "istiod"}).String()).Return(pods, nil)
-
-	k8s.On("IsOpenShift").Return(true)
-	k8s.On("GetProject", mock.AnythingOfType("string")).Return(&osproject_v1.Project{}, nil)
-	k8s.On("GetDeploymentConfigs", mock.AnythingOfType("string"), mock.AnythingOfType("string")).Return([]osapps_v1.DeploymentConfig{}, nil)
-	k8s.On("GetReplicaSets", mock.AnythingOfType("string"), mock.AnythingOfType("string")).Return([]apps_v1.ReplicaSet{}, nil)
-	k8s.On("GetReplicationControllers", mock.AnythingOfType("string"), mock.AnythingOfType("string")).Return([]v1.ReplicationController{}, nil)
-	k8s.On("GetStatefulSets", mock.AnythingOfType("string"), mock.AnythingOfType("string")).Return([]apps_v1.StatefulSet{}, nil)
-	k8s.On("GetJobs", mock.AnythingOfType("string"), mock.AnythingOfType("string")).Return([]batch_v1.Job{}, nil)
-	k8s.On("GetCronJobs", mock.AnythingOfType("string"), mock.AnythingOfType("string")).Return([]batch_v1beta1.CronJob{}, nil)
-	k8s.On("GetPod", mock.AnythingOfType("string"), mock.AnythingOfType("string")).Return(v1.Pod{}, nil)
-	k8s.On("GetPods", mock.AnythingOfType("string"), mock.AnythingOfType("string")).Return([]v1.Pod{}, nil)
-	k8s.On("GetPodLogs", mock.AnythingOfType("string"), mock.AnythingOfType("string"), mock.Anything).Return(&kubernetes.PodLogs{}, nil)
-
-	var err error
-	if !isIstioReachable {
-		err = fmt.Errorf("the Istio pods are unreachable")
-	}
-	k8s.On("GetPodProxy", mock.AnythingOfType("string"), mock.AnythingOfType("string"), mock.AnythingOfType("string")).Return([]byte{}, err)
-
-	return k8s
+func mockJaeger() tracing.ClientInterface {
+	j := new(tracingtest.TracingClientMock)
+	j.On("GetServiceStatus", context.TODO()).Return(true, nil)
+	return j
 }
 
-func fakeDeploymentWithStatus(name string, labels map[string]string, status apps_v1.DeploymentStatus) apps_v1.Deployment {
-	return apps_v1.Deployment{
+func mockFailingJaeger() tracing.ClientInterface {
+	j := new(tracingtest.TracingClientMock)
+	j.On("GetServiceStatus", context.TODO()).Return(false, errors.New("error connecting with tracing service"))
+	return j
+}
+
+func fakeDeploymentWithStatus(name string, labels map[string]string, status apps_v1.DeploymentStatus) *apps_v1.Deployment {
+	return &apps_v1.Deployment{
 		ObjectMeta: meta_v1.ObjectMeta{
-			Name:   name,
-			Labels: labels,
+			Name:      name,
+			Namespace: "istio-system",
+			Labels:    labels,
 		},
 		Status: status,
 		Spec: apps_v1.DeploymentSpec{
@@ -704,24 +770,30 @@ func fakeDeploymentWithStatus(name string, labels map[string]string, status apps
 				},
 			},
 			Replicas: &status.Replicas,
-		}}
+		},
+	}
 }
 
-func fakeDaemonSetWithStatus(name string, labels map[string]string, status apps_v1.DaemonSetStatus) apps_v1.DaemonSet {
-	return apps_v1.DaemonSet{
+func fakeDaemonSetWithStatus(name string, labels map[string]string, status apps_v1.DaemonSetStatus) *apps_v1.DaemonSet {
+	return &apps_v1.DaemonSet{
 		ObjectMeta: meta_v1.ObjectMeta{
-			Name:   name,
-			Labels: labels,
+			Name:      name,
+			Namespace: "istio-system",
+			Labels:    labels,
 		},
 		Status: status,
 		Spec: apps_v1.DaemonSetSpec{
+			Selector: &meta_v1.LabelSelector{
+				MatchLabels: labels,
+			},
 			Template: v1.PodTemplateSpec{
 				ObjectMeta: meta_v1.ObjectMeta{
 					Name:   "",
 					Labels: labels,
 				},
 			},
-		}}
+		},
+	}
 }
 
 func confWithComponentNamespaces() *config.Config {
@@ -729,7 +801,7 @@ func confWithComponentNamespaces() *config.Config {
 	conf.ExternalServices.Istio.ComponentStatuses = config.ComponentStatuses{
 		Enabled: true,
 		Components: []config.ComponentStatus{
-			{AppLabel: "pilot", IsCore: true},
+			{AppLabel: "pilot", IsCore: true, Namespace: "istio-system"},
 			{AppLabel: "ingress", IsCore: true, Namespace: "ingress-egress"},
 			{AppLabel: "egress", IsCore: false, Namespace: "ingress-egress"},
 			{AppLabel: "sds", IsCore: false, Namespace: "istio-admin"},
@@ -739,8 +811,10 @@ func confWithComponentNamespaces() *config.Config {
 	return conf
 }
 
-func mockServer(mr *mux.Router) *httptest.Server {
-	return httptest.NewServer(mr)
+func mockServer(t *testing.T, mr *mux.Router) *httptest.Server {
+	s := httptest.NewServer(mr)
+	t.Cleanup(s.Close)
+	return s
 }
 
 func addAddOnRoute(mr *mux.Router, mu *sync.Mutex, url string, statusCode int, callNum *int) {
@@ -769,22 +843,27 @@ func mockAddOnCalls(addons map[string]addOnsSetup) *mux.Router {
 	return mr
 }
 
-func defaultAddOnCalls(jaeger, grafana, prom *int) map[string]addOnsSetup {
+func defaultAddOnCalls(grafana, perses, prom *int) map[string]addOnsSetup {
 	return map[string]addOnsSetup{
 		"prometheus": {
 			Url:        "/prometheus/mock",
 			StatusCode: 200,
 			CallCount:  prom,
 		},
-		"jaeger": {
-			Url:        "/jaeger/mock",
+		"prometheus-healthy": {
+			Url:        "/prometheus/mock/-/healthy",
 			StatusCode: 200,
-			CallCount:  jaeger,
+			CallCount:  prom,
 		},
 		"grafana": {
 			Url:        "/grafana/mock",
 			StatusCode: 200,
 			CallCount:  grafana,
+		},
+		"perses": {
+			Url:        "/perses/mock",
+			StatusCode: 200,
+			CallCount:  perses,
 		},
 		"custom dashboards": {
 			Url:        "/prometheus-dashboards/mock",
@@ -796,11 +875,15 @@ func defaultAddOnCalls(jaeger, grafana, prom *int) map[string]addOnsSetup {
 
 func addonAddMockUrls(baseUrl string, conf *config.Config, overrideUrl bool) *config.Config {
 	conf.ExternalServices.Grafana.Enabled = true
-	conf.ExternalServices.Grafana.InClusterURL = baseUrl + "/grafana/mock"
+	conf.ExternalServices.Grafana.InternalURL = baseUrl + "/grafana/mock"
 	conf.ExternalServices.Grafana.IsCore = false
 
+	conf.ExternalServices.Perses.Enabled = true
+	conf.ExternalServices.Perses.InternalURL = baseUrl + "/perses/mock"
+	conf.ExternalServices.Perses.IsCore = false
+
 	conf.ExternalServices.Tracing.Enabled = true
-	conf.ExternalServices.Tracing.InClusterURL = baseUrl + "/jaeger/mock"
+	conf.ExternalServices.Tracing.InternalURL = baseUrl + "/tracing/mock"
 	conf.ExternalServices.Tracing.IsCore = false
 
 	conf.ExternalServices.Prometheus.URL = baseUrl + "/prometheus/mock"
@@ -810,11 +893,11 @@ func addonAddMockUrls(baseUrl string, conf *config.Config, overrideUrl bool) *co
 	conf.ExternalServices.CustomDashboards.IsCore = false
 
 	if overrideUrl {
-		conf.ExternalServices.Grafana.HealthCheckUrl = conf.ExternalServices.Grafana.InClusterURL
-		conf.ExternalServices.Grafana.InClusterURL = baseUrl + "/grafana/wrong"
+		conf.ExternalServices.Grafana.HealthCheckUrl = conf.ExternalServices.Grafana.InternalURL
+		conf.ExternalServices.Grafana.InternalURL = baseUrl + "/grafana/wrong"
 
-		conf.ExternalServices.Tracing.HealthCheckUrl = conf.ExternalServices.Tracing.InClusterURL
-		conf.ExternalServices.Tracing.InClusterURL = baseUrl + "/jaeger/wrong"
+		conf.ExternalServices.Perses.HealthCheckUrl = conf.ExternalServices.Perses.InternalURL
+		conf.ExternalServices.Perses.InternalURL = baseUrl + "/perses/wrong"
 
 		conf.ExternalServices.Prometheus.HealthCheckUrl = conf.ExternalServices.Prometheus.URL
 		conf.ExternalServices.Prometheus.URL = baseUrl + "/prometheus/wrong"
@@ -824,4 +907,191 @@ func addonAddMockUrls(baseUrl string, conf *config.Config, overrideUrl bool) *co
 
 	}
 	return conf
+}
+
+// gatewayDeployment builds a deployment that IsGatewayWorkload detects as a
+// gateway (the istioctl labeling).
+func gatewayDeployment(namespace, name string) *apps_v1.Deployment {
+	return &apps_v1.Deployment{
+		ObjectMeta: meta_v1.ObjectMeta{
+			Labels:    map[string]string{"app": name},
+			Name:      name,
+			Namespace: namespace,
+		},
+		Spec: apps_v1.DeploymentSpec{
+			Selector: &meta_v1.LabelSelector{
+				MatchLabels: map[string]string{"istio": "ingressgateway"},
+			},
+			Template: v1.PodTemplateSpec{
+				ObjectMeta: meta_v1.ObjectMeta{
+					Labels: map[string]string{"istio": "ingressgateway"},
+				},
+			},
+		},
+	}
+}
+
+// TestGetGatewaysPopulatesSharedCacheSAWide pins that the shared gateway
+// cache is populated with the SA-visible gateways, not the warming user's
+// accessible subset: the cache serves every user, so a user-scoped fetch
+// would truncate the list for broader users (and leak to narrower ones).
+func TestGetGatewaysPopulatesSharedCacheSAWide(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+
+	conf := config.NewConfig()
+	config.Set(conf)
+	cluster := conf.KubernetesConfig.ClusterName
+
+	// Gateway workloads in the accessible namespace and in a namespace the
+	// user cannot see. The SA sees both.
+	objects := []runtime.Object{
+		kubetest.FakeNamespace("bookinfo"),
+		kubetest.FakeNamespace("victim-ns"),
+		gatewayDeployment("bookinfo", "gw-allowed"),
+		gatewayDeployment("victim-ns", "gw-victim"),
+	}
+	sa := kubetest.NewFakeK8sClient(objects...)
+	sa.Token = "sa-token"
+	user := kubetest.NewNamespaceRestrictedClient(kubetest.NewFakeK8sClient(objects...), "user-token", []string{"bookinfo"})
+
+	saClients := map[string]kubernetes.ClientInterface{cluster: sa}
+	userClients := map[string]kubernetes.UserClientInterface{cluster: user}
+	kialiCache := cache.NewTestingCacheWithClients(t, saClients, *conf)
+	discovery := istio.NewDiscovery(saClients, kialiCache, conf)
+	layer := newLayer(userClients, saClients, nil, nil, kialiCache, conf, nil, discovery, nil)
+
+	// The restricted user warms the shared cache.
+	gateways, err := layer.Workload.GetGateways(context.TODO())
+	require.NoError(err)
+
+	gatewayNamespaces := make(map[string]string, len(gateways))
+	for _, gw := range gateways {
+		gatewayNamespaces[gw.Name] = gw.Namespace
+	}
+	assert.Equal("bookinfo", gatewayNamespaces["gw-allowed"], "the accessible namespace's gateway must be cached")
+	assert.Equal("victim-ns", gatewayNamespaces["gw-victim"], "the SA-visible denied namespace's gateway must be cached too: the cache is SA-scoped")
+}
+
+// TestGetStatusFiltersCachedGatewayEntriesForUser pins the istio status
+// authorization at the cached read path: the shared status cache holds the
+// SA-wide gateway list (whatever user warmed it), so the entries returned to
+// a restricted user must be filtered. Control-plane entries are kept without
+// access (mesh-wide information, like the mesh endpoints expose), entries
+// without a namespace are kept (they disclose none), and a gateway in a
+// namespace the user cannot access is dropped.
+func TestGetStatusFiltersCachedGatewayEntriesForUser(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+
+	conf := config.NewConfig()
+	config.Set(conf)
+	conf.ExternalServices.Istio.ComponentStatuses.Enabled = true
+	// The configured control-plane namespace: its entries are kept for every
+	// user regardless of namespace access.
+	conf.ExternalServices.Istio.ComponentStatuses.Components = []config.ComponentStatus{
+		{AppLabel: "istiod", IsCore: true, Namespace: "istio-system"},
+	}
+	cluster := conf.KubernetesConfig.ClusterName
+
+	sa, user := newAccessibleSetClients([]string{"bookinfo", "victim-ns", "istio-system"}, []string{"bookinfo"})
+	saClients := map[string]kubernetes.ClientInterface{cluster: sa}
+	userClients := map[string]kubernetes.UserClientInterface{cluster: user}
+	kialiCache := cache.NewTestingCacheWithClients(t, saClients, *conf)
+	discovery := istio.NewDiscovery(saClients, kialiCache, conf)
+	layer := newLayer(userClients, saClients, nil, nil, kialiCache, conf, nil, discovery, nil)
+
+	// A broader user's request computed and cached the status; the gateway
+	// entries in it span the SA-visible namespaces.
+	kialiCache.SetIstioStatus(kubernetes.IstioComponentStatus{
+		{Cluster: cluster, Name: "istiod", Namespace: "istio-system", Status: kubernetes.ComponentHealthy, IsCore: true},
+		{Cluster: cluster, Name: "gw-allowed", Namespace: "bookinfo", Status: kubernetes.ComponentHealthy},
+		{Cluster: cluster, Name: "gw-victim", Namespace: "victim-ns", Status: kubernetes.ComponentHealthy},
+		{Cluster: cluster, Name: "prometheus", Status: kubernetes.ComponentHealthy},
+	})
+
+	status, err := layer.IstioStatus.GetStatus(context.TODO())
+	require.NoError(err)
+
+	componentNames := make(map[string]bool, len(status))
+	for _, component := range status {
+		componentNames[component.Name] = true
+	}
+	assert.True(componentNames["istiod"], "the control-plane entry must be kept without access to its namespace")
+	assert.True(componentNames["gw-allowed"], "the accessible namespace's gateway must be kept")
+	assert.True(componentNames["prometheus"], "the namespace-less addon entry must be kept")
+	assert.False(componentNames["gw-victim"], "a denied namespace's gateway entry must not be returned")
+}
+
+// TestGetStatusControlPlaneExemptionIsClusterScoped pins that the
+// discovered control-plane exemption is keyed by (cluster, namespace): a
+// namespace that hosts a control plane in one cluster may be an ordinary
+// tenant namespace in another, and the collision must not exempt the other
+// cluster's entries. The configured component namespaces stay a deliberate
+// global exemption (the operator declares them by name only).
+func TestGetStatusControlPlaneExemptionIsClusterScoped(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+
+	conf := config.NewConfig()
+	config.Set(conf)
+	conf.ExternalServices.Istio.ComponentStatuses.Enabled = true
+	conf.ExternalServices.Istio.IstioAPIEnabled = true
+	// A configured component namespace: a global exemption by design.
+	conf.ExternalServices.Istio.ComponentStatuses.Components = []config.ComponentStatus{
+		{AppLabel: "comp", IsCore: true, Namespace: "configured-ns"},
+	}
+	home := conf.KubernetesConfig.ClusterName
+	const remote = "cluster-b"
+
+	// The user can access bookinfo in the home cluster only; in the remote
+	// cluster their LIST is empty (direct namespace access is denied).
+	homeSA := kubetest.NewFakeK8sClient(kubetest.FakeNamespace("bookinfo"), kubetest.FakeNamespace("shared"))
+	homeSA.Token = "home-sa-token"
+	remoteSA := kubetest.NewFakeK8sClient(kubetest.FakeNamespace("shared"))
+	remoteSA.Token = "remote-sa-token"
+	homeUser := kubetest.NewNamespaceRestrictedClient(kubetest.NewFakeK8sClient(kubetest.FakeNamespace("bookinfo"), kubetest.FakeNamespace("shared")), "user-token", []string{"bookinfo"})
+	remoteUser := kubetest.NewNamespaceRestrictedClient(kubetest.NewFakeK8sClient(kubetest.FakeNamespace("shared")), "user-token", nil)
+
+	saClients := map[string]kubernetes.ClientInterface{home: homeSA, remote: remoteSA}
+	userClients := map[string]kubernetes.UserClientInterface{home: homeUser, remote: remoteUser}
+	kialiCache := cache.NewTestingCacheWithClients(t, saClients, *conf)
+	discovery := istio.NewDiscovery(saClients, kialiCache, conf)
+	layer := newLayer(userClients, saClients, nil, nil, kialiCache, conf, nil, discovery, nil)
+
+	// The mesh hosts a control plane in the home cluster's "shared"
+	// namespace. The remote cluster also has a "shared" namespace — with an
+	// ordinary tenant gateway in it.
+	layer.IstioStatus.discovery = &istiotest.FakeDiscovery{MeshReturn: models.Mesh{
+		ControlPlanes: []models.ControlPlane{{
+			Cluster:         &models.KubeCluster{Name: home},
+			IstiodNamespace: "shared",
+		}},
+	}}
+
+	kialiCache.SetIstioStatus(kubernetes.IstioComponentStatus{
+		// The control plane itself: kept via the (cluster, namespace) pair.
+		{Cluster: home, Name: "istiod", Namespace: "shared", Status: kubernetes.ComponentHealthy, IsCore: true},
+		// The collision: a tenant gateway in the remote cluster's same-named
+		// namespace. The user is denied there, and the remote "shared" is not
+		// a control-plane namespace — the entry must be dropped.
+		{Cluster: remote, Name: "gw-tenant-collision", Namespace: "shared", Status: kubernetes.ComponentHealthy},
+		// Positive control: an accessible namespace's gateway is kept.
+		{Cluster: home, Name: "gw-allowed", Namespace: "bookinfo", Status: kubernetes.ComponentHealthy},
+		// The configured component namespace is a global exemption: kept
+		// even in the remote cluster the user cannot see.
+		{Cluster: remote, Name: "gw-configured", Namespace: "configured-ns", Status: kubernetes.ComponentHealthy},
+	})
+
+	status, err := layer.IstioStatus.GetStatus(context.TODO())
+	require.NoError(err)
+
+	componentNames := make(map[string]bool, len(status))
+	for _, component := range status {
+		componentNames[component.Name] = true
+	}
+	assert.True(componentNames["istiod"], "the control plane in the home cluster's shared namespace must be kept")
+	assert.True(componentNames["gw-allowed"], "the accessible namespace's gateway must be kept")
+	assert.True(componentNames["gw-configured"], "the configured component namespace is a global exemption and must be kept")
+	assert.False(componentNames["gw-tenant-collision"], "a tenant gateway in another cluster's same-named namespace must not be exempted")
 }

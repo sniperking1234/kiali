@@ -9,11 +9,15 @@
 #        start: starts the OpenShift environment
 #         stop: stops the OpenShift environment
 #       delete: deletes the OpenShift environment removing persisted data
+#      cleanup: just like delete but also further cleans up the CRC environment
 #       status: outputs the current status of the OpenShift environment
 #          ssh: logs into the CRC VM via ssh so you can probe in the VM
 #        sshoc: logs into the CRC VM via oc debug so you can probe in the VM
 #       routes: outputs all known route URLs
 #     services: outputs all known service endpoints (excluding internal openshift services)
+#       expose: creates firewalld rules so remote clients can access the cluster
+#     unexpose: removes firewalld rules so remote clients cannot access the cluster
+# changedomain: change the cluster to use an nip.io domain rather than "crc.testing".
 #
 # This script accepts several options - see --help for details.
 #
@@ -31,6 +35,40 @@ debug() {
   if [ "$_VERBOSE" == "true" ]; then
     infomsg "DEBUG: $1"
   fi
+}
+
+# Normalize an OpenShift version string to major.minor (e.g. "4.22.1" -> "4.22").
+normalize_openshift_minor_version() {
+  echo "$1" | sed -E 's/^(4\.[0-9]+).*/\1/'
+}
+
+# Looks up CRC tool and bundle versions for an OpenShift release from OPENSHIFT_VERSION_MAP.
+# On success, sets _RESOLVED_CRC_VERSION and _RESOLVED_CRC_BUNDLE_VERSION.
+lookup_crc_versions_for_openshift() {
+  local osv_minor
+  local entry
+  osv_minor="$(normalize_openshift_minor_version "$1")"
+  _RESOLVED_CRC_VERSION=""
+  _RESOLVED_CRC_BUNDLE_VERSION=""
+  while IFS= read -r entry; do
+    [ -z "${entry}" ] && continue
+    local map_os map_crc map_bundle
+    map_os="$(echo "${entry}" | cut -d: -f1)"
+    map_crc="$(echo "${entry}" | cut -d: -f2)"
+    map_bundle="$(echo "${entry}" | cut -d: -f3)"
+    if [ "${map_os}" = "${osv_minor}" ]; then
+      _RESOLVED_CRC_VERSION="${map_crc}"
+      _RESOLVED_CRC_BUNDLE_VERSION="${map_bundle}"
+      return 0
+    fi
+  done <<< "${OPENSHIFT_VERSION_MAP}"
+  infomsg "ERROR: Unsupported OpenShift version [${1}] (normalized: ${osv_minor})."
+  infomsg "Supported OpenShift versions: $(list_supported_openshift_versions)"
+  return 1
+}
+
+list_supported_openshift_versions() {
+  echo "${OPENSHIFT_VERSION_MAP}" | grep -v '^[[:space:]]*$' | cut -d: -f1 | tr '\n' ' '
 }
 
 get_downloader() {
@@ -52,25 +90,7 @@ get_downloader() {
   debug "Downloader command to be used: ${DOWNLOADER}"
 }
 
-get_installer() {
-  if [ -z "$INSTALLER" ] ; then
-    # Use dnf command if available, otherwise try yum
-    if which dnf > /dev/null 2>&1 ; then
-      INSTALLER="sudo dnf"
-    else
-      if which yum > /dev/null 2>&1 ; then
-        INSTALLER="sudo yum"
-      fi
-    fi
-
-    if [ ! "$INSTALLER" ] ; then
-      infomsg "ERROR: Cannot determine your machine's installer (cannot find dnf or yum)."
-      exit 1
-    fi
-  fi
-  debug "Installer command to be used: ${INSTALLER}"
-}
-
+# check_crc_running sets env var _CRC_RUNNING to true or false
 check_crc_running() {
   if [ -z ${_CRC_RUNNING} ]; then
     if crc status | grep "CRC VM:.*Running" > /dev/null 2>&1; then
@@ -82,15 +102,40 @@ check_crc_running() {
   fi
 }
 
+# get_console_url sets the env var CONSOLE_URL
 get_console_url() {
+  local rc
   CONSOLE_URL="$(${CRC_OC} get console cluster -o jsonpath='{.status.consoleURL}' 2>/dev/null)"
-  if [ "$?" != "0" -o "$CONSOLE_URL" == "" ]; then
+  rc="$?"
+  if [ "${rc}" != "0" ] || [ -z "${CONSOLE_URL}" ]; then
     CONSOLE_URL="console-not-available"
   fi
 }
 
+# get_api_server_url sets the env var OPENSHIFT_API_SERVER_URL
 get_api_server_url() {
-  OPENSHIFT_API_SERVER_URL="$(${CRC_OC} whoami --show-server)"
+  OPENSHIFT_API_SERVER_URL="$(${CRC_OC} whoami --show-server 2>/dev/null || echo 'unknown')"
+}
+
+# get_base_domain_name sets the env vars OPENSHIFT_BASE_DOMAIN_NAME as well as OPENSHIFT_API_SERVER_URL
+get_base_domain_name() {
+  get_api_server_url
+  OPENSHIFT_BASE_DOMAIN_NAME="$(echo "${OPENSHIFT_API_SERVER_URL}" | awk -F[/:] '{sub(/^api\./, "", $4); print $4}')"
+}
+
+# get_machine_ip sets the env var MACHINE_IP
+get_machine_ip() {
+  MACHINE_IP="$(hostname -I | awk '{print $1}')"
+}
+
+# get_oauth_host sets the env var OPENSHIFT_OAUTH_HOST
+get_oauth_host() {
+  OPENSHIFT_OAUTH_HOST="$(${CRC_OC} get route oauth-openshift -n openshift-authentication -o jsonpath='{.spec.host}')"
+}
+
+# is_logged_in sets the env var OC_IS_LOGGED_IN to true or false
+is_logged_in() {
+  OC_IS_LOGGED_IN="$(${CRC_OC} whoami &> /dev/null < /dev/null && echo true || echo false)"
 }
 
 get_status() {
@@ -105,20 +150,20 @@ get_status() {
   echo "Status from crc command [${CRC_COMMAND}]"
   ${CRC_COMMAND} status
   echo "====================================================================="
-
   if [ "${_CRC_RUNNING}" == "true" ]; then
-    get_registry_names
-    check_insecure_registry
-    get_console_url
-    get_api_server_url
+    is_logged_in
+    if [ "${OC_IS_LOGGED_IN}" == "true" ]; then
+      get_registry_names
+      get_console_url
+      get_base_domain_name
+      get_oauth_host
+      echo "Logged in?: yes"
+    else
+      echo "Logged in?: no"
+    fi
+    echo "====================================================================="
     echo "To install 'oc' in your environment:"
     ${CRC_COMMAND} oc-env
-    echo "====================================================================="
-    echo "Version from oc command [${CRC_OC}]"
-    ${CRC_OC} version
-    echo "====================================================================="
-    echo "Status from oc command [${CRC_OC}]"
-    ${CRC_OC} status
     echo "====================================================================="
     echo "TOP output:"
     printf "%s\n" "$(exec_ssh 'top -b -n 1 | head -n 5')"
@@ -126,30 +171,42 @@ get_status() {
     echo "Memory usage:"
     printf "%s\n" "$(exec_ssh 'free -ht')"
     echo "====================================================================="
-    echo "Number of CPUs: $(${CRC_OC} get $(${CRC_OC} get nodes -o name) -o jsonpath={.status.capacity.cpu})"
-    echo "====================================================================="
-    echo "Age of cluster: $(${CRC_OC} get namespace kube-system --no-headers | tr -s ' ' | cut -d ' ' -f3)"
     echo "Uptime of VM: $(exec_ssh 'uptime --pretty') (since $(exec_ssh 'uptime --since'))"
+    if [ "${OC_IS_LOGGED_IN}" == "true" ]; then
+      echo "====================================================================="
+      echo "Version from oc command [${CRC_OC}]"
+      ${CRC_OC} version
+      echo "====================================================================="
+      echo "Status from oc command [${CRC_OC}]"
+      ${CRC_OC} status
+      echo "====================================================================="
+      echo "Number of CPUs: $(${CRC_OC} get "$(${CRC_OC} get nodes -o name)" -o jsonpath='{.status.capacity.cpu}')"
+      echo "====================================================================="
+      echo "Age of cluster: $(${CRC_OC} get namespace kube-system --no-headers | tr -s ' ' | cut -d ' ' -f3)"
+      echo "====================================================================="
+      echo "whoami: $(${CRC_OC} whoami 2>&1 < /dev/null) ($(${CRC_OC} whoami --show-server 2>&1 < /dev/null))"
+      echo "====================================================================="
+      echo "Domain Name: ${OPENSHIFT_BASE_DOMAIN_NAME}"
+      echo "Console:     ${CONSOLE_URL}"
+      echo "API URL:     ${OPENSHIFT_API_SERVER_URL}"
+      echo "IP address:  $(${CRC_COMMAND} ip)"
+      echo "Image Repo:  ${EXTERNAL_IMAGE_REGISTRY} (${INTERNAL_IMAGE_REGISTRY})"
+      echo "OAuth Host:  ${OPENSHIFT_OAUTH_HOST}"
+    fi
     echo "====================================================================="
-    echo "whoami: $(${CRC_OC} whoami)"
-    echo "====================================================================="
-    echo "Console:    ${CONSOLE_URL}"
-    echo "API URL:    ${OPENSHIFT_API_SERVER_URL}"
-    echo "IP address: $(${CRC_COMMAND} ip)"
-    echo "Image Repo: ${EXTERNAL_IMAGE_REGISTRY} (${INTERNAL_IMAGE_REGISTRY})"
-    echo "====================================================================="
-    echo "kubeadmin password: $(cat ${CRC_KUBEADMIN_PASSWORD_FILE})"
-    echo "kiali password:     kiali"
-    echo "johndoe password:   johndoe"
+    echo "kubeadmin password: $(cat "${CRC_KUBEADMIN_PASSWORD_FILE}")"
+    echo "$(${CRC_COMMAND} console --credentials | sed 's/crc.testing/'${OPENSHIFT_BASE_DOMAIN_NAME}'/')"
     echo "====================================================================="
     echo "To push images to the image repo you need to log in."
     echo "You can use docker or podman, and you can use kubeadmin or kiali user."
-    echo "  oc login -u kubeadmin -p $(cat ${CRC_KUBEADMIN_PASSWORD_FILE}) ${OPENSHIFT_API_SERVER_URL}"
-    echo '  docker login -u kubeadmin -p $(oc whoami -t)' ${EXTERNAL_IMAGE_REGISTRY}
+    echo "  oc login -u kubeadmin -p $(cat "${CRC_KUBEADMIN_PASSWORD_FILE}") --server ${OPENSHIFT_API_SERVER_URL:-<api url>}"
+    echo '  docker login -u kubeadmin -p $(oc whoami -t)' ${EXTERNAL_IMAGE_REGISTRY:-<image registry>}
     echo "or"
-    echo "  oc login -u kiali -p kiali ${OPENSHIFT_API_SERVER_URL}"
-    echo '  podman login --tls-verify=false -u kiali -p $(oc whoami -t)' ${EXTERNAL_IMAGE_REGISTRY}
+    echo "  oc login -u kiali -p kiali --server ${OPENSHIFT_API_SERVER_URL:-<api url>}"
+    echo '  podman login --tls-verify=false -u kiali -p $(oc whoami -t)' ${EXTERNAL_IMAGE_REGISTRY:-<image registry>}
     echo "====================================================================="
+  else
+    echo "CRC is not running."
   fi
 }
 
@@ -165,36 +222,20 @@ get_registry_names() {
   INTERNAL_IMAGE_REGISTRY=${int:-<unknown>}
 }
 
-check_insecure_registry() {
-  # make sure docker insecure registry is defined
-  pgrep -a dockerd | grep "[-]-insecure-registry.*${EXTERNAL_IMAGE_REGISTRY}" > /dev/null 2>&1
-  if [ "$?" != "0" ]; then
-    grep "OPTIONS=.*--insecure-registry.*${EXTERNAL_IMAGE_REGISTRY}" /etc/sysconfig/docker > /dev/null 2>&1
-    if [ "$?" != "0" ]; then
-      grep "insecure-registries.*${EXTERNAL_IMAGE_REGISTRY}" /etc/docker/daemon.json > /dev/null 2>&1
-      if [ "$?" != "0" ]; then
-        infomsg "WARNING: You must tell Docker about the CRC insecure registry (e.g. --insecure-registry ${EXTERNAL_IMAGE_REGISTRY})."
-      else
-        debug "/etc/docker/daemon.json has the insecure-registry setting. This is good."
-      fi
-    else
-      debug "/etc/sysconfig/docker has defined the insecure-registry setting. This is good."
-    fi
-  else
-    debug "Docker daemon is running with --insecure-registry setting. This is good."
-  fi
-}
-
 get_route_url() {
   # takes as input "routeName:routeNamespace"
-  local routename=$(echo ${1} | cut -d: -f1)
-  local routenamespace=$(echo ${1} | cut -d: -f2)
+  local routename
+  local routenamespace
   local protocol="https"
-  local termination=$(${CRC_OC} get route ${routename} -n ${routenamespace} -o custom-columns=T:spec.tls.termination --no-headers)
+  local termination
+  local host
+  routename="$(echo ${1} | cut -d: -f1)"
+  routenamespace="$(echo ${1} | cut -d: -f2)"
+  termination=$(${CRC_OC} get route ${routename} -n ${routenamespace} -o custom-columns=T:spec.tls.termination --no-headers)
   if [ "${termination}" == "<none>" ]; then
     protocol="http"
   fi
-  local host=$(${CRC_OC} get route ${routename} -n ${routenamespace} -o custom-columns=H:spec.host --no-headers)
+  host=$(${CRC_OC} get route ${routename} -n ${routenamespace} -o custom-columns=H:spec.host --no-headers)
 
   ROUTE_URL="${protocol}://${host}"
 }
@@ -210,14 +251,22 @@ print_all_route_urls() {
 
 get_service_endpoint() {
   # takes as input "serviceName:serviceNamespace"
-  local servicename=$(echo ${1} | cut -d: -f1)
-  local servicenamespace=$(echo ${1} | cut -d: -f2)
-  local data="$(${CRC_OC} get service ${servicename} -n ${servicenamespace} -o custom-columns=I:spec.clusterIP,T:spec.type,NP:spec.ports[*].nodePort,P:spec.ports[*].port --no-headers | sed ${SEDOPTIONS} 's/  */:/g')"
-  local clusterIP=$(echo ${data} | cut -d: -f1)
-  local servicetype=$(echo ${data} | cut -d: -f2)
-  local nodeports=$(echo ${data} | cut -d: -f3)
-  local ports=$(echo ${data} | cut -d: -f4)
-  local host="$(${CRC_COMMAND} ip)"
+  local servicename
+  local servicenamespace
+  local data
+  local clusterIP
+  local servicetype
+  local nodeports
+  local ports
+  local host
+  servicename="$(echo ${1} | cut -d: -f1)"
+  servicenamespace="$(echo ${1} | cut -d: -f2)"
+  data="$(${CRC_OC} get service ${servicename} -n ${servicenamespace} -o custom-columns=I:spec.clusterIP,T:spec.type,NP:spec.ports[*].nodePort,P:spec.ports[*].port --no-headers | sed ${SEDOPTIONS} 's/  */:/g')"
+  clusterIP="$(echo ${data} | cut -d: -f1)"
+  servicetype="$(echo ${data} | cut -d: -f2)"
+  nodeports="$(echo ${data} | cut -d: -f3)"
+  ports="$(echo ${data} | cut -d: -f4)"
+  host="$(${CRC_COMMAND} ip)"
   # really only NodePort services are exposed outside of the CRC VM, so we just report those
   if [ ${servicetype} == "NodePort" ]; then
     SERVICE_ENDPOINT="${host}:${nodeports}"
@@ -242,27 +291,383 @@ print_all_service_endpoints() {
 
 exec_ssh() {
   local sshcmd=${1}
-  ssh -y -i ${CRC_ROOT_DIR}/machines/crc/id_rsa -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null core@$(${CRC_COMMAND} ip) ${sshcmd}
+  # when network-mode is explicitly set to "user" or it is the default, the port is 2222.
+  local port=22
+  if ${CRC_COMMAND} config get network-mode | grep -Eq " user$|'user'"; then
+    port=2222
+  fi
+  ssh -y -p ${port} -i ${CRC_ROOT_DIR}/machines/crc/id_ed25519 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "core@$(${CRC_COMMAND} ip)" ${sshcmd}
+}
+
+expose_cluster() {
+  check_crc_running
+  if [ "${_CRC_RUNNING}" != "true" ]; then
+    infomsg "CRC is not running. Aborting."
+    exit 1
+  fi
+
+  local crc_ip
+  local sudo
+
+  # make sure the platform has all the requirements needed to do this
+  local ip_fwd
+  local existing_fwds
+  crc_ip="$(${CRC_COMMAND} ip 2>/dev/null)"
+  sudo="$(test "$(whoami)" = "root" && echo "" || echo "sudo")"
+  ip_fwd=$(cat /proc/sys/net/ipv4/ip_forward)
+  if [ "$ip_fwd" != "1" ]; then infomsg "ERROR: IP forwarding not enabled. /proc/sys/net/ipv4/ip_forward=$ip_fwd"; exit 1; fi
+  if ! which firewall-cmd >& /dev/null; then infomsg "ERROR: You do not have firewall-cmd in your PATH"; exit 1; fi
+  if ! systemctl -q is-active firewalld; then infomsg "ERROR: firewalld is not running"; exit 1; fi
+  if [ -z "${crc_ip}" ]; then infomsg "ERROR: The CRC cluster is not running"; exit 1; fi
+
+  # If we already have existing port forwards, abort
+  existing_fwds=$($sudo firewall-cmd --list-forward-ports | grep "^port=80:proto=tcp:\|^port=443:proto=tcp:\|^port=6443:proto=tcp:")
+  if [ -n "$existing_fwds" ]; then
+    infomsg "ERROR: Existing port forwarding rules were found which are conflicting and must be deleted:"
+    for x in ${existing_fwds}; do
+      echo " $sudo firewall-cmd --remove-forward-port=\"$x\""
+    done
+    infomsg "You can use the 'unexpose' command to remove these rules."
+    exit 1
+  fi
+
+  for c in \
+    "firewall-cmd --add-forward-port=port=443:proto=tcp:toaddr=${crc_ip}:toport=443" \
+    "firewall-cmd --add-forward-port=port=6443:proto=tcp:toaddr=${crc_ip}:toport=6443" \
+    "firewall-cmd --add-forward-port=port=80:proto=tcp:toaddr=${crc_ip}:toport=80"
+  do
+    echo -n "EXECUTING: $sudo $c ... "
+    $sudo $c
+  done
+
+  # give some hints to the user about how to access it
+  infomsg "When accessing this cluster from outside make sure that cluster FQDNs resolve from outside."
+
+  is_logged_in
+  if [ "${OC_IS_LOGGED_IN}" == "true" ]; then
+    get_machine_ip
+    get_base_domain_name
+    get_registry_names
+    get_oauth_host
+    local console_host
+    console_host="$(${CRC_OC} get route console -n openshift-console -o jsonpath='{.spec.host}')"
+    infomsg "For basic api/console access, something like the following in an /etc/hosts entry should work:"
+    infomsg "${MACHINE_IP:-<IP-of-this-host>} api.${OPENSHIFT_BASE_DOMAIN_NAME:-} ${console_host:-} ${EXTERNAL_IMAGE_REGISTRY} ${OPENSHIFT_OAUTH_HOST:-}"
+  fi
+}
+
+unexpose_cluster() {
+  local sudo
+  local ip_fwd
+  local existing_fwds
+  sudo="$(test "$(whoami)" = "root" && echo "" || echo "sudo")"
+
+  # make sure the platform has all the requirements needed to do this
+  ip_fwd=$(cat /proc/sys/net/ipv4/ip_forward)
+  if [ "$ip_fwd" != "1" ]; then infomsg "ERROR: IP forwarding not enabled. /proc/sys/net/ipv4/ip_forward=$ip_fwd"; exit 1; fi
+  if ! which firewall-cmd >& /dev/null; then infomsg "ERROR: You do not have firewall-cmd in your PATH"; exit 1; fi
+  if ! systemctl -q is-active firewalld; then infomsg "ERROR: firewalld is not running"; exit 1; fi
+
+  existing_fwds=$($sudo firewall-cmd --list-forward-ports | grep "^port=80:proto=tcp:\|^port=443:proto=tcp:\|^port=6443:proto=tcp:")
+  if [ -n "${existing_fwds}" ]; then
+    for x in ${existing_fwds}; do
+      echo -n "EXECUTING: $sudo firewall-cmd --remove-forward-port=\"$x\" ... "
+      $sudo firewall-cmd --remove-forward-port="$x"
+    done
+  else
+    infomsg "No relevant firewalld rules exist - nothing needs to be removed."
+  fi
+}
+
+wait_for_cluster_operators() {
+  while true; do
+
+    infomsg "Waiting for the cluster operators to be ready..."
+    sleep 10
+
+    local co_status
+    co_status=$(${CRC_OC} get clusteroperators --no-headers 2> /dev/null)
+    if [ "$?" != "0" ]; then
+      infomsg "Could not get info on cluster operators. Assuming the API Server is not ready..."
+      continue
+    fi
+    if [ "$(echo "$co_status" | wc -l 2>/dev/null)" -lt "3" ]; then
+      infomsg "OpenShift cluster is still starting up..."
+      continue
+    fi
+
+    # if there are any operators NOT AVAILABLE, exit code will be 0.
+    echo "$co_status" | awk '{print $3}' | grep False &>/dev/null
+    local available_operators=$?
+    # if there are any operators PROGRESSING, exit code will be 0.
+    echo "$co_status" | awk '{print $4}' | grep True &>/dev/null
+    local progressing_operators=$?
+    # if there are any operators DEGRADED, exit code will be 0.
+    echo "$co_status" | awk '{print $5}' | grep True &>/dev/null
+    local degraded_operators=$?
+    if [ "$available_operators" != "0" ] && [ "$progressing_operators" != "0" ] && [ "$degraded_operators" != "0" ]; then
+      infomsg "All cluster operators appear to be ready."
+      break
+    fi
+  done
+}
+
+install_hydra_openshift() {
+  infomsg "Installing Ory Hydra for OpenID Connect support on OpenShift..."
+
+  # Find the Hydra install script relative to this script
+  local hydra_install_script="${SCRIPT_ROOT}/ory-hydra/scripts/install-hydra.sh"
+  if [ ! -f "${hydra_install_script}" ]; then
+    infomsg "ERROR: Hydra install script not found at: ${hydra_install_script}"
+    exit 1
+  fi
+
+  # Install Hydra with OpenShift configuration
+  # Routes will be created automatically, TLS handled at Route level
+  bash "${hydra_install_script}" \
+    --cluster-type openshift \
+    --client-exe "${CRC_OC}" \
+    --hydra-version "${HYDRA_VERSION}"
+
+  if [ "$?" != "0" ]; then
+    infomsg "ERROR: Failed to install Ory Hydra"
+    exit 1
+  fi
+
+  # Wait for all Hydra pods to be ready (exclude Completed jobs from count)
+  infomsg "Waiting for Hydra pods to be ready..."
+  for i in {1..60}; do
+    local ready_pods
+    local total_running_pods
+    ready_pods=$(${CRC_OC} get pods -n ory --no-headers 2>/dev/null | grep -c "1/1.*Running" || echo "0")
+    total_running_pods=$(${CRC_OC} get pods -n ory --no-headers 2>/dev/null | grep -c "Running" || echo "0")
+    if [ "${ready_pods}" -ge 3 ] && [ "${ready_pods}" -eq "${total_running_pods}" ]; then
+      infomsg "All Hydra pods are ready (${ready_pods}/${total_running_pods})"
+      break
+    fi
+    infomsg "Waiting for Hydra pods... (${ready_pods}/${total_running_pods} ready, attempt $i/60)"
+    sleep 5
+  done
+
+  # Verify Routes are accessible
+  infomsg "Verifying Hydra Routes are accessible..."
+  local hydra_public_route
+  hydra_public_route=$(${CRC_OC} get route hydra-public -n ory -o jsonpath='{.spec.host}' 2>/dev/null || echo "")
+  if [ -n "${hydra_public_route}" ]; then
+    for i in {1..30}; do
+      if curl -k -s "https://${hydra_public_route}/.well-known/openid-configuration" > /dev/null 2>&1; then
+        infomsg "Hydra OIDC endpoint is accessible at: https://${hydra_public_route}"
+        break
+      fi
+      infomsg "Waiting for Hydra OIDC endpoint... (attempt $i/30)"
+      sleep 2
+    done
+  else
+    infomsg "WARNING: Could not determine Hydra public route"
+  fi
+
+  infomsg "Ory Hydra installation complete!"
+  infomsg "Routes:"
+  ${CRC_OC} get routes -n ory
+}
+
+change_crc_domain_name() {
+  check_crc_running
+  if [ "${_CRC_RUNNING}" != "true" ]; then
+    infomsg "CRC is not running - cannot set CRC domain name. Aborting."
+    exit 1
+  fi
+
+  is_logged_in
+  if [ "${OC_IS_LOGGED_IN}" != "true" ]; then
+    infomsg "You are not logged into the OpenShift cluster."
+    exit 1
+  fi
+
+  get_machine_ip
+  if ! ping -c 1 "${MACHINE_IP}" >/dev/null; then
+    infomsg "Cannot determine the machine IP. Aborting."
+    exit 1
+  fi
+
+  if [ ! -f /etc/haproxy/haproxy.cfg ] ; then
+    echo "haproxy is not installed. Run: sudo dnf -y install haproxy policycoreutils-python-utils"
+    exit 1
+  fi
+
+  local sudo
+  local crc_ip
+  sudo="$(test "$(whoami)" = "root" && echo "" || echo "sudo")"
+
+  # firewall screws things up. Have never been able to figure it out. Disable it.
+  if systemctl -q is-active firewalld; then
+    infomsg "Shutting down the firewalld service."
+    $sudo systemctl stop firewalld
+  fi
+
+  crc_ip="$(${CRC_COMMAND} ip)"
+
+  infomsg "Setting up HAProxy"
+  cat << EOF > /tmp/haproxy.cfg.crc
+global
+        maxconn 4000
+
+defaults
+        balance roundrobin
+        log global
+        timeout connect 10s
+        timeout client 2000s
+        timeout server 2000s
+
+frontend fe-api
+        bind 0.0.0.0:6443
+        mode tcp
+        option tcplog
+        default_backend be-api
+
+frontend fe-https
+        bind 0.0.0.0:443
+        mode tcp
+        option tcplog
+        default_backend be-https
+
+frontend fe-http
+        bind 0.0.0.0:80
+        mode tcp
+        option tcplog
+        default_backend be-http
+
+backend be-api
+        mode tcp
+        option ssl-hello-chk
+        server crcvm ${crc_ip}:6443 check
+
+backend be-https
+        mode tcp
+        option ssl-hello-chk
+        server crcvm ${crc_ip}:443 check
+
+backend be-http
+        mode tcp
+        server crcvm ${crc_ip}:80 check
+EOF
+
+  if [ ! -f /etc/haproxy/haproxy.cfg.ORIGINAL ] ; then
+    infomsg "Backing up original haproxy config file"
+    $sudo cp /etc/haproxy/haproxy.cfg /etc/haproxy/haproxy.cfg.ORIGINAL
+  fi
+
+  $sudo cp /tmp/haproxy.cfg.crc /etc/haproxy/haproxy.cfg
+  $sudo systemctl restart haproxy
+  infomsg "HAProxy is ready"
+
+  # the new CRC base domain name
+  BASE_DOMAIN="${MACHINE_IP}.nip.io"
+  infomsg "Will change CRC cluster domain name to [${BASE_DOMAIN}]"
+
+  # create new certificate with the new base domain name
+  infomsg "Generating new certificate..."
+  openssl req -newkey rsa:2048 -new -nodes -x509 -days 3650 -keyout /tmp/crc-nip.key -out /tmp/crc-nip.crt -subj "/CN=${BASE_DOMAIN}" -addext "subjectAltName=DNS:apps.${BASE_DOMAIN},DNS:*.apps.${BASE_DOMAIN},DNS:api.${BASE_DOMAIN}"
+  if [ "$?" != "0" ]; then infomsg "Cannot create certificate" && exit 1; fi
+
+  # put the new certificate in a secret within the openshift-config namespace
+  infomsg "New certificate generated. Now configuring OpenShift..."
+  ${CRC_OC} create secret tls crc-nip-secret --cert=/tmp/crc-nip.crt --key=/tmp/crc-nip.key -n openshift-config
+  if [ "$?" != "0" ]; then infomsg "Cannot create secret with the new certificate" && exit 1; fi
+
+  # configure some additional places in the OpenShift cluster that need to know about the new domain name
+  ${CRC_OC} patch route default-route -n openshift-image-registry --type=merge -p "{\"spec\": {\"host\": \"default-route-openshift-image-registry.$BASE_DOMAIN\"}}"
+  if [ "$?" != "0" ]; then infomsg "Failed to patch openshift-image-registry/default-route" && exit 1; fi
+
+  cat <<EOF > /tmp/crc-ingress-patch.yaml
+spec:
+  appsDomain: apps.${BASE_DOMAIN}
+  componentRoutes:
+  - hostname: console-openshift-console.apps.${BASE_DOMAIN}
+    name: console
+    namespace: openshift-console
+    servingCertKeyPairSecret:
+      name: crc-nip-secret
+  - hostname: oauth-openshift.apps.${BASE_DOMAIN}
+    name: oauth-openshift
+    namespace: openshift-authentication
+    servingCertKeyPairSecret:
+      name: crc-nip-secret
+EOF
+  ${CRC_OC} patch ingresses.config.openshift.io cluster --type=merge --patch-file=/tmp/crc-ingress-patch.yaml
+  if [ "$?" != "0" ]; then infomsg "Failed to patch cluster ingress" && exit 1; fi
+
+  ${CRC_OC} patch apiserver cluster --type=merge -p "{\"spec\":{\"servingCerts\": {\"namedCertificates\":[{\"names\":[\"api.${BASE_DOMAIN}\"],\"servingCertificate\": {\"name\": \"crc-nip-secret\"}}]}}}"
+  if [ "$?" != "0" ]; then infomsg "Failed to patch cluster apiserver" && exit 1; fi
+
+  infomsg "The server will soon be accessible via web console at: https://console-openshift-console.apps.${BASE_DOMAIN}"
+  infomsg "To log into the cluster via 'oc': oc login -u <username> -p <password> https://api.${BASE_DOMAIN}:6443"
+
+  # wait for the cluster to fully incorporate these changes
+  wait_for_cluster_operators
+
+  infomsg "The API server URL has changed. Logging out of the obsolete session"
+  ${CRC_OC} logout
+  infomsg "Using the CRC oc client to login as kubeadmin"
+  ${CRC_OC} login --insecure-skip-tls-verify=true -u kubeadmin -p "$(cat "${CRC_KUBEADMIN_PASSWORD_FILE}")" --server https://api.${BASE_DOMAIN}:6443
+
+  if which oc &> /dev/null; then
+    infomsg "Using the 'oc' client found in PATH to login as kubeadmin"
+    oc login --insecure-skip-tls-verify=true -u kubeadmin -p "$(cat "${CRC_KUBEADMIN_PASSWORD_FILE}")" --server https://api.${BASE_DOMAIN}:6443
+  else
+    infomsg "You need to log back into the cluster via your 'oc' client."
+  fi
+  infomsg "Login Command: oc login -u <username> -p <password> --server https://api.${BASE_DOMAIN}:6443"
 }
 
 # Change to the directory where this script is and set our environment
-SCRIPT_ROOT="$( cd "$(dirname "$0")" ; pwd -P )"
-cd ${SCRIPT_ROOT}
+SCRIPT_ROOT="$( cd "$(dirname "$0")" || exit ; pwd -P )"
+cd ${SCRIPT_ROOT} || exit
 
-# The default version of the crc tool to be downloaded
-DEFAULT_CRC_DOWNLOAD_VERSION="1.10.0"
+# To see versions of crc and openshift, go to either:
+# * http://cdk-builds.usersys.redhat.com/builds/crc/releases
+# * https://developers.redhat.com/content-gateway/rest/mirror/pub/openshift-v4/clients/crc
+# Pick a CRC release, and drill down into release-info.json - it will tell you what OpenShift it has inside.
+#
+# When adding support for a new OpenShift release, add a row to OPENSHIFT_VERSION_MAP below
+# and update DEFAULT_OPENSHIFT_VERSION if it should become the new default.
 
-# The default version of the crc bundle - this is typically the version included with the CRC download
-DEFAULT_CRC_LIBVIRT_DOWNLOAD_VERSION="4.4.3"
+# The default OpenShift version to run when --openshift-version is not specified
+DEFAULT_OPENSHIFT_VERSION="4.22"
+
+# Maps OpenShift minor version to crc tool version and crc bundle version.
+# Format: openshift_minor:crc_version:bundle_version
+OPENSHIFT_VERSION_MAP="
+4.22:2.62.0:4.22.1
+4.21:2.61.0:4.21.14
+4.20:2.57.0:4.20.5
+4.19:2.53.0:4.19.3
+4.18:2.49.0:4.18.2
+"
 
 # The default virtual CPUs assigned to the CRC VM
-DEFAULT_CRC_CPUS="5"
+DEFAULT_CRC_CPUS="6"
 
 # The default memory (in GB) assigned to the CRC VM
-DEFAULT_CRC_MEMORY="16"
+DEFAULT_CRC_MEMORY="32"
 
 # The default virtual disk size (in GB) assigned to the CRC VM
-DEFAULT_CRC_VIRTUAL_DISK_SIZE="30"
+DEFAULT_CRC_VIRTUAL_DISK_SIZE="48"
+
+# If true the OpenShift bundle will be downloaded when needed.
+DEFAULT_DOWNLOAD_BUNDLE="false"
+
+# Enables cluster monitoring in the CRC cluster
+DEFAULT_ENABLE_CLUSTER_MONITORING="false"
+
+# Enables network mode "user" which uses the local host networking
+DEFAULT_ENABLE_USER_NETWORK_MODE="false"
+
+# Enables Ory Hydra OIDC provider installation (for OpenID Connect testing)
+DEFAULT_HYDRA_ENABLED="false"
+
+# The version of Hydra to install
+DEFAULT_HYDRA_VERSION="v2.2.0"
 
 # process command line args to override environment
 _CMD=""
@@ -279,6 +684,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     delete)
       _CMD="delete"
+      shift
+      ;;
+    cleanup)
+      _CMD="cleanup"
       shift
       ;;
     status)
@@ -301,6 +710,18 @@ while [[ $# -gt 0 ]]; do
       _CMD="services"
       shift
       ;;
+    expose)
+      _CMD="expose"
+      shift
+      ;;
+    unexpose)
+      _CMD="unexpose"
+      shift
+      ;;
+    changedomain)
+      _CMD="changedomain"
+      shift
+      ;;
     -b|--bin-dir)
       OPENSHIFT_BIN_PATH="$2"
       shift;shift
@@ -311,6 +732,7 @@ while [[ $# -gt 0 ]]; do
       ;;
     -clv|--crc-libvirt-version)
       CRC_LIBVIRT_DOWNLOAD_VERSION="$2"
+      _CRC_LIBVIRT_VERSION_EXPLICIT="true"
       shift;shift
       ;;
     -ccpus|--crc-cpus)
@@ -327,18 +749,39 @@ while [[ $# -gt 0 ]]; do
       ;;
     -cv|--crc-version)
       CRC_DOWNLOAD_VERSION="$2"
+      _CRC_VERSION_EXPLICIT="true"
       shift;shift
       ;;
     -cvdisk|--crc-virtual-disk-size)
       CRC_VIRTUAL_DISK_SIZE="$2"
       shift;shift
       ;;
-    -kuca|--kiali-user-cluster-admin)
-      KIALI_USER_IS_CLUSTER_ADMIN="$2"
+    -db|--download-bundle)
+      DOWNLOAD_BUNDLE="$2"
+      shift;shift
+      ;;
+    -ecm|--enable-cluster-monitoring)
+      ENABLE_CLUSTER_MONITORING="$2"
+      shift;shift
+      ;;
+    -eunm|--enable-user-network-mode)
+      ENABLE_USER_NETWORK_MODE="$2"
+      shift;shift
+      ;;
+    -osv|--openshift-version)
+      OPENSHIFT_VERSION="$2"
+      shift;shift
+      ;;
+    -he|--hydra-enabled)
+      HYDRA_ENABLED="$2"
+      shift;shift
+      ;;
+    -hv|--hydra-version)
+      HYDRA_VERSION="$2"
       shift;shift
       ;;
     -p|--pull-secret-file)
-      PULL_SECRET_ARG="-p $2"
+      PULL_SECRET_FILE="$2"
       shift;shift
       ;;
     -v|--verbose)
@@ -357,10 +800,15 @@ Valid options:
   -ca|--crc-arch <architecture>
       The architecture of the crc binary to use.
       Default: amd64
+  -osv|--openshift-version <version>
+      OpenShift version to run (e.g. 4.22 or 4.20).
+      Selects matching CRC tool and bundle versions automatically.
+      Default: ${DEFAULT_OPENSHIFT_VERSION}
+      Supported: $(list_supported_openshift_versions)
   -clv|--crc-libvirt-version <version>
       The version of the crc libvirt bundle to use.
       If one does not exist in the bin directory, it will be downloaded there.
-      Default: ${DEFAULT_CRC_LIBVIRT_DOWNLOAD_VERSION}
+      Overrides the bundle version selected by --openshift-version.
   -ccpus|--crc-cpus <num CPUs>
       Number of virtual CPUs to assign to the VM.
       Default: ${DEFAULT_CRC_CPUS}
@@ -375,16 +823,33 @@ Valid options:
   -cv|--crc-version <version>
       The version of the crc binary to use.
       If one does not exist in the bin directory, it will be downloaded there.
-      Default: ${DEFAULT_CRC_DOWNLOAD_VERSION}
+      Overrides the CRC tool version selected by --openshift-version.
   -cvdisk|--crc-virtual-disk-size <disk size>
       The size of the virtual disk (in GB) to assign to the VM.
       Default: ${DEFAULT_CRC_VIRTUAL_DISK_SIZE}
       Used only for the 'start' command.
-  -h|--help : this message
-  -kuca|--kiali-user-cluster-admin (true|false)
-      Determines if the "kiali" OpenShift user is to be given cluster admin rights.
-      Default: not set - you will be prompted during startup
+  -db|--download-bundle (true|false)
+      If true, the OpenShift bundle image will be downloaded by this script if needed.
+      You usually do not need to set this to true - crc itself will download the bundle if it is needed.
+      Default: ${DEFAULT_DOWNLOAD_BUNDLE}
       Used only for the 'start' command.
+  -ecm|--enable-cluster-monitoring (true|false)
+      If true, the cluster will have monitoring enabled.
+      Default: ${DEFAULT_ENABLE_CLUSTER_MONITORING}
+      Used only for the 'start' command.
+  -eunm|--enable-user-network-mode (true|false)
+      If true, the network mode will be changed to "user" and will enable CRC to use the local host's networking.
+      Default: ${DEFAULT_ENABLE_USER_NETWORK_MODE}
+      Used only for the 'start' command.
+  -he|--hydra-enabled (true|false)
+      If true, Ory Hydra will be installed for OpenID Connect authentication testing.
+      Default: ${DEFAULT_HYDRA_ENABLED}
+      Used only for the 'start' command.
+  -hv|--hydra-version <version>
+      The version of Ory Hydra to install (e.g., v2.2.0).
+      Default: ${DEFAULT_HYDRA_VERSION}
+      Used only for the 'start' command when --hydra-enabled is true.
+  -h|--help : this message
   -p|--pull-secret-file <filename>
       Specifies the file containing your Image pull secret.
       You can download it from https://cloud.redhat.com/openshift/install/metal/user-provisioned
@@ -399,11 +864,15 @@ The command must be one of:
   * start: Starts the CRC VM with OpenShift 4.x.
   * stop: Stops the CRC VM retaining all data. 'start' will then bring up the CRC VM in the same state.
   * delete: Stops the CRC VM and removes all persistent data. 'start' will then bring up a clean CRC VM.
+  * cleanup: Just like delete but also further cleans up the CRC environment including the large downloaded bundles.
   * status: Information about the CRC VM and the OpenShift cluster running inside it.
   * ssh: Provides a command line prompt with root access inside the CRC VM. Logs in via ssh.
   * sshoc: Provides a command line prompt with root access inside the CRC VM. Logs in via oc debug.
   * routes: Outputs URLs for all known routes.
   * services: Outputs URLs for all known service endpoints (excluding internal openshift services).
+  * expose: Creates firewalld rules so remote clients can access the cluster.
+  * unexpose: Removes firewalld rules so remote clients cannot access the cluster.
+  * changedomain: Changes the CRC cluster base domain name from 'crc.testing' to a unique 'nip.io' name.
 
 HELPMSG
       exit 1
@@ -434,19 +903,34 @@ OPENSHIFT_BIN_PATH="${OPENSHIFT_BIN_PATH:=${HOME}/bin}"
 # The platform is either "linux" or "darwin".
 DEFAULT_OS_PLATFORM=linux
 DETECTED_OS_PLATFORM=`uname | tr '[:upper:]' '[:lower:]'`
-if [ "${DETECTED_OS_PLATFORM}" = "linux" -o "${DETECTED_OS_PLATFORM}" = "darwin" ] ; then
+if [ "${DETECTED_OS_PLATFORM}" = "linux" ] || [ "${DETECTED_OS_PLATFORM}" = "darwin" ] ; then
   DEFAULT_OS_PLATFORM=${DETECTED_OS_PLATFORM}
   debug "The operating system has been detected as ${DEFAULT_OS_PLATFORM}"
 fi
-CRC_DOWNLOAD_VERSION="${CRC_DOWNLOAD_VERSION:-${DEFAULT_CRC_DOWNLOAD_VERSION}}"
+_effective_openshift_version="${OPENSHIFT_VERSION:-${DEFAULT_OPENSHIFT_VERSION}}"
+if [ "${_CRC_VERSION_EXPLICIT}" != "true" ] || [ "${_CRC_LIBVIRT_VERSION_EXPLICIT}" != "true" ]; then
+  lookup_crc_versions_for_openshift "${_effective_openshift_version}" || exit 1
+  if [ "${_CRC_VERSION_EXPLICIT}" != "true" ]; then
+    CRC_DOWNLOAD_VERSION="${_RESOLVED_CRC_VERSION}"
+  fi
+  if [ "${_CRC_LIBVIRT_VERSION_EXPLICIT}" != "true" ]; then
+    CRC_LIBVIRT_DOWNLOAD_VERSION="${_RESOLVED_CRC_BUNDLE_VERSION}"
+  fi
+fi
+CRC_DOWNLOAD_VERSION="${CRC_DOWNLOAD_VERSION:?CRC tool version is not set}"
+CRC_LIBVIRT_DOWNLOAD_VERSION="${CRC_LIBVIRT_DOWNLOAD_VERSION:?CRC bundle version is not set}"
 CRC_DOWNLOAD_PLATFORM="${CRC_DOWNLOAD_PLATFORM:-${DEFAULT_OS_PLATFORM}}"
 CRC_DOWNLOAD_ARCH="${CRC_DOWNLOAD_ARCH:-amd64}"
-CRC_LIBVIRT_DOWNLOAD_VERSION="${CRC_LIBVIRT_DOWNLOAD_VERSION:-${DEFAULT_CRC_LIBVIRT_DOWNLOAD_VERSION}}"
 CRC_ROOT_DIR="${HOME}/.crc"
-CRC_KUBEADMIN_PASSWORD_FILE="${CRC_ROOT_DIR}/cache/crc_libvirt_${CRC_LIBVIRT_DOWNLOAD_VERSION}/kubeadmin-password"
-CRC_KUBECONFIG="${CRC_ROOT_DIR}/cache/crc_libvirt_${CRC_LIBVIRT_DOWNLOAD_VERSION}/kubeconfig"
+CRC_KUBEADMIN_PASSWORD_FILE="${CRC_ROOT_DIR}/machines/crc/kubeadmin-password"
+CRC_KUBECONFIG="${CRC_ROOT_DIR}/machines/crc/kubeconfig"
 CRC_MACHINE_IMAGE="${CRC_ROOT_DIR}/machines/crc/crc"
-CRC_OC="${CRC_ROOT_DIR}/bin/oc"
+CRC_OC_BIN="${CRC_ROOT_DIR}/bin/oc/oc"
+DOWNLOAD_BUNDLE="${DOWNLOAD_BUNDLE:-${DEFAULT_DOWNLOAD_BUNDLE}}"
+ENABLE_CLUSTER_MONITORING="${ENABLE_CLUSTER_MONITORING:-${DEFAULT_ENABLE_CLUSTER_MONITORING}}"
+ENABLE_USER_NETWORK_MODE="${ENABLE_USER_NETWORK_MODE:-${DEFAULT_ENABLE_USER_NETWORK_MODE}}"
+HYDRA_ENABLED="${HYDRA_ENABLED:-${DEFAULT_HYDRA_ENABLED}}"
+HYDRA_VERSION="${HYDRA_VERSION:-${DEFAULT_HYDRA_VERSION}}"
 
 # VM configuration
 CRC_CPUS=${CRC_CPUS:-${DEFAULT_CRC_CPUS}}
@@ -458,13 +942,6 @@ CRC_VIRTUAL_DISK_SIZE=${CRC_VIRTUAL_DISK_SIZE:-${DEFAULT_CRC_VIRTUAL_DISK_SIZE}}
 # These variables below are not meant for users to change.
 #--------------------------------------------------------------
 
-# See if sudo is required. It is required if the user is not in the docker group.
-if groups ${USER} | grep >/dev/null 2>&1 '\bdocker\b'; then
-  DOCKER_SUDO=
-else
-  DOCKER_SUDO=sudo
-fi
-
 # Determine where to get the binaries and their full paths and how to execute them.
 CRC_DOWNLOAD_LOCATION="https://mirror.openshift.com/pub/openshift-v4/clients/crc/${CRC_DOWNLOAD_VERSION}/crc-${CRC_DOWNLOAD_PLATFORM}-${CRC_DOWNLOAD_ARCH}.tar.xz"
 CRC_DOWNLOAD_LOCATION_ALT="http://cdk-builds.usersys.redhat.com/builds/crc/releases/${CRC_DOWNLOAD_VERSION}/crc-${CRC_DOWNLOAD_PLATFORM}-${CRC_DOWNLOAD_ARCH}.tar.xz"
@@ -475,14 +952,17 @@ if [ "${_VERBOSE}" == "true" ]; then
   CRC_COMMAND="${CRC_COMMAND} --log-level debug"
 fi
 
-CRC_LIBVIRT_DOWNLOAD_LOCATION="http://cdk-builds.usersys.redhat.com/builds/crc/bundles/${CRC_LIBVIRT_DOWNLOAD_VERSION}/crc_libvirt_${CRC_LIBVIRT_DOWNLOAD_VERSION}.crcbundle"
-CRC_LIBVIRT_PATH="${OPENSHIFT_BIN_PATH}/crc_libvirt_${CRC_LIBVIRT_DOWNLOAD_VERSION}.crcbundle"
+CRC_LIBVIRT_DOWNLOAD_LOCATION="https://mirror.openshift.com/pub/openshift-v4/clients/crc/bundles/openshift/${CRC_LIBVIRT_DOWNLOAD_VERSION}/crc_libvirt_${CRC_LIBVIRT_DOWNLOAD_VERSION}_${CRC_DOWNLOAD_ARCH}.crcbundle"
+CRC_LIBVIRT_PATH="${OPENSHIFT_BIN_PATH}/crc_libvirt_${CRC_LIBVIRT_DOWNLOAD_VERSION}_${CRC_DOWNLOAD_ARCH}.crcbundle"
+
+CRC_OC="${CRC_OC_BIN} --kubeconfig ${CRC_KUBECONFIG}"
 
 # Environment setup section stops here.
 ########################################
 
 debug "ENVIRONMENT:
   command=$_CMD
+  OPENSHIFT_VERSION=${OPENSHIFT_VERSION:-${DEFAULT_OPENSHIFT_VERSION}}
   CRC_COMMAND=$CRC_COMMAND
   CRC_CPUS=$CRC_CPUS
   CRC_DOWNLOAD_LOCATION=$CRC_DOWNLOAD_LOCATION
@@ -501,7 +981,10 @@ debug "ENVIRONMENT:
   CRC_OC=$CRC_OC
   CRC_ROOT_DIR=$CRC_ROOT_DIR
   CRC_VIRTUAL_DISK_SIZE=$CRC_VIRTUAL_DISK_SIZE
-  DOCKER_SUDO=$DOCKER_SUDO
+  ENABLE_CLUSTER_MONITORING=$ENABLE_CLUSTER_MONITORING
+  ENABLE_USER_NETWORK_MODE=$ENABLE_USER_NETWORK_MODE
+  HYDRA_ENABLED=$HYDRA_ENABLED
+  HYDRA_VERSION=$HYDRA_VERSION
   OPENSHIFT_BIN_PATH=$OPENSHIFT_BIN_PATH
   "
 
@@ -512,10 +995,10 @@ if [ ! -d "${OPENSHIFT_BIN_PATH}" ]; then
 fi
 
 # Download the crc tool if we do not have it yet
-if [[ -f "${CRC_EXE_PATH}" ]]; then
-  _existingVersion=$(${CRC_EXE_PATH} version | head -n 1 | sed ${SEDOPTIONS} "s/^crc version: \([A-Za-z0-9.]*\)[A-Za-z0-9.-]*+[a-z0-9]*$/\1/")
+if [ -f "${CRC_EXE_PATH}" ]; then
+  _existingVersion=$(${CRC_EXE_PATH} version 2>/dev/null | head -n 1 | sed ${SEDOPTIONS} "s/^C.*: \([A-Za-z0-9.]*\)[A-Za-z0-9.-]*+[a-z0-9]*$/\1/")
   _crc_major_minor_patch_version="$(echo -n ${CRC_DOWNLOAD_VERSION} | sed -E 's/([0-9]+.[0-9]+.[0-9]+).*/\1/')"
-  if [ "${_existingVersion}" != "${CRC_DOWNLOAD_VERSION}" -a "${_existingVersion}" != "${_crc_major_minor_patch_version}" ]; then
+  if [ "${_existingVersion}" != "${CRC_DOWNLOAD_VERSION}" ] && [ "${_existingVersion}" != "${_crc_major_minor_patch_version}" ]; then
     infomsg "===== WARNING ====="
     infomsg "You already have the crc tool but it does not match the version you want."
     infomsg "Either delete your existing binary and let this script download another one,"
@@ -543,7 +1026,7 @@ else
       exit 1
     fi
   fi
-  tar xvf "${CRC_EXE_PATH}.tar.xz" -C "$(dirname ${CRC_EXE_PATH})" --strip 1 '*/crc'
+  tar xvf "${CRC_EXE_PATH}.tar.xz" --wildcards -C "$(dirname ${CRC_EXE_PATH})" --strip 1 '*/crc'
   chmod +x ${CRC_EXE_PATH}
   rm "${CRC_EXE_PATH}.tar.xz"
 fi
@@ -552,31 +1035,64 @@ debug "crc command that will be used: ${CRC_COMMAND}"
 debug "$(${CRC_COMMAND} version)"
 
 # Download the crc libvirt image if we do not have it yet
-CRC_BUNDLE_ARG="-b ${CRC_LIBVIRT_PATH}"
-if [ -f "${CRC_LIBVIRT_PATH}" ]; then
-  debug "crc libvirt bundle that will be used: ${CRC_LIBVIRT_PATH}"
-elif [ "$(stat -c '%s' ${CRC_EXE_PATH})" -gt "1000000000" ]; then
-  debug "crc appears to have the bundle already included. It will be used: $(stat -c '%n (%s bytes)' ${CRC_EXE_PATH})"
-  CRC_BUNDLE_ARG=""
-else
-  infomsg "Downloading crc libvirt bundle to ${CRC_LIBVIRT_PATH}"
+if [ "${DOWNLOAD_BUNDLE}" == "true" ]; then
+  CRC_BUNDLE_FILE="${CRC_LIBVIRT_PATH}"
+  if [ -f "${CRC_LIBVIRT_PATH}" ]; then
+    debug "crc libvirt bundle that will be used: ${CRC_LIBVIRT_PATH}"
+  elif [ "$(stat -c '%s' ${CRC_EXE_PATH})" -gt "1000000000" ]; then
+    debug "crc appears to have the bundle already included. It will be used: $(stat -c '%n (%s bytes)' ${CRC_EXE_PATH})"
+    CRC_BUNDLE_FILE=""
+  else
+    infomsg "Downloading crc libvirt bundle to ${CRC_LIBVIRT_PATH}"
 
-  get_downloader
-  eval ${DOWNLOADER} "${CRC_LIBVIRT_PATH}" ${CRC_LIBVIRT_DOWNLOAD_LOCATION}
-  if [ "$?" != "0" ]; then
-    infomsg "===== WARNING ====="
-    infomsg "Could not download the crc libvirt bundle."
-    infomsg "Make sure this is valid: ${CRC_LIBVIRT_DOWNLOAD_LOCATION}"
-    infomsg "===== WARNING ====="
-    rm "${CRC_LIBVIRT_PATH}"
-    exit 1
+    get_downloader
+    eval ${DOWNLOADER} "${CRC_LIBVIRT_PATH}" ${CRC_LIBVIRT_DOWNLOAD_LOCATION}
+    if [ "$?" != "0" ]; then
+      infomsg "===== WARNING ====="
+      infomsg "Could not download the crc libvirt bundle."
+      infomsg "Make sure this is valid: ${CRC_LIBVIRT_DOWNLOAD_LOCATION}"
+      infomsg "===== WARNING ====="
+      rm "${CRC_LIBVIRT_PATH}"
+      exit 1
+    fi
   fi
+else
+  CRC_BUNDLE_FILE=""
+  infomsg "Was asked to not download the crc libvirt bundle"
 fi
 
-cd ${OPENSHIFT_BIN_PATH}
-export KUBECONFIG="${CRC_KUBECONFIG}"
+cd ${OPENSHIFT_BIN_PATH} || exit
 
 if [ "$_CMD" = "start" ]; then
+
+  infomsg "Defining the CRC configuration..."
+  if [ ! -z "${CRC_BUNDLE_FILE}" ]; then
+    ${CRC_COMMAND} config set bundle ${CRC_BUNDLE_FILE}
+  else
+    ${CRC_COMMAND} config unset bundle
+  fi
+  ${CRC_COMMAND} config set consent-telemetry no
+  ${CRC_COMMAND} config set cpus ${CRC_CPUS}
+  ${CRC_COMMAND} config set disable-update-check true
+  ${CRC_COMMAND} config set disk-size ${CRC_VIRTUAL_DISK_SIZE}
+  ${CRC_COMMAND} config set enable-cluster-monitoring ${ENABLE_CLUSTER_MONITORING}
+  ${CRC_COMMAND} config set kubeadmin-password kiali
+  ${CRC_COMMAND} config set memory "$(expr ${CRC_MEMORY} '*' 1024)"
+  if [ ! -z "${PULL_SECRET_FILE}" ]; then
+    ${CRC_COMMAND} config set pull-secret-file ${PULL_SECRET_FILE}
+  else
+    ${CRC_COMMAND} config unset pull-secret-file
+  fi
+
+  # Unsure if we need these
+  if [ "${ENABLE_USER_NETWORK_MODE}" == "true" ]; then
+    ${CRC_COMMAND} config set network-mode user
+    ${CRC_COMMAND} config set host-network-access true
+  else
+    if ${CRC_COMMAND} config get network-mode | grep -q ' user$'; then
+      infomsg "WARNING: --enable-user-network-mode is false but the current CRC config has it enabled."
+    fi
+  fi
 
   infomsg "Setting up the requirements for the OpenShift cluster..."
   debug "${CRC_COMMAND} setup"
@@ -588,178 +1104,40 @@ if [ "$_CMD" = "start" ]; then
   fi
 
   infomsg "Starting the OpenShift cluster..."
-  # if you change the command line here, also change it below during the restart
-  debug "${CRC_COMMAND} start ${PULL_SECRET_ARG} ${CRC_BUNDLE_ARG} -m $(expr ${CRC_MEMORY} '*' 1024) -c ${CRC_CPUS}"
-  ${CRC_COMMAND} start ${PULL_SECRET_ARG} ${CRC_BUNDLE_ARG} -m $(expr ${CRC_MEMORY} '*' 1024) -c ${CRC_CPUS}
+  debug "${CRC_COMMAND} start"
+  ${CRC_COMMAND} start
 
   if [ "$?" != "0" ]; then
     infomsg "ERROR: failed to start the VM."
     exit 1
   fi
 
-  debug "Checking the memory of the VM..."
-  _CURRENT_CRC_MEMORY="$(virsh -c qemu:///system dommemstat crc | grep actual | sed ${SEDOPTIONS} 's/actual \([0-9]*\)/\1/')"
-  if [ "${_CURRENT_CRC_MEMORY}" -lt "${CRC_MEMORY}000000" ]; then
-    infomsg "Configuring memory for your VM: memory=${CRC_MEMORY}G."
-    virsh -c qemu:///system setmaxmem crc ${CRC_MEMORY}000000 --config
-    virsh -c qemu:///system setmem crc ${CRC_MEMORY}000000 --config
-    _NEED_VM_STOP="true"
-    _NEED_VM_START="true"
-  else
-    debug "VM already configured with ${CRC_MEMORY}G memory."
-  fi
+  ${CRC_OC} login -u kubeadmin -p "$(cat "${CRC_KUBEADMIN_PASSWORD_FILE}")"
 
-  debug "Checking the CPU count of the VM..."
-  if [ "$(virsh -c qemu:///system vcpucount crc --live)" != "${CRC_CPUS}" ]; then
-    infomsg "Configuring CPUs for your VM: number of CPUs=${CRC_CPUS}"
-    virsh -c qemu:///system setvcpus crc ${CRC_CPUS} --maximum --config
-    virsh -c qemu:///system setvcpus crc ${CRC_CPUS} --config
-    _NEED_VM_STOP="true"
-    _NEED_VM_START="true"
-  else
-    debug "VM already configured with ${CRC_CPUS} CPUs."
-  fi
-
-  # See: https://fatmin.com/2016/12/20/how-to-resize-a-qcow2-image-and-filesystem-with-virt-resize/
-  # Do this part as the last configuration change since this will require the VM to be stopped.
-  debug "Checking the virtual disk size of the VM image..."
-  _QEMU_IMG_STDOUT="$(sudo qemu-img info ${CRC_MACHINE_IMAGE})"
-  if [ "$?" != "0" ]; then
-    infomsg "Will attempt to get shared write lock to obtain disk size"
-    _QEMU_IMG_STDOUT="$(sudo qemu-img info -U ${CRC_MACHINE_IMAGE})"
-    if [ "$?" != "0" ]; then
-      infomsg "Cannnot determine current disk size of VM - will assume there is enough"
-      _QEMU_IMG_STDOUT="virtual size: 9999G (99999999999 bytes)"
-    fi
-  fi
-  _CURRENT_VIRTUAL_DISK_SIZE="$(echo "${_QEMU_IMG_STDOUT}" | grep 'virtual size' | sed ${SEDOPTIONS} 's/virtual size: \([0-9]*\)[G].*$/\1/')"
-  if [ "${_CURRENT_VIRTUAL_DISK_SIZE}" -lt "${CRC_VIRTUAL_DISK_SIZE}" ]; then
-    _INCREASE_VIRTUAL_DISK_SIZE="+$(expr ${CRC_VIRTUAL_DISK_SIZE} - ${_CURRENT_VIRTUAL_DISK_SIZE})G"
-    infomsg "The virtual disk size is currently ${_CURRENT_VIRTUAL_DISK_SIZE}G."
-    infomsg "You asked for a virtual disk size of ${CRC_VIRTUAL_DISK_SIZE}G."
-    infomsg "The virtual disk size will be increased by ${_INCREASE_VIRTUAL_DISK_SIZE}."
-    infomsg "This multi-step process will take a long time. Be patient."
-
-    infomsg "TODO: THIS PROBABLY WILL FAIL WITH CRC 1.6+ - see https://github.com/code-ready/crc/issues/127"
-
-    # cannot resize disk while VM is running, shut it down now
-    ${CRC_COMMAND} stop
-    _NEED_VM_START="true"
-
-    get_installer
-    if ! which virt-resize > /dev/null 2>&1 ; then
-      infomsg "To set the virtual disk size, installing 'virt-resize' from the 'libguestfs-tools' package."
-      eval ${INSTALLER} install libguestfs-tools
-    fi
-
-    if ! ${INSTALLER} list installed libguestfs-xfs > /dev/null 2>&1 ; then
-      infomsg "To resize the filesystem properly, installing 'libguestfs-xfs'."
-      eval ${INSTALLER} install libguestfs-xfs
-    fi
-
-    sudo qemu-img resize ${CRC_MACHINE_IMAGE} ${_INCREASE_VIRTUAL_DISK_SIZE}
-    debug "Resizing the underlying file systems."
-    sudo cp ${CRC_MACHINE_IMAGE} ${CRC_MACHINE_IMAGE}.ORIGINAL
-    sudo virt-resize --expand /dev/sda3 ${CRC_MACHINE_IMAGE}.ORIGINAL ${CRC_MACHINE_IMAGE}
-    sudo rm ${CRC_MACHINE_IMAGE}.ORIGINAL
-    infomsg "The new disk image details:"
-    sudo qemu-img info ${CRC_MACHINE_IMAGE}
-    sudo virt-filesystems --long -h --all -a ${CRC_MACHINE_IMAGE}
-  else
-    debug "VM already configured with ${CRC_VIRTUAL_DISK_SIZE}G of virtual disk space."
-  fi
-
-  if [ "${_NEED_VM_STOP}" == "true" ]; then
-    infomsg "Stopping the VM..."
-    ${CRC_COMMAND} stop
-  fi
-
-  if [ "${_NEED_VM_START}" == "true" ]; then
-    infomsg "Restarting the VM to pick up the new configuration."
-    ${CRC_COMMAND} start ${PULL_SECRET_ARG} ${CRC_BUNDLE_ARG} -m ${CRC_MEMORY}000 -c ${CRC_CPUS}
-    if [ "$?" != "0" ]; then
-      infomsg "ERROR: failed to restart the VM."
-      exit 1
-    fi
-    get_console_url
-    echo -n "Waiting for OpenShift console at ${CONSOLE_URL} ..."
-    sleep 5
-    while ! curl --head -s -k ${CONSOLE_URL} | head -n 1 | grep -q "200[[:space:]]*OK"
-    do
-      sleep 5
-      get_console_url
-      echo -n "."
-    done
-    echo "Done."
-    infomsg "VM has been rebooted with the new configuration and OpenShift is ready."
-  fi
-
-  # see https://docs.openshift.com/container-platform/4.4/authentication/identity_providers/configuring-htpasswd-identity-provider.html
+  # see https://docs.openshift.com/container-platform/4.8/authentication/identity_providers/configuring-htpasswd-identity-provider.html
   # we need to be admin in order to create the htpasswd oauth and users
-  infomsg "Creating users 'kiali' and 'johndoe'"
-  ${CRC_OC} login -u system:admin
-  cat <<EOM | ${CRC_OC} apply -f -
----
-# Secret containing two htpasswd credentials:
-#   kiali:kiali
-#   johndoe:johndoe
-apiVersion: v1
-metadata:
-  name: htpasswd
-  namespace: openshift-config
-data:
-  htpasswd: a2lhbGk6JDJ5JDA1JHhrV1NNY0ZIUXkwZ2RDMUltLnJDZnVsV2NuYkhDQ2w2bDhEdjFETWEwV1hLRzc4U2tVcHQ2CmpvaG5kb2U6JGFwcjEkRzhhL2x1My4kRnc5RjJUczFKNUFKRUNJc05KN1RWLgo=
-kind: Secret
-type: Opaque
----
-apiVersion: config.openshift.io/v1
-kind: OAuth
-metadata:
-  name: cluster
-spec:
-  identityProviders:
-  - name: htpasswd
-    type: HTPasswd
-    mappingMethod: claim
-    htpasswd:
-      fileData:
-        name: htpasswd
-EOM
+  if which htpasswd; then
+    infomsg "Creating user 'kiali'"
+    ${CRC_OC} get secret -n openshift-config htpass-secret -o jsonpath='{.data.htpasswd}' | base64 -d | sed -e '$a\' > /tmp/crc.htpasswd.kiali && htpasswd -b /tmp/crc.htpasswd.kiali kiali kiali
+    htpasswd_b64=""
+    htpasswd_b64="$(base64 -w 0 /tmp/crc.htpasswd.kiali)"
+    ${CRC_OC} patch secret -n openshift-config htpass-secret --patch '{"data": {"htpasswd": "'"${htpasswd_b64}"'" }}'
+    rm /tmp/crc.htpasswd.kiali
 
-  if [ "${KIALI_USER_IS_CLUSTER_ADMIN}" == "" ]; then
-    infomsg 'Do you want the kiali user to be assigned the cluster-admin role?'
-    infomsg 'Select "1" for Yes and "2" for No:'
-    select yn in "Yes" "No"; do
-      case $yn in
-        Yes )
-          KIALI_USER_IS_CLUSTER_ADMIN="true"
-          break;;
-        No )
-          KIALI_USER_IS_CLUSTER_ADMIN="false"
-          break;;
-      esac
-    done
-  fi
-
-  # If kiali user is to be assigned cluster admin role, we need to first check that the kiali user is ready.
-  # In order to check this, a login attempt must succeed and the kiali user must be in the list of valid users.
-  # Once confirmed the kiali user is ready, then the cluster admin role can be added to it.
-  if [ "${KIALI_USER_IS_CLUSTER_ADMIN}" == "true" ]; then
-    for i in {1..100}
+    # Add cluster role to the kiali user once it that user is available
+    for i in {1..20}
     do
       infomsg "Waiting for kiali user to be created before attempting to assign it cluster-admin role..."
       sleep 10
-      if ${CRC_OC} login -u kiali -p kiali > /dev/null 2>&1 ; then
-        ${CRC_OC} login -u system:admin > /dev/null 2>&1
-        if ${CRC_OC} get user kiali > /dev/null 2>&1 ; then
-          infomsg "Will assign the cluster-admin role to the kiali user."
-          ${CRC_OC} adm policy add-cluster-role-to-user cluster-admin kiali
-          break
-        fi
+      if ${CRC_OC} login -u kiali -p kiali &>/dev/null; then
+        infomsg "Will assign the cluster-admin role to the kiali user."
+        ${CRC_OC} login -u kubeadmin -p "$(cat "${CRC_KUBEADMIN_PASSWORD_FILE}")"
+        ${CRC_OC} adm policy add-cluster-role-to-user cluster-admin kiali
+        break
       fi
     done
   else
-    infomsg "Kiali user will not be assigned the cluster-admin role."
+    infomsg "Not adding user 'kiali' because you do not have htpasswd installed - use the default users that come with CRC"
   fi
 
   # Make sure the image registry is exposed via the default route
@@ -768,6 +1146,11 @@ EOM
     ${CRC_OC} patch config.imageregistry.operator.openshift.io/cluster --patch '{"spec":{"defaultRoute":true}}' --type=merge
   else
     debug "The image registry operator has exposed the internal image registry"
+  fi
+
+  # Install Ory Hydra if enabled (for OpenID Connect testing)
+  if [ "${HYDRA_ENABLED}" == "true" ]; then
+    install_hydra_openshift
   fi
 
   # show the status message
@@ -780,8 +1163,16 @@ elif [ "$_CMD" = "stop" ]; then
 
 elif [ "$_CMD" = "delete" ]; then
 
-  infomsg "Will delete the OpenShift cluster - this removes all persisted data."
-  ${CRC_COMMAND} delete
+  infomsg "Will delete the OpenShift cluster. This removes all persisted data but downloaded bundles remain."
+  ${CRC_COMMAND} delete --force
+
+elif [ "$_CMD" = "cleanup" ]; then
+
+  infomsg "Will cleanup the CRC environment, including the large bundles that were downloaded."
+  ${CRC_COMMAND} delete --clear-cache --force
+  infomsg "Further cleaning up of the CRC environment"
+  ${CRC_COMMAND} cleanup
+  infomsg "If CRC is not cleaned up fully, execute: sudo virsh destroy crc && sudo virsh undefine crc"
 
 elif [ "$_CMD" = "status" ]; then
 
@@ -795,7 +1186,7 @@ elif [ "$_CMD" = "ssh" ]; then
 elif [ "$_CMD" = "sshoc" ]; then
 
   infomsg "Logging into the CRC VM via oc debug..."
-  ${CRC_OC} debug $(${CRC_OC} get nodes -o name)
+  ${CRC_OC} debug "$(${CRC_OC} get nodes -o name)"
 
 elif [ "$_CMD" = "routes" ]; then
 
@@ -805,7 +1196,19 @@ elif [ "$_CMD" = "services" ]; then
 
   print_all_service_endpoints
 
+elif [ "$_CMD" = "expose" ]; then
+
+  expose_cluster
+
+elif [ "$_CMD" = "unexpose" ]; then
+
+  unexpose_cluster
+
+elif [ "$_CMD" = "changedomain" ]; then
+
+  change_crc_domain_name
+
 else
-  infomsg "ERROR: Required command must be either: start, stop, delete, status, ssh, sshoc, routes, services, sm-install, sm-uninstall, bi-install"
+  infomsg "ERROR: Required command must be either: start, stop, delete, status, ssh, sshoc, routes, services, expose, unexpose, changedomain"
   exit 1
 fi

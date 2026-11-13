@@ -1,6 +1,7 @@
 package prometheustest
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -14,9 +15,10 @@ import (
 )
 
 func setupMocked() (*prometheus.Client, *PromAPIMock, error) {
-	config.Set(config.NewConfig())
+	conf := config.NewConfig()
+	config.Set(conf)
 	api := new(PromAPIMock)
-	client, err := prometheus.NewClient()
+	client, err := prometheus.NewClient(*conf, "")
 	if err != nil {
 		return nil, nil, err
 	}
@@ -31,7 +33,7 @@ func TestGetAllRequestRates(t *testing.T) {
 		return
 	}
 
-	queryTime := time.Date(2017, 01, 15, 0, 0, 0, 0, time.UTC)
+	queryTime := time.Date(2017, 0o1, 15, 0, 0, 0, 0, time.UTC)
 
 	vectorQ1 := model.Vector{
 		&model.Sample{
@@ -40,17 +42,18 @@ func TestGetAllRequestRates(t *testing.T) {
 			Metric:    model.Metric{"foo": "bar"},
 		},
 	}
-	api.OnQueryTime(`rate(istio_requests_total{destination_service_namespace="ns",source_workload_namespace!="ns"}[5m]) > 0`, &queryTime, vectorQ1)
+	api.OnQueryTime(`rate(istio_requests_total{destination_service_namespace="ns",source_workload_namespace!="ns",destination_cluster="east"}[5m]) > 0`, &queryTime, vectorQ1)
 
 	vectorQ2 := model.Vector{
 		&model.Sample{
 			Timestamp: model.Now(),
 			Value:     model.SampleValue(2),
-			Metric:    model.Metric{"foo": "bar"}},
+			Metric:    model.Metric{"foo": "bar"},
+		},
 	}
-	api.OnQueryTime(`rate(istio_requests_total{source_workload_namespace="ns"}[5m]) > 0`, &queryTime, vectorQ2)
+	api.OnQueryTime(`rate(istio_requests_total{source_workload_namespace="ns",source_cluster="east"}[5m]) > 0`, &queryTime, vectorQ2)
 
-	rates, _ := client.GetAllRequestRates("ns", "5m", queryTime)
+	rates, _ := client.GetAllRequestRates(context.Background(), "ns", "east", "5m", queryTime)
 	assert.Equal(t, 2, rates.Len())
 	assert.Equal(t, vectorQ1[0], rates[0])
 	assert.Equal(t, vectorQ2[0], rates[1])
@@ -63,7 +66,7 @@ func TestGetAllRequestRatesIstioSystem(t *testing.T) {
 		return
 	}
 
-	queryTime := time.Date(2017, 01, 15, 0, 0, 0, 0, time.UTC)
+	queryTime := time.Date(2017, 0o1, 15, 0, 0, 0, 0, time.UTC)
 
 	vectorQ1 := model.Vector{
 		&model.Sample{
@@ -72,17 +75,18 @@ func TestGetAllRequestRatesIstioSystem(t *testing.T) {
 			Metric:    model.Metric{"foo": "bar"},
 		},
 	}
-	api.OnQueryTime(`rate(istio_requests_total{destination_service_namespace="istio-system",source_workload_namespace!="istio-system"}[5m]) > 0`, &queryTime, vectorQ1)
+	api.OnQueryTime(`rate(istio_requests_total{destination_service_namespace="istio-system",source_workload_namespace!="istio-system",destination_cluster="east"}[5m]) > 0`, &queryTime, vectorQ1)
 
 	vectorQ2 := model.Vector{
 		&model.Sample{
 			Timestamp: model.Now(),
 			Value:     model.SampleValue(2),
-			Metric:    model.Metric{"foo": "bar"}},
+			Metric:    model.Metric{"foo": "bar"},
+		},
 	}
-	api.OnQueryTime(`rate(istio_requests_total{source_workload_namespace="istio-system"}[5m]) > 0`, &queryTime, vectorQ2)
+	api.OnQueryTime(`rate(istio_requests_total{source_workload_namespace="istio-system",source_cluster="east"}[5m]) > 0`, &queryTime, vectorQ2)
 
-	rates, _ := client.GetAllRequestRates("istio-system", "5m", queryTime)
+	rates, _ := client.GetAllRequestRates(context.Background(), "istio-system", "east", "5m", queryTime)
 	assert.Equal(t, 2, rates.Len())
 	assert.Equal(t, vectorQ1[0], rates[0])
 	assert.Equal(t, vectorQ2[0], rates[1])
@@ -95,7 +99,7 @@ func TestGetNamespaceServicesRequestRates(t *testing.T) {
 		return
 	}
 
-	queryTime := time.Date(2017, 01, 15, 0, 0, 0, 0, time.UTC)
+	queryTime := time.Date(2017, 0o1, 15, 0, 0, 0, 0, time.UTC)
 
 	vectorQ1 := model.Vector{
 		&model.Sample{
@@ -104,9 +108,9 @@ func TestGetNamespaceServicesRequestRates(t *testing.T) {
 			Metric:    model.Metric{"foo": "bar"},
 		},
 	}
-	api.OnQueryTime(`rate(istio_requests_total{destination_service_namespace="ns"}[5m]) > 0`, &queryTime, vectorQ1)
+	api.OnQueryTime(`rate(istio_requests_total{destination_service_namespace="ns",destination_cluster=~"east|unknown"}[5m]) > 0`, &queryTime, vectorQ1)
 
-	rates, _ := client.GetNamespaceServicesRequestRates("ns", "5m", queryTime)
+	rates, _ := client.GetNamespaceServicesRequestRates(context.Background(), "ns", "east", "5m", queryTime)
 	assert.Equal(t, 1, rates.Len())
 	assert.Equal(t, vectorQ1[0], rates[0])
 }
@@ -121,26 +125,65 @@ func TestConfig(t *testing.T) {
 		YAML: `{"status":"success","data":{"yaml":"global:\n  scrape_interval: 15s\n"}}`,
 	})
 
-	config, _ := client.GetConfiguration()
+	config, _ := client.GetConfiguration(context.Background())
 	assert.Contains(t, config.YAML, "scrape_interval")
 }
 
-func TestFlags(t *testing.T) {
+func TestRuntimeInfo(t *testing.T) {
 	client, api, err := setupMocked()
 	if err != nil {
 		t.Error(err)
 		return
 	}
-	mockFlags(api, prom_v1.FlagsResult{"storage.tsdb.retention": "6h"})
+	mockRuntimeinfoResult(api, prom_v1.RuntimeinfoResult{StorageRetention: "6h"})
 
-	flags, _ := client.GetFlags()
-	assert.Equal(t, flags["storage.tsdb.retention"], "6h")
+	ri, _ := client.GetRuntimeinfo(context.Background())
+	assert.Equal(t, "6h", ri.StorageRetention)
 }
 
 func mockConfig(api *PromAPIMock, ret prom_v1.ConfigResult) {
-	api.On("Config", mock.AnythingOfType("*context.emptyCtx")).Return(ret, nil)
+	api.On("Config", mock.Anything).Return(ret, nil)
 }
 
-func mockFlags(api *PromAPIMock, ret prom_v1.FlagsResult) {
-	api.On("Flags", mock.AnythingOfType("*context.emptyCtx")).Return(ret, nil)
+func mockRuntimeinfoResult(api *PromAPIMock, ret prom_v1.RuntimeinfoResult) {
+	api.On("Runtimeinfo", mock.Anything).Return(ret, nil)
+}
+
+// TestSkipCacheContextBypassesPromCache verifies that when ContextWithSkipCache
+// is used, repeated identical queries always hit the Prometheus API (never served
+// from cache).
+func TestSkipCacheContextBypassesPromCache(t *testing.T) {
+	client, api, err := setupMocked()
+	if err != nil {
+		t.Error(err)
+		return
+	}
+
+	queryTime := time.Date(2017, 0o1, 15, 0, 0, 0, 0, time.UTC)
+
+	vector := model.Vector{
+		&model.Sample{
+			Timestamp: model.Now(),
+			Value:     model.SampleValue(1),
+			Metric:    model.Metric{"foo": "bar"},
+		},
+	}
+	api.OnQueryTime(`rate(istio_requests_total{destination_service_namespace="ns",source_workload_namespace!="ns",destination_cluster="east"}[5m]) > 0`, &queryTime, vector)
+	api.OnQueryTime(`rate(istio_requests_total{source_workload_namespace="ns",source_cluster="east"}[5m]) > 0`, &queryTime, vector)
+
+	ctx := prometheus.ContextWithSkipCache(context.Background())
+
+	// First call
+	rates1, err1 := client.GetAllRequestRates(ctx, "ns", "east", "5m", queryTime)
+	assert.NoError(t, err1)
+	assert.Equal(t, 2, rates1.Len())
+
+	// Second call with same parameters — should NOT be served from cache
+	rates2, err2 := client.GetAllRequestRates(ctx, "ns", "east", "5m", queryTime)
+	assert.NoError(t, err2)
+	assert.Equal(t, 2, rates2.Len())
+
+	// Verify the mock Query was called 4 times total (2 queries x 2 calls),
+	// not 2 times (which would indicate the second call hit the cache).
+	api.AssertNumberOfCalls(t, "Query", 4)
 }

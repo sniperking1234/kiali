@@ -16,31 +16,37 @@ type EnvoyProxyDump struct {
 	Routes     *Routes                `json:"routes,omitempty"`
 }
 
-type Listeners []*Listener
-type Listener struct {
-	Address     string  `json:"address"`
-	Port        float64 `json:"port"`
-	Match       string  `json:"match"`
-	Destination string  `json:"destination"`
-}
+type (
+	Listeners []*Listener
+	Listener  struct {
+		Address     string  `json:"address"`
+		Port        float64 `json:"port"`
+		Match       string  `json:"match"`
+		Destination string  `json:"destination"`
+	}
+)
 
-type Clusters []*Cluster
-type Cluster struct {
-	ServiceFQDN     kubernetes.Host `json:"service_fqdn"`
-	Port            int             `json:"port"`
-	Subset          string          `json:"subset"`
-	Direction       string          `json:"direction"`
-	Type            string          `json:"type"`
-	DestinationRule string          `json:"destination_rule"`
-}
+type (
+	Clusters []*Cluster
+	Cluster  struct {
+		ServiceFQDN     kubernetes.Host `json:"service_fqdn"`
+		Port            int             `json:"port"`
+		Subset          string          `json:"subset"`
+		Direction       string          `json:"direction"`
+		Type            string          `json:"type"`
+		DestinationRule string          `json:"destination_rule"`
+	}
+)
 
-type Routes []*Route
-type Route struct {
-	Name           string          `json:"name"`
-	Domains        kubernetes.Host `json:"domains"`
-	Match          string          `json:"match"`
-	VirtualService string          `json:"virtual_service"`
-}
+type (
+	Routes []*Route
+	Route  struct {
+		Name           string          `json:"name"`
+		Domains        kubernetes.Host `json:"domains"`
+		Match          string          `json:"match"`
+		VirtualService string          `json:"virtual_service"`
+	}
+)
 
 type Bootstrap struct {
 	Bootstrap map[string]interface{} `json:"bootstrap,inline"`
@@ -101,7 +107,7 @@ func listenerMatches(listener kubernetes.EnvoyListener) []map[string]interface{}
 
 		port := ""
 		if match.DestinationPort != nil {
-			port = fmt.Sprintf(":%d", match.DestinationPort)
+			port = fmt.Sprintf(":%d", *match.DestinationPort)
 		}
 
 		if len(match.PrefixRanges) > 0 {
@@ -132,7 +138,8 @@ func getListenerDestination(filters []kubernetes.EnvoyListenerFilter) string {
 	}
 
 	for _, filter := range filters {
-		if filter.Name == "envoy.filters.network.http_connection_manager" {
+		switch filter.Name {
+		case "envoy.filters.network.http_connection_manager":
 			typedConfig := filter.TypedConfig
 			if typedConfig.RouteConfig != nil {
 				if cluster := getMatchAllCluster(typedConfig.RouteConfig); cluster != "" {
@@ -154,7 +161,7 @@ func getListenerDestination(filters []kubernetes.EnvoyListenerFilter) string {
 			}
 
 			return "HTTP"
-		} else if filter.Name == "envoy.filters.network.tcp_proxy" {
+		case "envoy.filters.network.tcp_proxy":
 			typedConfig := filter.TypedConfig
 			if strings.Contains(typedConfig.Cluster, "Cluster") {
 				return typedConfig.Cluster
@@ -190,7 +197,7 @@ func getMatchAllCluster(route *kubernetes.RouteConfig) string {
 
 	vh := vhs[0]
 	domains := vh.Domains
-	if !(len(domains) == 1 && domains[0] == "*") {
+	if len(domains) != 1 || domains[0] != "*" {
 		return ""
 	}
 
@@ -246,7 +253,7 @@ func getAppDescriptor(chainMatch *kubernetes.FilterChainMatch) string {
 	return ""
 }
 
-func (css *Clusters) Parse(dump *kubernetes.ConfigDump) error {
+func (css *Clusters) Parse(dump *kubernetes.ConfigDump, identityDomain string) error {
 	clusterDump, err := dump.GetClusters()
 	if err != nil {
 		return err
@@ -255,7 +262,7 @@ func (css *Clusters) Parse(dump *kubernetes.ConfigDump) error {
 	for _, clusterSet := range [][]kubernetes.EnvoyClusterWrapper{clusterDump.DynamicClusters, clusterDump.StaticClusters} {
 		for _, cluster := range clusterSet {
 			cs := &Cluster{}
-			cs.Parse(cluster.Cluster)
+			cs.Parse(cluster.Cluster, identityDomain)
 			*css = append(*css, cs)
 		}
 	}
@@ -263,7 +270,7 @@ func (css *Clusters) Parse(dump *kubernetes.ConfigDump) error {
 	return nil
 }
 
-func (cs *Cluster) Parse(cluster kubernetes.EnvoyCluster) {
+func (cs *Cluster) Parse(cluster kubernetes.EnvoyCluster, identityDomain string) {
 	cs.ServiceFQDN = kubernetes.Host{Service: cluster.Name}
 	cs.Type = cluster.Type
 	cs.Port = 0
@@ -273,7 +280,7 @@ func (cs *Cluster) Parse(cluster kubernetes.EnvoyCluster) {
 
 	parts := strings.Split(cluster.Name, "|")
 	if len(parts) > 3 {
-		cs.ServiceFQDN = kubernetes.ParseHost(parts[3], "", "")
+		cs.ServiceFQDN = kubernetes.ParseHost(parts[3], "", identityDomain)
 		cs.Port, _ = strconv.Atoi(strings.TrimSuffix(parts[1], "_"))
 		cs.Subset = parts[2]
 		cs.Direction = strings.TrimSuffix(parts[0], "_")
@@ -281,7 +288,7 @@ func (cs *Cluster) Parse(cluster kubernetes.EnvoyCluster) {
 	}
 }
 
-func (rs *Routes) Parse(dump *kubernetes.ConfigDump, namespaces []string) error {
+func (rs *Routes) Parse(dump *kubernetes.ConfigDump, namespaces []string, identityDomain string) error {
 	routesDump, err := dump.GetRoutes()
 	if err != nil {
 		return err
@@ -296,7 +303,7 @@ func (rs *Routes) Parse(dump *kubernetes.ConfigDump, namespaces []string) error 
 					if r.Route != nil && r.Route.Cluster != "PassthroughCluster" {
 						*rs = append(*rs, &Route{
 							Name:           rc.Name,
-							Domains:        bestDomainMatch(vhs.Domains, namespaces),
+							Domains:        bestDomainMatch(vhs.Domains, namespaces, identityDomain),
 							Match:          matchSummary(r.Match),
 							VirtualService: istioMetadata(r.Metadata),
 						})
@@ -306,7 +313,7 @@ func (rs *Routes) Parse(dump *kubernetes.ConfigDump, namespaces []string) error 
 				if len(vhs.Routes) == 0 {
 					*rs = append(*rs, &Route{
 						Name:           rc.Name,
-						Domains:        bestDomainMatch(vhs.Domains, namespaces),
+						Domains:        bestDomainMatch(vhs.Domains, namespaces, identityDomain),
 						Match:          "/*",
 						VirtualService: "404",
 					})
@@ -339,13 +346,13 @@ func matchSummary(match map[string]interface{}) string {
 	return strings.Join(conds, " ")
 }
 
-func bestDomainMatch(domains []string, namespaces []string) kubernetes.Host {
+func bestDomainMatch(domains []string, namespaces []string, identityDomain string) kubernetes.Host {
 	if len(domains) == 0 {
 		return kubernetes.Host{Service: ""}
 	}
 
 	if len(domains) == 1 {
-		return kubernetes.GetHost(domains[0], "", "", namespaces)
+		return kubernetes.GetHost(domains[0], "", namespaces, identityDomain)
 	}
 
 	bestMatch := domains[0]
@@ -363,7 +370,7 @@ func bestDomainMatch(domains []string, namespaces []string) kubernetes.Host {
 			bestMatch = domain
 		}
 	}
-	return kubernetes.GetHost(bestMatch, "", "", namespaces)
+	return kubernetes.GetHost(bestMatch, "", namespaces, identityDomain)
 }
 
 func istioMetadata(metadata *kubernetes.EnvoyMetadata) string {
@@ -375,7 +382,7 @@ func istioMetadata(metadata *kubernetes.EnvoyMetadata) string {
 }
 
 func renderConfig(configPath string) string {
-	if strings.HasPrefix(configPath, "/apis/networking.istio.io/v1alpha3/namespaces/") {
+	if strings.HasPrefix(configPath, "/apis/networking.istio.io/v1/namespaces/") {
 		parts := strings.Split(configPath, "/")
 		if len(parts) != 8 {
 			return ""

@@ -1,0 +1,345 @@
+import * as React from 'react';
+import type {
+  MenuToggleElement} from '@patternfly/react-core';
+import {
+  Button,
+  ButtonVariant,
+  FormGroup,
+  FormHelperText,
+  HelperText,
+  HelperTextItem,
+  MenuToggle,
+  Select,
+  SelectList,
+  SelectOption,
+  TextInput
+} from '@patternfly/react-core';
+import type { IRow, ThProps} from '@patternfly/react-table';
+import { Td, Tr } from '@patternfly/react-table';
+import { isGatewayHostValid } from '../../../utils/IstioConfigUtils';
+import type { ServerForm } from '../../../types/IstioObjects';
+import { isValid } from 'utils/Common';
+import { isValidPort } from './ListenerBuilder';
+import { kialiStyle } from 'styles/StyleUtils';
+import { KialiIcon } from 'config/KialiIcon';
+import { SimpleTable } from 'components/Table/SimpleTable';
+import { useKialiTranslation } from 'utils/I18nUtils';
+
+type ServerBuilderProps = {
+  index: number;
+  onChange: (serverform: ServerForm, i: number) => void;
+  onRemoveServer: (i: number) => void;
+  server: ServerForm;
+};
+
+export const protocols = ['HTTP', 'HTTPS', 'GRPC', 'HTTP2', 'MONGO', 'TCP', 'TLS'];
+const tlsModes = ['PASSTHROUGH', 'SIMPLE', 'MUTUAL', 'AUTO_PASSTHROUGH', 'ISTIO_MUTUAL', 'OPTIONAL_MUTUAL'];
+
+export const areValidHosts = (hosts: string[]): boolean => {
+  if (hosts.length === 0) {
+    return false;
+  }
+
+  let isValid = true;
+
+  for (let i = 0; i < hosts.length; i++) {
+    if (!isGatewayHostValid(hosts[i])) {
+      isValid = false;
+      break;
+    }
+  }
+
+  return isValid;
+};
+
+const tableStyle = kialiStyle({
+  $nest: {
+    '& tr': {
+      borderBottom: 0
+    },
+    '&& tbody td': {
+      padding: 0,
+      paddingRight: '0.5rem'
+    }
+  }
+});
+
+const deleteButtonStyle = kialiStyle({
+  display: 'flex',
+  margin: 'auto',
+  padding: '0.25rem'
+});
+
+export const ServerBuilder: React.FC<ServerBuilderProps> = (props: ServerBuilderProps) => {
+  const { t } = useKialiTranslation();
+  const [isProtocolSelectOpen, setIsProtocolSelectOpen] = React.useState<boolean>(false);
+  const [isTlsModeSelectOpen, setIsTlsModeSelectOpen] = React.useState<boolean>(false);
+
+  const columns: ThProps[] = [
+    {
+      title: t('Port Number'),
+      width: 20
+    },
+    {
+      title: t('Port Name'),
+      width: 20
+    },
+    {
+      title: t('Protocol'),
+      width: 20
+    }
+  ];
+
+  const onAddHosts = (_event: React.FormEvent, value: string): void => {
+    props.onChange(
+      { ...props.server, hosts: value.trim().length === 0 ? [] : value.split(',').map(host => host.trim()) },
+      props.index
+    );
+  };
+
+  const onAddPortNumber = (_event: React.FormEvent, value: string): void => {
+    props.onChange({ ...props.server, number: value.trim() }, props.index);
+  };
+
+  const onAddPortName = (_event: React.FormEvent, value: string): void => {
+    props.onChange({ ...props.server, name: value.trim() }, props.index);
+  };
+
+  const onAddPortProtocol = (value: string): void => {
+    setIsProtocolSelectOpen(false);
+    props.onChange({ ...props.server, protocol: value.trim() }, props.index);
+  };
+
+  const onAddTlsMode = (value: string): void => {
+    setIsTlsModeSelectOpen(false);
+    props.onChange({ ...props.server, tlsMode: value.trim() }, props.index);
+  };
+
+  const onAddTlsServerCertificate = (_event: React.FormEvent, value: string): void => {
+    props.onChange({ ...props.server, tlsServerCertificate: value.trim() }, props.index);
+  };
+
+  const onAddTlsPrivateKey = (_event: React.FormEvent, value: string): void => {
+    props.onChange({ ...props.server, tlsPrivateKey: value.trim() }, props.index);
+  };
+
+  const onAddTlsCaCertificate = (_event: React.FormEvent, value: string): void => {
+    props.onChange({ ...props.server, tlsCaCertificate: value.trim() }, props.index);
+  };
+
+  const portRows: IRow[] = [
+    {
+      cells: [
+        <TextInput
+          value={props.server.number}
+          type="text"
+          id={`addPortNumber_${props.index}`}
+          aria-describedby="add port number"
+          name="addPortNumber"
+          onChange={onAddPortNumber}
+          validated={isValid(isValidPort(props.server.number))}
+        />,
+
+        <TextInput
+          value={props.server.name}
+          type="text"
+          id={`addPortName_${props.index}`}
+          aria-describedby="add port name"
+          name="addPortName"
+          onChange={onAddPortName}
+          validated={isValid(props.server.name.length > 0)}
+        />,
+
+        <Select
+          id={`addPortProtocol_${props.index}`}
+          isOpen={isProtocolSelectOpen}
+          selected={props.server.protocol}
+          onSelect={(_event, value) => onAddPortProtocol(value as string)}
+          onOpenChange={setIsProtocolSelectOpen}
+          toggle={(toggleRef: React.Ref<MenuToggleElement>) => (
+            <MenuToggle
+              id={`addPortProtocol_${props.index}-toggle`}
+              ref={toggleRef}
+              onClick={() => setIsProtocolSelectOpen(!isProtocolSelectOpen)}
+              isExpanded={isProtocolSelectOpen}
+              isFullWidth
+            >
+              {props.server.protocol}
+            </MenuToggle>
+          )}
+          aria-label={t('Protocol Select')}
+        >
+          <SelectList>
+            {protocols.map((option, index) => (
+              <SelectOption key={`p_${index}`} value={option}>
+                {option}
+              </SelectOption>
+            ))}
+          </SelectList>
+        </Select>
+      ]
+    }
+  ];
+
+  const showTls = props.server.protocol === 'HTTPS' || props.server.protocol === 'TLS';
+
+  return (
+    <Tr>
+      <Td>
+        <FormGroup label={t('Hosts')} isRequired={true} fieldId="gateway-selector">
+          <TextInput
+            value={props.server.hosts.join(',')}
+            isRequired={true}
+            type="text"
+            id={`hosts_${props.index}`}
+            aria-describedby="hosts"
+            name="hosts"
+            onChange={onAddHosts}
+            validated={isValid(areValidHosts(props.server.hosts))}
+          />
+
+          <FormHelperText>
+            <HelperText>
+              <HelperTextItem>
+                {isValid(areValidHosts(props.server.hosts))
+                  ? t('One or more hosts exposed by this Gateway.')
+                  : t('Invalid hosts for this Gateway. Enter one or more hosts separated by comma.')}
+              </HelperTextItem>
+            </HelperText>
+          </FormHelperText>
+        </FormGroup>
+
+        <FormGroup label={t('Port')} isRequired={true} fieldId="server-port" style={{ padding: '0.5rem 0' }}>
+          <SimpleTable label={t('Port Level MTLS')} className={tableStyle} columns={columns} rows={portRows} />
+        </FormGroup>
+
+        {showTls && (
+          <FormGroup label={t('TLS Mode')} isRequired={true} fieldId="addTlsMode" style={{ margin: '0.5rem 0' }}>
+            <Select
+              id="addTlsMode"
+              isOpen={isTlsModeSelectOpen}
+              selected={props.server.tlsMode}
+              onSelect={(_event, value) => onAddTlsMode(value as string)}
+              onOpenChange={setIsTlsModeSelectOpen}
+              toggle={(toggleRef: React.Ref<MenuToggleElement>) => (
+                <MenuToggle
+                  id="addTlsMode-toggle"
+                  ref={toggleRef}
+                  onClick={() => setIsTlsModeSelectOpen(!isTlsModeSelectOpen)}
+                  isExpanded={isTlsModeSelectOpen}
+                  isFullWidth
+                >
+                  {props.server.tlsMode}
+                </MenuToggle>
+              )}
+              aria-label={t('TLS Mode Select')}
+            >
+              <SelectList>
+                {tlsModes.map((option, index) => (
+                  <SelectOption key={`p_${index}`} value={option}>
+                    {option}
+                  </SelectOption>
+                ))}
+              </SelectList>
+            </Select>
+          </FormGroup>
+        )}
+
+        {showTls && (props.server.tlsMode === 'SIMPLE' || props.server.tlsMode === 'MUTUAL') && (
+          <>
+            <FormGroup
+              label={t('Server Certificate')}
+              style={{ margin: '0.5rem 0' }}
+              isRequired={true}
+              fieldId="server-certificate"
+            >
+              <TextInput
+                value={props.server.tlsServerCertificate}
+                isRequired={true}
+                type="text"
+                id="server-certificate"
+                aria-describedby="server-certificate"
+                name="server-certificate"
+                onChange={onAddTlsServerCertificate}
+                validated={isValid(props.server.tlsServerCertificate.length > 0)}
+              />
+
+              {!isValid(props.server.tlsServerCertificate.length > 0) && (
+                <FormHelperText>
+                  <HelperText>
+                    <HelperTextItem>
+                      {t('The path to the file holding the server-side TLS certificate to use.')}
+                    </HelperTextItem>
+                  </HelperText>
+                </FormHelperText>
+              )}
+            </FormGroup>
+
+            <FormGroup label={t('Private Key')} isRequired={true} fieldId="private-key" style={{ margin: '0.5rem 0' }}>
+              <TextInput
+                value={props.server.tlsPrivateKey}
+                isRequired={true}
+                type="text"
+                id="private-key"
+                aria-describedby="private-key"
+                name="private-key"
+                onChange={onAddTlsPrivateKey}
+                validated={isValid(props.server.tlsPrivateKey.length > 0)}
+              />
+
+              {!isValid(props.server.tlsPrivateKey.length > 0) && (
+                <FormHelperText>
+                  <HelperText>
+                    <HelperTextItem>{t("The path to the file holding the server's private key.")}</HelperTextItem>
+                  </HelperText>
+                </FormHelperText>
+              )}
+            </FormGroup>
+          </>
+        )}
+
+        {showTls && props.server.tlsMode === 'MUTUAL' && (
+          <FormGroup
+            label={t('CA Certificate')}
+            style={{ margin: '0.5rem 0' }}
+            isRequired={true}
+            fieldId="ca-certificate"
+          >
+            <TextInput
+              value={props.server.tlsCaCertificate}
+              isRequired={true}
+              type="text"
+              id="ca-certificate"
+              aria-describedby="ca-certificate"
+              name="ca-certificate"
+              onChange={onAddTlsCaCertificate}
+              validated={isValid(props.server.tlsCaCertificate.length > 0)}
+            />
+
+            {!isValid(props.server.tlsCaCertificate.length > 0) && (
+              <FormHelperText>
+                <HelperText>
+                  <HelperTextItem>
+                    {t(
+                      'The path to a file containing certificate authority certificates to use in verifying a presented client side certificate.'
+                    )}
+                  </HelperTextItem>
+                </HelperText>
+              </FormHelperText>
+            )}
+          </FormGroup>
+        )}
+      </Td>
+
+      <Td style={{ verticalAlign: 'middle' }}>
+        <Button
+          id="deleteBtn"
+          variant={ButtonVariant.link}
+          icon={<KialiIcon.Trash />}
+          className={deleteButtonStyle}
+          onClick={() => props.onRemoveServer(props.index)}
+        />
+      </Td>
+    </Tr>
+  );
+};

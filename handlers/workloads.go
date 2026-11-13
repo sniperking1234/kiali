@@ -1,146 +1,525 @@
 package handlers
 
 import (
-	"io/ioutil"
 	"net/http"
+	"sync"
 
 	"github.com/gorilla/mux"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+
+	"github.com/kiali/kiali/business"
+	"github.com/kiali/kiali/cache"
+	"github.com/kiali/kiali/config"
+	"github.com/kiali/kiali/grafana"
+	"github.com/kiali/kiali/handlers/queryparams"
+	"github.com/kiali/kiali/istio"
+	"github.com/kiali/kiali/kubernetes"
+	"github.com/kiali/kiali/models"
+	"github.com/kiali/kiali/prometheus"
+	"github.com/kiali/kiali/tracing"
+	"github.com/kiali/kiali/util"
 )
 
-// WorkloadList is the API handler to fetch all the workloads to be displayed, related to a single namespace
-func WorkloadList(w http.ResponseWriter, r *http.Request) {
-	params := mux.Vars(r)
+// workloadParams holds the path and query parameters for WorkloadList and WorkloadDetails
+//
+// swagger:parameters workloadParams
+type workloadParams struct {
+	baseHealthParams
+	// The target workload
+	//
+	// in: path
+	WorkloadName string `json:"workload"`
+	// in: query
+	WorkloadGVK schema.GroupVersionKind `json:"gvk"`
+	// Optional
+	IncludeHealth         bool `json:"health"`
+	IncludeIstioResources bool `json:"istioResources"`
+	IncludeValidations    bool `json:"validate"`
+}
 
-	// Get business layer
-	business, err := getBusiness(r)
+// Package-level schema — documents the workload list/details query contract.
+var workloadQueryParams = []queryparams.Param{
+	queryparams.BoolParam("health", true),
+	queryparams.BoolParam("istioResources", true),
+	queryparams.BoolParam("validate", false),
+	queryparams.PresenceParam("gvk"),
+	queryparams.StringParam("namespaces", ""),
+}
+
+func (p *workloadParams) extract(r *http.Request, conf *config.Config) error {
+	vars := mux.Vars(r)
+	result, err := p.parseSchema(conf, r, workloadQueryParams...)
 	if err != nil {
-		RespondWithError(w, http.StatusInternalServerError, "Workloads initialization error: "+err.Error())
-		return
+		return err
 	}
-	namespace := params["namespace"]
+	p.Namespace = vars["namespace"]
+	p.WorkloadName = vars["workload"]
+	p.IncludeHealth = result.Bool("health")
+	p.IncludeIstioResources = result.Bool("istioResources")
+	p.IncludeValidations = result.Bool("validate")
 
-	// Fetch and build workloads
-	workloadList, err := business.Workload.GetWorkloadList(namespace)
+	p.WorkloadGVK, err = util.StringToGVK(result.String("gvk"))
 	if err != nil {
-		handleErrorResponse(w, err)
-		return
+		return err
 	}
+	return nil
+}
 
-	RespondWithJSON(w, http.StatusOK, workloadList)
+// ClusterWorkloads is the API handler to fetch all the workloads to be displayed, related to a single namespace
+func ClusterWorkloads(
+	conf *config.Config,
+	kialiCache cache.KialiCache,
+	clientFactory kubernetes.ClientFactory,
+	cpm business.ControlPlaneMonitor,
+	prom prometheus.ClientInterface,
+	traceClientLoader func() tracing.ClientInterface,
+	grafana *grafana.Service,
+	discovery istio.MeshDiscovery,
+) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		query := r.URL.Query()
+		namespacesQueryParam := query.Get("namespaces") // csl of namespaces
+		p := workloadParams{}
+		errParse := p.extract(r, conf)
+		if errParse != nil {
+			RespondWithQueryParamError(w, errParse.Error())
+			return
+		}
+
+		businessLayer, err := getLayer(r, conf, kialiCache, clientFactory, cpm, prom, traceClientLoader, grafana, discovery)
+		if err != nil {
+			RespondWithError(w, http.StatusInternalServerError, "Apps initialization error: "+err.Error())
+			return
+		}
+
+		// The accessible namespace names for the cluster, narrowed to the
+		// namespaces query parameter when it is set (fail closed on error).
+		nss, ok := accessibleNamespaceNames(w, r.Context(), businessLayer, p.ClusterName, namespacesQueryParam)
+		if !ok {
+			return
+		}
+
+		clusterWorkloadsList := &models.ClusterWorkloads{
+			Cluster:     p.ClusterName,
+			Workloads:   []models.WorkloadListItem{},
+			Validations: models.IstioValidations{},
+		}
+
+		for _, ns := range nss {
+			criteria := business.WorkloadCriteria{
+				Cluster: p.ClusterName, Namespace: ns, IncludeHealth: p.IncludeHealth,
+				IncludeIstioResources: p.IncludeIstioResources, RateInterval: p.RateInterval, QueryTime: p.QueryTime,
+			}
+
+			if p.IncludeHealth {
+				rateInterval, err := adjustRateInterval(r.Context(), businessLayer, ns, p.RateInterval, p.QueryTime, p.ClusterName)
+				if err != nil {
+					handleErrorResponse(w, err, "Adjust rate interval error: "+err.Error())
+					return
+				}
+				criteria.RateInterval = rateInterval
+			}
+
+			// Fetch and build workloads
+			workloadList, err := businessLayer.Workload.GetWorkloadList(r.Context(), criteria)
+			if err != nil {
+				handleErrorResponse(w, err)
+				return
+			}
+			clusterWorkloadsList.Workloads = append(clusterWorkloadsList.Workloads, workloadList.Workloads...)
+			clusterWorkloadsList.Validations = clusterWorkloadsList.Validations.MergeValidations(workloadList.Validations)
+		}
+
+		RespondWithJSON(w, http.StatusOK, clusterWorkloadsList)
+	}
 }
 
 // WorkloadDetails is the API handler to fetch all details to be displayed, related to a single workload
-func WorkloadDetails(w http.ResponseWriter, r *http.Request) {
-	params := mux.Vars(r)
-	query := r.URL.Query()
+func WorkloadDetails(
+	conf *config.Config,
+	kialiCache cache.KialiCache,
+	clientFactory kubernetes.ClientFactory,
+	cpm business.ControlPlaneMonitor,
+	prom prometheus.ClientInterface,
+	traceClientLoader func() tracing.ClientInterface,
+	grafana *grafana.Service,
+	discovery istio.MeshDiscovery,
+) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		p := workloadParams{}
+		errParse := p.extract(r, conf)
+		if errParse != nil {
+			RespondWithQueryParamError(w, errParse.Error())
+			return
+		}
 
-	// Get business layer
-	business, err := getBusiness(r)
-	if err != nil {
-		RespondWithError(w, http.StatusInternalServerError, "Workloads initialization error: "+err.Error())
-		return
+		criteria := business.WorkloadCriteria{
+			Namespace: p.Namespace, WorkloadName: p.WorkloadName,
+			WorkloadGVK: p.WorkloadGVK, IncludeIstioResources: p.IncludeIstioResources, IncludeServices: true, IncludeHealth: p.IncludeHealth, RateInterval: p.RateInterval,
+			QueryTime: p.QueryTime, Cluster: p.ClusterName,
+		}
+
+		business, err := getLayer(r, conf, kialiCache, clientFactory, cpm, prom, traceClientLoader, grafana, discovery)
+		if err != nil {
+			RespondWithError(w, http.StatusInternalServerError, "Apps initialization error: "+err.Error())
+			return
+		}
+
+		includeValidations := p.IncludeValidations
+		if !conf.IsValidationsEnabled() {
+			includeValidations = false
+		}
+
+		istioConfigValidations := models.IstioValidations{}
+		var errValidations error
+
+		wg := sync.WaitGroup{}
+		if includeValidations {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				istioConfigValidations, errValidations = business.Validations.GetValidationsForWorkload(r.Context(), criteria.Cluster, criteria.Namespace, criteria.WorkloadName)
+			}()
+		}
+
+		// Fetch and build workload
+		workloadDetails, err := business.Workload.GetWorkload(r.Context(), criteria)
+		if includeValidations && err == nil {
+			wg.Wait()
+			workloadDetails.Validations = istioConfigValidations
+			err = errValidations
+		} else if workloadDetails != nil {
+			// Ensure validations is never nil to prevent frontend crashes
+			workloadDetails.Validations = models.IstioValidations{}
+		}
+
+		if criteria.IncludeHealth && err == nil {
+			workloadDetails.Health, err = business.Health.GetWorkloadHealth(r.Context(), criteria.Namespace, criteria.Cluster, criteria.WorkloadName, criteria.RateInterval, criteria.QueryTime, workloadDetails)
+			if err != nil {
+				handleErrorResponse(w, err)
+				return
+			}
+		}
+
+		if err != nil {
+			handleErrorResponse(w, err)
+			return
+		}
+
+		RespondWithJSON(w, http.StatusOK, workloadDetails)
 	}
-	namespace := params["namespace"]
-	workload := params["workload"]
-	workloadType := query.Get("type")
-
-	// Fetch and build workload
-	workloadDetails, err := business.Workload.GetWorkload(namespace, workload, workloadType, true)
-	if err != nil {
-		handleErrorResponse(w, err)
-		return
-	}
-
-	RespondWithJSON(w, http.StatusOK, workloadDetails)
 }
 
 // WorkloadUpdate is the API to perform a patch on a Workload configuration
-func WorkloadUpdate(w http.ResponseWriter, r *http.Request) {
-	params := mux.Vars(r)
-	query := r.URL.Query()
+func WorkloadUpdate(
+	conf *config.Config,
+	kialiCache cache.KialiCache,
+	clientFactory kubernetes.ClientFactory,
+	cpm business.ControlPlaneMonitor,
+	prom prometheus.ClientInterface,
+	traceClientLoader func() tracing.ClientInterface,
+	grafana *grafana.Service,
+	discovery istio.MeshDiscovery,
+) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		params := mux.Vars(r)
+		query := r.URL.Query()
+		if err := queryparams.RejectUnknown(query, "clusterName", "gvk", "patchType", "validate"); err != nil {
+			RespondWithQueryParamError(w, err.Error())
+			return
+		}
 
-	// Get business layer
-	business, err := getBusiness(r)
-	if err != nil {
-		RespondWithError(w, http.StatusInternalServerError, "Workloads initialization error: "+err.Error())
-		return
+		business, err := getLayer(r, conf, kialiCache, clientFactory, cpm, prom, traceClientLoader, grafana, discovery)
+		if err != nil {
+			RespondWithError(w, http.StatusInternalServerError, "Apps initialization error: "+err.Error())
+			return
+		}
+
+		patchType := query.Get("patchType")
+		if patchType == "" {
+			patchType = defaultPatchType
+		}
+
+		namespace := params["namespace"]
+		workload := params["workload"]
+		workloadGVK, errGVK := util.StringToGVK(query.Get("gvk"))
+		if errGVK != nil {
+			RespondWithQueryParamError(w, "Update request with bad workloadGVK param: "+errGVK.Error())
+			return
+		}
+
+		cluster := queryparams.ClusterName(conf, query)
+
+		includeValidations, err := queryparams.ParseBoolParam(query.Get("validate"), "validate", false)
+		if err != nil {
+			RespondWithQueryParamError(w, err.Error())
+			return
+		}
+		if !conf.IsValidationsEnabled() {
+			includeValidations = false
+		}
+
+		body, err := boundedReadAll(r)
+		if err != nil {
+			RespondWithError(w, http.StatusBadRequest, "Update request with bad update patch: "+err.Error())
+			return
+		}
+		jsonPatch := string(body)
+
+		istioConfigValidations := models.IstioValidations{}
+		var errValidations error
+
+		wg := sync.WaitGroup{}
+		if includeValidations {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				istioConfigValidations, errValidations = business.Validations.GetValidationsForWorkload(r.Context(), cluster, namespace, workload)
+			}()
+		}
+
+		workloadDetails, err := business.Workload.UpdateWorkload(r.Context(), cluster, namespace, workload, workloadGVK, true, jsonPatch, patchType)
+		if includeValidations && err == nil {
+			wg.Wait()
+			workloadDetails.Validations = istioConfigValidations
+			err = errValidations
+		} else if workloadDetails != nil {
+			// Ensure validations is never nil to prevent frontend crashes
+			workloadDetails.Validations = models.IstioValidations{}
+		}
+		if err != nil {
+			handleErrorResponse(w, err)
+			return
+		}
+		audit(r, "UPDATE", namespace, workloadGVK.String(), "Workload Update. Cluster: ["+cluster+"], Workload Name: ["+workload+"], Patch: "+jsonPatch)
+		RespondWithJSON(w, http.StatusOK, workloadDetails)
 	}
-
-	namespace := params["namespace"]
-	workload := params["workload"]
-	workloadType := query.Get("type")
-
-	body, err := ioutil.ReadAll(r.Body)
-	if err != nil {
-		RespondWithError(w, http.StatusBadRequest, "Update request with bad update patch: "+err.Error())
-	}
-	jsonPatch := string(body)
-	workloadDetails, err := business.Workload.UpdateWorkload(namespace, workload, workloadType, true, jsonPatch)
-
-	if err != nil {
-		handleErrorResponse(w, err)
-		return
-	}
-	audit(r, "UPDATE on Namespace: "+namespace+" Workload name: "+workload+" Type: "+workloadType+" Patch: "+jsonPatch)
-	RespondWithJSON(w, http.StatusOK, workloadDetails)
 }
 
 // PodDetails is the API handler to fetch all details to be displayed, related to a single pod
-func PodDetails(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
+func PodDetails(
+	conf *config.Config,
+	kialiCache cache.KialiCache,
+	clientFactory kubernetes.ClientFactory,
+	cpm business.ControlPlaneMonitor,
+	prom prometheus.ClientInterface,
+	traceClientLoader func() tracing.ClientInterface,
+	grafana *grafana.Service,
+	discovery istio.MeshDiscovery,
+) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		vars := mux.Vars(r)
+		query := r.URL.Query()
+		if err := queryparams.RejectUnknown(query, "clusterName"); err != nil {
+			RespondWithQueryParamError(w, err.Error())
+			return
+		}
 
-	// Get business layer
-	business, err := getBusiness(r)
-	if err != nil {
-		RespondWithError(w, http.StatusInternalServerError, "Pods initialization error: "+err.Error())
-		return
+		business, err := getLayer(r, conf, kialiCache, clientFactory, cpm, prom, traceClientLoader, grafana, discovery)
+		if err != nil {
+			RespondWithError(w, http.StatusInternalServerError, "Apps initialization error: "+err.Error())
+			return
+		}
+
+		cluster := queryparams.ClusterName(conf, query)
+		namespace := vars["namespace"]
+		pod := vars["pod"]
+
+		// Fetch and build pod
+		podDetails, err := business.Workload.GetPod(cluster, namespace, pod)
+		if err != nil {
+			handleErrorResponse(w, err)
+			return
+		}
+
+		RespondWithJSON(w, http.StatusOK, podDetails)
 	}
-	namespace := vars["namespace"]
-	pod := vars["pod"]
-
-	// Fetch and build pod
-	podDetails, err := business.Workload.GetPod(namespace, pod)
-	if err != nil {
-		handleErrorResponse(w, err)
-		return
-	}
-
-	RespondWithJSON(w, http.StatusOK, podDetails)
 }
 
 // PodLogs is the API handler to fetch logs for a single pod container
-func PodLogs(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	queryParams := r.URL.Query()
+func PodLogs(
+	conf *config.Config,
+	kialiCache cache.KialiCache,
+	clientFactory kubernetes.ClientFactory,
+	cpm business.ControlPlaneMonitor,
+	prom prometheus.ClientInterface,
+	traceClientLoader func() tracing.ClientInterface,
+	grafana *grafana.Service,
+	discovery istio.MeshDiscovery,
+) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if config.IsFeatureDisabled(config.FeatureLogView) {
+			RespondWithError(w, http.StatusForbidden, "Pod Logs access is disabled")
+			return
+		}
+		vars := mux.Vars(r)
+		queryParams := r.URL.Query()
+		if err := queryparams.RejectUnknown(queryParams, "clusterName", "container", "duration", "logType", "maxLines", "service", "sinceTime", "workload"); err != nil {
+			RespondWithQueryParamError(w, err.Error())
+			return
+		}
 
-	// Get business layer
-	business, err := getBusiness(r)
-	if err != nil {
-		RespondWithError(w, http.StatusInternalServerError, "Pod Logs initialization error: "+err.Error())
-		return
+		business, err := getLayer(r, conf, kialiCache, clientFactory, cpm, prom, traceClientLoader, grafana, discovery)
+		if err != nil {
+			RespondWithError(w, http.StatusInternalServerError, "Apps initialization error: "+err.Error())
+			return
+		}
+
+		cluster := queryparams.ClusterName(conf, queryParams)
+		namespace := vars["namespace"]
+		pod := vars["pod"]
+
+		// Get log options. This validates the log type: unknown types are a
+		// client error (400), and the criteria's log type drives the gate
+		// below.
+		opts, err := business.Workload.BuildLogOptionsCriteria(
+			queryParams.Get("container"),
+			queryParams.Get("duration"),
+			models.LogType(queryParams.Get("logType")),
+			queryParams.Get("sinceTime"),
+			queryParams.Get("maxLines"))
+		if err != nil {
+			RespondWithQueryParamError(w, err.Error())
+			return
+		}
+
+		// Check that the user has access to the namespace before streaming
+		// any logs. This is required for the log types fetched with the Kiali
+		// ServiceAccount client (ztunnel), where the Kubernetes API cannot
+		// enforce the user's RBAC; the other log types use the user's own
+		// clients and already fail closed at the API server (pods/log
+		// permission). UsesKialiSA is the same predicate the business layer
+		// uses to pick the client, so the gate can never drift from the
+		// client selection. Note it stays load-bearing even when the cache
+		// holds no ztunnel pods: that branch still streams the requested pod
+		// with the SA client.
+		if opts.LogType.UsesKialiSA() {
+			if _, err := checkNamespaceAccessWithList(w, r, conf, kialiCache, discovery, clientFactory, namespace, cluster); err != nil {
+				return
+			}
+		}
+
+		// Fetch pod logs
+		err = business.Workload.StreamPodLogs(r.Context(), cluster, namespace, queryParams.Get("workload"), queryParams.Get("service"), pod, opts, w)
+		if err != nil {
+			handleErrorResponse(w, err)
+			return
+		}
 	}
-	namespace := vars["namespace"]
-	pod := vars["pod"]
+}
 
-	// Get log options
-	opts, err := business.Workload.BuildLogOptionsCriteria(
-		queryParams.Get("container"),
-		queryParams.Get("duration"),
-		queryParams.Get("isProxy"),
-		queryParams.Get("sinceTime"),
-		queryParams.Get("tailLines"))
+// WorkloadEnvoyMemory is the API handler to fetch Envoy memory diagnostics for a workload.
+func WorkloadEnvoyMemory(
+	conf *config.Config,
+	kialiCache cache.KialiCache,
+	clientFactory kubernetes.ClientFactory,
+	cpm business.ControlPlaneMonitor,
+	prom prometheus.ClientInterface,
+	traceClientLoader func() tracing.ClientInterface,
+	grafana *grafana.Service,
+	discovery istio.MeshDiscovery,
+) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		vars := mux.Vars(r)
+		namespace := vars["namespace"]
+		workloadName := vars["workload"]
+		if !validK8sNameRe.MatchString(workloadName) {
+			RespondWithError(w, http.StatusBadRequest, "Invalid workload name")
+			return
+		}
 
-	if err != nil {
-		handleErrorResponse(w, err)
-		return
+		cluster := queryparams.ClusterName(conf, r.URL.Query())
+		namespaceInfo, err := checkNamespaceAccessWithList(w, r, conf, kialiCache, discovery, clientFactory, namespace, cluster)
+		if err != nil {
+			return
+		}
+
+		params := models.IstioMetricsQuery{Cluster: cluster, Namespace: namespace, Workload: workloadName}
+		if err := extractIstioMetricsQueryParams(r, &params, namespaceInfo); err != nil {
+			RespondWithQueryParamError(w, err.Error())
+			return
+		}
+
+		businessLayer, err := getLayer(r, conf, kialiCache, clientFactory, cpm, prom, traceClientLoader, grafana, discovery)
+		if err != nil {
+			RespondWithError(w, http.StatusInternalServerError, "Workload initialization error: "+err.Error())
+			return
+		}
+
+		workloadDetails, err := businessLayer.Workload.GetWorkload(r.Context(), business.WorkloadCriteria{
+			Cluster:               cluster,
+			Namespace:             namespace,
+			WorkloadName:          workloadName,
+			IncludeServices:       false,
+			IncludeIstioResources: false,
+			IncludeHealth:         false,
+		})
+		if err != nil {
+			handleErrorResponse(w, err)
+			return
+		}
+
+		if !business.HasEnvoyProxyWorkload(workloadDetails) {
+			RespondWithError(w, http.StatusNotFound, "Workload does not have an Envoy proxy")
+			return
+		}
+
+		envoyMemoryService := business.NewEnvoyMemoryService(prom, conf)
+		summary, err := envoyMemoryService.GetSummary(r.Context(), workloadDetails, &params.RangeQuery)
+		if err != nil {
+			RespondWithError(w, http.StatusServiceUnavailable, err.Error())
+			return
+		}
+
+		RespondWithJSON(w, http.StatusOK, summary)
 	}
+}
 
-	// Fetch pod logs
-	podLogs, err := business.Workload.GetPodLogs(namespace, pod, opts)
-	if err != nil {
-		handleErrorResponse(w, err)
-		return
+func ConfigDumpZtunnel(
+	conf *config.Config,
+	kialiCache cache.KialiCache,
+	clientFactory kubernetes.ClientFactory,
+	cpm business.ControlPlaneMonitor,
+	prom prometheus.ClientInterface,
+	traceClientLoader func() tracing.ClientInterface,
+	grafana *grafana.Service,
+	discovery istio.MeshDiscovery,
+) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		params := mux.Vars(r)
+
+		query := r.URL.Query()
+		if err := queryparams.RejectUnknown(query, "clusterName"); err != nil {
+			RespondWithQueryParamError(w, err.Error())
+			return
+		}
+
+		cluster := queryparams.ClusterName(conf, query)
+		namespace := params["namespace"]
+		pod := params["pod"]
+
+		// The ztunnel config dump is mesh-wide and is fetched with the Kiali
+		// ServiceAccount client, so the Kubernetes API cannot enforce the user's
+		// RBAC. Check access to the namespace in the URL (the workload's namespace)
+		// before fetching anything; the response is additionally filtered to the
+		// namespaces the user can access. The check is LIST-based (see
+		// checkNamespaceAccessWithList) so that callers authorized through
+		// namespace LIST are not rejected when the namespace cache is cold.
+		if _, err := checkNamespaceAccessWithList(w, r, conf, kialiCache, discovery, clientFactory, namespace, cluster); err != nil {
+			return
+		}
+
+		business, err := getLayer(r, conf, kialiCache, clientFactory, cpm, prom, traceClientLoader, grafana, discovery)
+		if err != nil {
+			RespondWithError(w, http.StatusInternalServerError, "Apps initialization error: "+err.Error())
+			return
+		}
+
+		dump, err := business.Workload.GetZtunnelConfig(r.Context(), cluster, pod)
+		if err != nil {
+			RespondWithError(w, http.StatusInternalServerError, "Error fetching ztunnel config: "+err.Error())
+			return
+		}
+		RespondWithJSON(w, http.StatusOK, dump)
 	}
-
-	RespondWithJSON(w, http.StatusOK, podLogs)
 }

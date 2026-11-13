@@ -55,7 +55,7 @@ Options:
     Default: true
 
 -ir|--irc-room <irc room name>
-    The freenode IRC room to send the results message.
+    The libera IRC room to send the results message.
     Set to "" to not send any message.
     Default: kiali-molecule-tests
 
@@ -89,7 +89,7 @@ Options:
 -kpf|--kubeadmin-pw-file <filename>
     The file containing the kubeadmin password. If the file is not readable by the user
     running this script, the script will attempt to read it via "sudo".
-    Default: /root/ocp4_setup_ocp4/install_dir/auth/kubeadmin-password
+    Default: /root/ocp4_cluster_ocp4/install_dir/auth/kubeadmin-password
 
 -ku|--kubeadmin-user <username>
     A username that has kubeadmin permissions.
@@ -97,7 +97,7 @@ Options:
 
 -lb|--logs-branch <branch name>
     The logs branch to clone.
-    Default: master
+    Default: openshift
 
 -lf|--logs-fork <name>
     The logs fork/org to clone.
@@ -114,7 +114,7 @@ Options:
 -oc <path to oc>
     The full path to the 'oc' command.
     If 'oc' is in your PATH, you can pass the option as '-oc \$(which oc)'
-    Default: /root/ocp4_setup_ocp4/oc
+    Default: /root/ocp4_cluster_ocp4/oc
 
 -oi|--operator-installer <helm|skip>
     How the operator is to be installed by the molecule tests. It is either installed
@@ -122,6 +122,13 @@ Options:
     operator yourself (say, via OLM) and you want the molecule tests to use it rather
     than to install its own operator.
     Default: helm
+
+-rr|--reduce-resources <true|false>
+    When true, and if Istio will be installed (see --install-istio), some Istio components
+    (such as sidecar proxies) will be given a smaller amount of resources (CPU and memory)
+    which will allow you to run the tests on a cluster that does not have a large amount
+    of resources.
+    Default: false
 
 -sd|--src-dir <directory>
     Where the git source repositories will be cloned.
@@ -142,6 +149,15 @@ Options:
     into your cluster. If your environment is not set up for development
     (e.g. you do not have Go installed), then this script will fail.
     If false, the cluster will simply pull the 'latest' images published on quay.io.
+    Default: false
+
+-udefi|--use-default-images <true|false>
+    If true (and --use-dev-images is 'false') no specific image name or version will be specified in
+    the CRs that are created by the molecule tests. In other words, spec.deployment.image_name and
+    spec.deployment.image_version will be empty strings. This means the Kial server image and the OSSMC image
+    that will be deployed in the tests will be determined by the operator defaults.
+    This is useful when testing with a specific spec.version (--spec-version) and you want the operator
+    to install the default server image for that version.
     Default: false
 
 -ul|--upload-logs <true|false>
@@ -180,10 +196,12 @@ while [[ $# -gt 0 ]]; do
     -oapi|--openshift-api)        OPENSHIFT_API="$2";         shift;shift; ;;
     -oc)                          OC="$2";                    shift;shift; ;;
     -oi|--operator-installer)     OPERATOR_INSTALLER="$2";    shift;shift; ;;
+    -rr|--reduce-resources)       REDUCE_RESOURCES="$2";      shift;shift; ;;
     -sd|--src-dir)                SRC="$2";                   shift;shift; ;;
     -st|--skip-tests)             SKIP_TESTS="$2";            shift;shift; ;;
     -sv|--spec-version)           SPEC_VERSION="$2";          shift;shift; ;;
     -udi|--use-dev-images)        USE_DEV_IMAGES="$2";        shift;shift; ;;
+    -udefi|--use-default-images)  USE_DEFAULT_IMAGES="$2";    shift;shift; ;;
     -ul|--upload-logs)            UPLOAD_LOGS="$2";           shift;shift; ;;
     *) echo "Unknown argument: [$key]. Aborting."; helpmsg; exit 1 ;;
   esac
@@ -194,8 +212,8 @@ set -e
 
 # set up some of our defaults
 KUBEADMIN_USER="${KUBEADMIN_USER:-kubeadmin}"
-KUBEADMIN_PW_FILE="${KUBEADMIN_PW_FILE:-/root/ocp4_setup_ocp4/install_dir/auth/kubeadmin-password}"
-OC=${OC:-/root/ocp4_setup_ocp4/oc}
+KUBEADMIN_PW_FILE="${KUBEADMIN_PW_FILE:-/root/ocp4_cluster_ocp4/install_dir/auth/kubeadmin-password}"
+OC=${OC:-/root/ocp4_cluster_ocp4/oc}
 OPENSHIFT_API=${OPENSHIFT_API:-https://api.ocp4.local:6443}
 SRC="${SRC:-/tmp/KIALI-GIT}"
 DORP="${DORP:-docker}"
@@ -212,7 +230,7 @@ KIALI_OPERATOR_BRANCH="${KIALI_OPERATOR_BRANCH:-master}"
 # details about the github repo where the logs are to be stored
 LOGS_PROJECT_NAME="${LOGS_PROJECT_NAME:-kiali-molecule-test-logs}"
 LOGS_FORK="${LOGS_FORK:-jmazzitelli}"
-LOGS_BRANCH="${LOGS_BRANCH:-master}"
+LOGS_BRANCH="${LOGS_BRANCH:-openshift}"
 
 LOGS_LOCAL_DIRNAME="${LOGS_PROJECT_NAME}"
 LOGS_LOCAL_DIRNAME_ABS="${SRC}/${LOGS_LOCAL_DIRNAME}"
@@ -235,20 +253,25 @@ KIALI_OPERATOR_GITHUB_GITCLONE_HTTPS="${GITHUB_PROTOCOL_HTTPS}${KIALI_OPERATOR_F
 LOGS_GITHUB_GITCLONE_GIT="${GITHUB_PROTOCOL_GIT}${LOGS_FORK}/${LOGS_PROJECT_NAME}.git"
 LOGS_GITHUB_GITCLONE_HTTPS="${GITHUB_PROTOCOL_HTTPS}${LOGS_FORK}/${LOGS_PROJECT_NAME}.git"
 
-# the freenode IRC room where notifications are to be sent (allow the user to set this to "" via -ir option)
+# the libera IRC room where notifications are to be sent (allow the user to set this to "" via -ir option)
 IRC_ROOM="${IRC_ROOM-kiali-molecule-tests}"
 
 # Only if this is set to "true" will the logs be committed and pushed to the git repo
 UPLOAD_LOGS="${UPLOAD_LOGS:-false}"
 
 # Only if this is set to "true" will Istio be installed if it is missing
+# The reduce resources flag is not used unless Istio will be installed.
 INSTALL_ISTIO="${INSTALL_ISTIO:-true}"
+REDUCE_RESOURCES="${REDUCE_RESOURCES:-false}"
 
 # Determines if we should build and push dev images
 USE_DEV_IMAGES="${USE_DEV_IMAGES:-false}"
 
 # Determines what Kiali CR spec.version the tests should use
 SPEC_VERSION="${SPEC_VERSION:-default}"
+
+# Determines if image_name/image_version should be omitted from test Kiali CRs and OSSMConsole CRs
+USE_DEFAULT_IMAGES="${USE_DEFAULT_IMAGES:-false}"
 
 # print out our settings for debug purposes
 cat <<EOM
@@ -275,11 +298,13 @@ LOGS_LOCAL_SUBDIR=$LOGS_LOCAL_SUBDIR
 LOGS_LOCAL_SUBDIR_ABS=$LOGS_LOCAL_SUBDIR_ABS
 OC=$OC
 OPERATOR_INSTALLER=$OPERATOR_INSTALLER
+REDUCE_RESOURCES=$REDUCE_RESOURCES
 SKIP_TESTS=$SKIP_TESTS
 SPEC_VERSION=$SPEC_VERSION
 SRC=$SRC
 UPLOAD_LOGS=$UPLOAD_LOGS
 USE_DEV_IMAGES=$USE_DEV_IMAGES
+USE_DEFAULT_IMAGES=$USE_DEFAULT_IMAGES
 === SETTINGS ===
 EOM
 
@@ -330,7 +355,7 @@ which $DORP > /dev/null || (infomsg "[$DORP] is not in the PATH"; exit 1)
 
 infomsg "Clone github repos in [$SRC] to make sure we have the latest tests and scripts"
 
-cd ${SRC}
+cd ${SRC} || exit
 
 infomsg "Cloning logs repo [${LOGS_FORK}/${LOGS_PROJECT_NAME}:${LOGS_BRANCH}] from [${LOGS_GITHUB_GITCLONE}]..."
 git clone --single-branch --branch ${LOGS_BRANCH} ${LOGS_GITHUB_GITCLONE}
@@ -345,22 +370,25 @@ infomsg "Cloning kiali-operator [${KIALI_OPERATOR_FORK}/kiali-operator:${KIALI_O
 git clone --single-branch --branch ${KIALI_OPERATOR_BRANCH} ${KIALI_OPERATOR_GITHUB_GITCLONE}
 
 ln -s ${SRC}/kiali-operator kiali/operator
-cd kiali
+cd kiali || exit
 
 infomsg "Log into the cluster [${OPENSHIFT_API}] as kubeadmin user named [${KUBEADMIN_USER}]"
 $OC login -u ${KUBEADMIN_USER} -p ${KUBEADMIN_PW} ${OPENSHIFT_API}
 
 if [ "${USE_DEV_IMAGES}" == "true" ]; then
-  infomsg "Dev images are to be tested. Will prepare them now."
+  GOPATH="${GOPATH:-/tmp}"
+  infomsg "Dev images are to be tested. Will prepare them now using GOPATH=${GOPATH}"
 
-  infomsg "Building dev image..."
-  make -e OC="${OC}" -e DORP="${DORP}" clean build test
+  infomsg "Building backend server and frontend UI..."
+  make -e OC="${OC}" -e DORP="${DORP}" -e GOPATH="${GOPATH}" clean build-ui build test
 
   infomsg "Logging into the image registry..."
-  eval $(make -e OC="${OC}" -e DORP="${DORP}" cluster-status | grep "Image Registry login:" | sed 's/Image Registry login: \(.*\)$/\1/')
+  registry_login_cmd="$(make -e OC="${OC}" -e DORP="${DORP}" cluster-status | grep "Image Registry login:" | sed 's/Image Registry login: \(.*\)$/\1/')"
+  read -ra registry_login_arr <<< "${registry_login_cmd}"
+  "${registry_login_arr[@]}"
 
   infomsg "Pushing the images into the cluster..."
-  make -e OC="${OC}" -e DORP="${DORP}" cluster-push
+  make -e OC="${OC}" -e DORP="${DORP}" -e GOPATH="${GOPATH}" cluster-push
 else
   infomsg "Will test the latest published images"
 fi
@@ -372,19 +400,22 @@ else
   infomsg "Operator installation is being skipped so it is assumed you already have Kiali operator installed. No cleanup of residual Kiali installs will be performed. Make sure you do not have a Kiali CR installed - only the operator should be installed."
 fi
 
-if ! $OC get namespace istio-system > /dev/null; then
+# Check if Istio control plane (istiod) is actually installed, not just if the namespace exists
+# This prevents false positives when istio-system namespace exists but Istio isn't installed
+if ! $OC get deployment istiod -n istio-system > /dev/null 2>&1; then
   if [ "${INSTALL_ISTIO}" == "true" ]; then
+    infomsg "Istio control plane (istiod) not found - installing Istio now..."
     if [ ! -z "${ISTIO_VERSION}" ]; then
       DOWNLOAD_ISTIO_VERSION_ARG="--istio-version ${ISTIO_VERSION}"
     fi
     hack/istio/download-istio.sh ${DOWNLOAD_ISTIO_VERSION_ARG}
-    hack/istio/install-istio-via-istioctl.sh --client-exe-path "$OC"
+    hack/istio/install-istio-via-istioctl.sh --client-exe-path "$OC" --reduce-resources "${REDUCE_RESOURCES}" --disable-ipv6 true
   else
-    infomsg "There is no 'istio-system' namespace, and this script was told not to install Istio. Aborting."
+    infomsg "Istio control plane (istiod) is not installed, and this script was told not to install Istio. Aborting."
     exit 1
   fi
 else
-  infomsg "There is an 'istio-system' namespace - assuming Istio is installed and ready."
+  infomsg "Istio control plane (istiod) is installed - assuming Istio is ready."
 fi
 
 infomsg "Building the Molecule test docker image using [${DORP}]"
@@ -392,17 +423,33 @@ make -e FORCE_MOLECULE_BUILD="true" -e DORP="${DORP}" molecule-build
 
 mkdir -p "${LOGS_LOCAL_SUBDIR_ABS}"
 infomsg "Running the tests - logs are going here: ${LOGS_LOCAL_SUBDIR_ABS}"
-eval hack/run-molecule-tests.sh $(test ! -z "$ALL_TESTS" && echo "--all-tests \"$ALL_TESTS\"") $(test ! -z "$SKIP_TESTS" && echo "--skip-tests \"$SKIP_TESTS\"") --use-dev-images "${USE_DEV_IMAGES}" --spec-version "${SPEC_VERSION}" --helm-charts-repo "${SRC}/helm-charts" --client-exe "$OC" --color false --test-logs-dir "${LOGS_LOCAL_SUBDIR_ABS}" -dorp "${DORP}" --operator-installer "${OPERATOR_INSTALLER:-helm}" > "${LOGS_LOCAL_RESULTS}"
+molecule_cmd=(hack/run-molecule-tests.sh
+  --use-dev-images "${USE_DEV_IMAGES}"
+  --use-default-images "${USE_DEFAULT_IMAGES}"
+  --spec-version "${SPEC_VERSION}"
+  --helm-charts-repo "${SRC}/helm-charts"
+  --client-exe "$OC"
+  --color false
+  --test-logs-dir "${LOGS_LOCAL_SUBDIR_ABS}"
+  -dorp "${DORP}"
+  --operator-installer "${OPERATOR_INSTALLER:-helm}"
+)
+if [ -n "${ALL_TESTS}" ]; then
+  molecule_cmd+=(--all-tests "${ALL_TESTS}")
+fi
+if [ -n "${SKIP_TESTS}" ]; then
+  molecule_cmd+=(--skip-tests "${SKIP_TESTS}")
+fi
+"${molecule_cmd[@]}" > "${LOGS_LOCAL_RESULTS}"
 
-cd ${LOGS_LOCAL_SUBDIR_ABS}
+cd ${LOGS_LOCAL_SUBDIR_ABS} || exit
 
 # compress large log files
 MAX_LOG_FILE_SIZE="50M"
-for bigfile in $(find ${LOGS_LOCAL_SUBDIR_ABS} -maxdepth 1 -type f -size +${MAX_LOG_FILE_SIZE})
-do
-  infomsg "This file is large and needs to be compressed: $(basename ${bigfile})"
-  tar -czf ${bigfile}.tgz -C ${LOGS_LOCAL_SUBDIR_ABS} --remove-files $(basename ${bigfile})
-done
+while IFS= read -r -d '' bigfile; do
+  infomsg "This file is large and needs to be compressed: $(basename "${bigfile}")"
+  tar -czf "${bigfile}.tgz" -C "${LOGS_LOCAL_SUBDIR_ABS}" --remove-files "$(basename "${bigfile}")"
+done < <(find "${LOGS_LOCAL_SUBDIR_ABS}" -maxdepth 1 -type f -size +"${MAX_LOG_FILE_SIZE}" -print0)
 
 if [ "${UPLOAD_LOGS}" == "true" ]; then
   infomsg "Committing the logs to github: ${LOGS_GITHUB_HTTPS_SUBDIR}"
@@ -415,7 +462,7 @@ fi
 
 # determine what message to send to IRC based on test results
 if grep FAILURE "${LOGS_LOCAL_RESULTS}"; then
-  irc_msg="a FAILURE occurred in one or more tests"
+  irc_msg="a FAILURE occurred in [$(grep FAILURE "${LOGS_LOCAL_RESULTS}" | wc -l)] tests"
 else
   irc_msg="all tests passed"
 fi
@@ -438,5 +485,5 @@ else
   sleep 5
   echo "PRIVMSG #${IRC_ROOM} : ${irc_msg}"
   echo QUIT
-  ) | nc irc.freenode.net 6667
+  ) | nc irc.libera.chat 6667
 fi

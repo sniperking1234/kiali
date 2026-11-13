@@ -1,0 +1,180 @@
+import * as React from 'react';
+
+import type { DurationInSeconds, BoundsInMilliseconds, TimeRange } from '../../types/Common';
+import { guardTimeRange, durationToBounds, isEqualTimeRange } from '../../types/Common';
+import { ToolbarDropdown } from '../Dropdown/ToolbarDropdown';
+import { mapValues } from 'lodash-es';
+import { serverConfig } from '../../config/ServerConfig';
+import { retrieveTimeRange, storeTimeRange } from './TimeRangeHelper';
+import { DateTimePicker } from './DateTimePicker';
+import type { KialiAppState } from '../../store/Store';
+import { timeRangeSelector } from '../../store/Selectors';
+import type { KialiDispatch } from 'types/Redux';
+import { UserSettingsActions } from '../../actions/UserSettingsActions';
+import { connect } from 'react-redux';
+import { bindActionCreators } from 'redux';
+import { kialiStyle } from 'styles/StyleUtils';
+import { formatLastDuration, t } from 'utils/I18nUtils';
+
+type ReduxStateProps = {
+  timeRange: TimeRange;
+};
+
+type ReduxDispatchProps = {
+  setTimeRange: (range: TimeRange) => void;
+};
+
+type Props = ReduxStateProps &
+  ReduxDispatchProps & {
+    manageURL?: boolean;
+    tooltip: string;
+  };
+
+const timeRangeStyle = kialiStyle({
+  display: 'flex',
+  alignItems: 'center',
+  gap: '0.5rem'
+});
+
+export class TimeRangeComp extends React.Component<Props> {
+  constructor(props: Props) {
+    super(props);
+    const urlTimeRange = retrieveTimeRange();
+
+    if (
+      (urlTimeRange.rangeDuration !== undefined || urlTimeRange.from !== undefined) &&
+      !isEqualTimeRange(props.timeRange, urlTimeRange)
+    ) {
+      // Use the time range from URL and update redux
+      this.props.setTimeRange(urlTimeRange);
+    } else {
+      // No URL time range, store the current props to URL
+      this.storeTimeRange(this.props.timeRange);
+    }
+  }
+
+  componentDidUpdate(prevProps: Props): void {
+    if (prevProps.timeRange !== this.props.timeRange) {
+      this.storeTimeRange(this.props.timeRange);
+    }
+  }
+
+  onDurationChanged = (key: string): void => {
+    let range: TimeRange = {};
+
+    if (key === 'custom') {
+      // Convert to bounds
+      range = guardTimeRange(range, durationToBounds, b => b);
+      range.rangeDuration = undefined;
+    } else {
+      range.rangeDuration = Number(key);
+      range.from = undefined;
+      range.to = undefined;
+    }
+
+    this.props.setTimeRange(range);
+  };
+
+  onStartPickerChanged = (d?: Date): void => {
+    let range: TimeRange = {};
+
+    if (d) {
+      range = guardTimeRange(range, durationToBounds, b => b);
+      range.from = d.getTime();
+
+      if (range.to && range.from > range.to) {
+        range.from = range.to;
+      }
+
+      range.rangeDuration = undefined;
+      this.props.setTimeRange(range);
+    }
+  };
+
+  onEndPickerChanged = (d?: Date): void => {
+    const range = guardTimeRange(this.props.timeRange, durationToBounds, b => b);
+    range.to = d ? d.getTime() : undefined;
+
+    if (range.to && range.from && range.from > range.to) {
+      range.to = range.from;
+    }
+
+    this.props.setTimeRange(range);
+  };
+
+  render(): React.ReactNode {
+    return guardTimeRange(
+      this.props.timeRange,
+      d => this.renderDuration(d),
+      ft => this.renderWithCustom(ft)
+    );
+  }
+
+  renderDuration = (d?: DurationInSeconds): React.ReactNode => {
+    const durations = mapValues(serverConfig.durations, formatLastDuration);
+    const options = { custom: t('Custom'), ...durations };
+    const value = d ?? 'custom';
+
+    return (
+      <ToolbarDropdown
+        id={'metrics_filter_interval_duration'}
+        handleSelect={this.onDurationChanged}
+        value={value}
+        label={options[value]}
+        options={options}
+        tooltip={this.props.tooltip}
+      />
+    );
+  };
+
+  renderWithCustom = (bounds: BoundsInMilliseconds): React.ReactNode => {
+    const now = Date.now();
+
+    // Limit minDate based on Prometheus retention period
+    const retentionMs = (serverConfig.prometheus.storageTsdbRetention ?? 21600) * 1000;
+    const minDate = new Date(now - retentionMs);
+
+    // maxDate is now (no future dates)
+    const maxDate = new Date(now);
+
+    return (
+      <div className={timeRangeStyle}>
+        {this.renderDuration()}
+        {t('From')}
+        <DateTimePicker
+          selected={bounds.from}
+          onChange={date => this.onStartPickerChanged(date)}
+          minDate={minDate}
+          maxDate={bounds.to ? Math.min(bounds.to, now) : maxDate}
+        />
+        {t('To')}
+        <DateTimePicker
+          selected={bounds.to}
+          onChange={date => this.onEndPickerChanged(date)}
+          minDate={bounds.from ?? minDate}
+          maxDate={maxDate}
+        />
+      </div>
+    );
+  };
+
+  private storeTimeRange = (timeRange: TimeRange): void => {
+    if (this.props.manageURL) {
+      storeTimeRange(timeRange);
+    }
+  };
+}
+
+const mapStateToProps = (state: KialiAppState): ReduxStateProps => {
+  return {
+    timeRange: timeRangeSelector(state)
+  };
+};
+
+const mapDispatchToProps = (dispatch: KialiDispatch): ReduxDispatchProps => {
+  return {
+    setTimeRange: bindActionCreators(UserSettingsActions.setTimeRange, dispatch)
+  };
+};
+
+export const TimeRangeComponent = connect(mapStateToProps, mapDispatchToProps)(TimeRangeComp);

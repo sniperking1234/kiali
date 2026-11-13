@@ -1,6 +1,8 @@
 package models
 
-import core_v1 "k8s.io/api/core/v1"
+import (
+	core_v1 "k8s.io/api/core/v1"
+)
 
 type Ports []Port
 type Port struct {

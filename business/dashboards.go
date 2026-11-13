@@ -1,168 +1,149 @@
 package business
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"strings"
 	"sync"
 
-	"k8s.io/client-go/tools/clientcmd/api"
-
 	"github.com/kiali/kiali/config"
-	"github.com/kiali/kiali/kubernetes/monitoringdashboards"
-	"github.com/kiali/kiali/kubernetes/monitoringdashboards/v1alpha1"
+	"github.com/kiali/kiali/config/dashboards"
+	"github.com/kiali/kiali/grafana"
 	"github.com/kiali/kiali/log"
 	"github.com/kiali/kiali/models"
 	"github.com/kiali/kiali/prometheus"
-	"github.com/kiali/kiali/prometheus/internalmetrics"
 )
 
 const defaultNamespaceLabel = "namespace"
 
-// DashboardsService deals with fetching dashboards from k8s client
+var (
+	customDashboardsPromMu     sync.Mutex
+	customDashboardsPromClient prometheus.ClientInterface
+	// kialiSAToken is set once at startup via SetKialiSAToken so the
+	// custom dashboards Prometheus client can authenticate with the
+	// Kiali service-account token when auth.use_kiali_token is true.
+	kialiSAToken string
+)
+
+// SetKialiSAToken stores the Kiali service-account token for use when
+// creating the custom dashboards Prometheus client. Call once at startup.
+func SetKialiSAToken(token string) {
+	kialiSAToken = token
+}
+
+// newPromClient is the factory used to create a Prometheus client for the
+// custom dashboards endpoint. Tests can replace this to inject a mock.
+var newPromClient = func(conf config.Config, promCfg config.PrometheusConfig, saToken string) (prometheus.ClientInterface, error) {
+	return prometheus.NewClientFromPrometheusConfig(conf, promCfg, saToken)
+}
+
+// DashboardsService deals with fetching dashboards from config
 type DashboardsService struct {
-	promClient      prometheus.ClientInterface
-	k8sClient       monitoringdashboards.ClientInterface
-	promConfig      config.PrometheusConfig
+	conf            *config.Config
+	dashboards      map[string]dashboards.MonitoringDashboard
 	globalNamespace string
+	grafana         *grafana.Service
 	namespaceLabel  string
-	CustomEnabled   bool
+	promClient      prometheus.ClientInterface
+	promConfig      config.PrometheusConfig
+	workload        *models.Workload
+
+	CustomEnabled bool
 }
 
 // NewDashboardsService initializes this business service
-func NewDashboardsService() *DashboardsService {
-	cfg := config.Get()
-	customEnabled := cfg.ExternalServices.CustomDashboards.Enabled
-	prom := cfg.ExternalServices.Prometheus
-	if customEnabled && cfg.ExternalServices.CustomDashboards.Prometheus.URL != "" {
-		prom = cfg.ExternalServices.CustomDashboards.Prometheus
+func NewDashboardsService(conf *config.Config, grafana *grafana.Service, promClient prometheus.ClientInterface, namespace *models.Namespace, workload *models.Workload) *DashboardsService {
+	customEnabled := conf.ExternalServices.CustomDashboards.Enabled
+	prom := conf.ExternalServices.Prometheus
+	if customEnabled && conf.ExternalServices.CustomDashboards.Prometheus.URL != "" {
+		prom = conf.ExternalServices.CustomDashboards.Prometheus
+
+		// Lazily create a dedicated Prometheus client for custom dashboard
+		// queries. A mutex (rather than sync.Once) allows retry on transient
+		// errors such as TLS cert files not yet mounted at first request.
+		func() {
+			customDashboardsPromMu.Lock()
+			defer customDashboardsPromMu.Unlock()
+			if customDashboardsPromClient == nil {
+				client, err := newPromClient(*conf, prom, kialiSAToken)
+				if err != nil {
+					log.Errorf("Failed to create custom dashboards Prometheus client for [%s]: %v. Falling back to main Prometheus client.", prom.URL, err)
+				} else {
+					customDashboardsPromClient = client
+				}
+			}
+			if customDashboardsPromClient != nil {
+				promClient = customDashboardsPromClient
+			}
+		}()
 	}
-	nsLabel := cfg.ExternalServices.CustomDashboards.NamespaceLabel
+	nsLabel := conf.ExternalServices.CustomDashboards.NamespaceLabel
 	if nsLabel == "" {
-		nsLabel = "kubernetes_namespace"
+		nsLabel = "namespace"
 	}
+
+	// Overwrite Custom dashboards defined at Namespace level
+	builtInDashboards := conf.CustomDashboards
+	if namespace != nil {
+		nsDashboards := dashboards.GetNamespaceMonitoringDashboards(namespace.Name, namespace.Annotations)
+		builtInDashboards = dashboards.AddMonitoringDashboards(builtInDashboards, nsDashboards)
+	}
+	if workload != nil {
+		wkDashboards := dashboards.GetWorkloadMonitoringDashboards(namespace.Name, workload.Name, workload.DashboardAnnotations)
+		builtInDashboards = dashboards.AddMonitoringDashboards(builtInDashboards, wkDashboards)
+	}
+
 	return &DashboardsService{
+		conf:            conf,
 		CustomEnabled:   customEnabled,
+		grafana:         grafana,
+		promClient:      promClient,
 		promConfig:      prom,
-		globalNamespace: cfg.Deployment.Namespace,
+		globalNamespace: conf.Deployment.Namespace,
 		namespaceLabel:  nsLabel,
+		dashboards:      builtInDashboards.OrganizeByName(),
+		workload:        workload,
 	}
 }
 
-func (in *DashboardsService) prom() (prometheus.ClientInterface, error) {
-	// Lazy init
-	if in.promClient == nil {
-		client, err := prometheus.NewClientForConfig(in.promConfig)
-		if err != nil {
-			return nil, fmt.Errorf("cannot initialize Prometheus Client: %v", err)
-		}
-		in.promClient = client
+func (in *DashboardsService) loadRawDashboardResource(template string) (*dashboards.MonitoringDashboard, error) {
+	dashboard, ok := in.dashboards[template]
+	if !ok {
+		return nil, fmt.Errorf("dashboard [%v] does not exist or is disabled", template)
 	}
-	return in.promClient, nil
+
+	return &dashboard, nil
 }
 
-func (in *DashboardsService) k8s() (monitoringdashboards.ClientInterface, error) {
-	// Lazy init
-	if in.k8sClient == nil {
-		client, err := monitoringdashboards.NewClient()
-		if err != nil {
-			return nil, fmt.Errorf("cannot initialize Kubernetes Client: %v", err)
-		}
-		in.k8sClient = client
-	}
-	return in.k8sClient, nil
-}
-
-// k8sGetDashboard wraps KialiMonitoringInterface.GetDashboard with client creation & error handling
-func (in *DashboardsService) k8sGetDashboard(namespace, template string) (*v1alpha1.MonitoringDashboard, error) {
-	client, err := in.k8s()
-	if err != nil {
-		return nil, err
-	}
-	log.Tracef("load k8s dashboard '%s' in namespace '%s'", template, namespace)
-	return client.GetDashboard(namespace, template)
-}
-
-// k8sGetDashboards wraps KialiMonitoringInterface.GetDashboards with client creation & error handling
-func (in *DashboardsService) k8sGetDashboards(namespace string) ([]v1alpha1.MonitoringDashboard, error) {
-	client, err := in.k8s()
-	if err != nil {
-		return nil, err
-	}
-	log.Tracef("load all k8s dashboards in namespace '%s'", namespace)
-	return client.GetDashboards(namespace)
-}
-
-func (in *DashboardsService) loadRawDashboardResource(namespace, template string) (*v1alpha1.MonitoringDashboard, error) {
-	// There is an override mechanism with dashboards: default dashboards can be provided in Kiali namespace,
-	// and can be overriden in app namespace.
-	// So we look for the one in app namespace first, and only if not found fallback to the one in istio-system.
-	dashboard, err := in.k8sGetDashboard(namespace, template)
-	if err != nil && in.globalNamespace != "" {
-		dashboard, err = in.k8sGetDashboard(in.globalNamespace, template)
-		if err != nil {
-			return nil, err
-		}
-	}
-	return dashboard, err
-}
-
-func (in *DashboardsService) loadRawDashboardResources(namespace string) (map[string]v1alpha1.MonitoringDashboard, error) {
-	all := make(map[string]v1alpha1.MonitoringDashboard)
-
-	// From global namespace
-	if in.globalNamespace != "" {
-		dashboards, err := in.k8sGetDashboards(in.globalNamespace)
-		if err != nil {
-			return nil, err
-		}
-		for _, d := range dashboards {
-			all[d.Name] = d
-		}
-	}
-
-	// From specific namespace
-	if namespace != in.globalNamespace {
-		dashboards, err := in.k8sGetDashboards(namespace)
-		if err != nil {
-			return nil, err
-		}
-		for _, d := range dashboards {
-			all[d.Name] = d
-		}
-	}
-
-	return all, nil
-}
-
-func (in *DashboardsService) loadAndResolveDashboardResource(namespace, template string, loaded map[string]bool) (*v1alpha1.MonitoringDashboard, error) {
+func (in *DashboardsService) loadAndResolveDashboardResource(template string, loaded map[string]bool) (*dashboards.MonitoringDashboard, error) {
 	// Circular dependency check
 	if _, ok := loaded[template]; ok {
 		return nil, fmt.Errorf("cannot load dashboard %s due to circular dependency detected. Already loaded dependencies: %v", template, loaded)
 	}
 	loaded[template] = true
-	dashboard, err := in.loadRawDashboardResource(namespace, template)
+	dashboard, err := in.loadRawDashboardResource(template)
 	if err != nil {
 		return nil, err
 	}
-	err = in.resolveReferences(namespace, dashboard, loaded)
+	err = in.resolveReferences(dashboard, loaded)
 	return dashboard, err
 }
 
 // resolveReferences resolves the composition mechanism that allows to reference a dashboard from another one
-func (in *DashboardsService) resolveReferences(namespace string, dashboard *v1alpha1.MonitoringDashboard, loaded map[string]bool) error {
-	resolved := []v1alpha1.MonitoringDashboardItem{}
-	for _, item := range dashboard.Spec.Items {
+func (in *DashboardsService) resolveReferences(dashboard *dashboards.MonitoringDashboard, loaded map[string]bool) error {
+	resolved := []dashboards.MonitoringDashboardItem{}
+	for _, item := range dashboard.Items {
 		reference := strings.TrimSpace(item.Include)
 		if reference != "" {
 			// reference can point to a whole dashboard (ex: microprofile-1.0) or a chart within a dashboard (ex: microprofile-1.0$Thread count)
 			parts := strings.Split(reference, "$")
 			dashboardRefName := parts[0]
-			composedDashboard, err := in.loadAndResolveDashboardResource(namespace, dashboardRefName, loaded)
+			composedDashboard, err := in.loadAndResolveDashboardResource(dashboardRefName, loaded)
 			if err != nil {
 				return err
 			}
-			for _, item2 := range composedDashboard.Spec.Items {
+			for _, item2 := range composedDashboard.Items {
 				if len(parts) > 1 {
 					// Reference a specific chart
 					if item2.Chart.Name == parts[1] {
@@ -178,41 +159,44 @@ func (in *DashboardsService) resolveReferences(namespace string, dashboard *v1al
 			resolved = append(resolved, item)
 		}
 	}
-	dashboard.Spec.Items = resolved
+	dashboard.Items = resolved
 	return nil
 }
 
 // GetDashboard returns a dashboard filled-in with target data
-func (in *DashboardsService) GetDashboard(authInfo *api.AuthInfo, params models.DashboardQuery, template string) (*models.MonitoringDashboard, error) {
-	promClient, err := in.prom()
-	if err != nil {
-		return nil, err
-	}
-	dashboard, err := in.loadAndResolveDashboardResource(params.Namespace, template, map[string]bool{})
+func (in *DashboardsService) GetDashboard(ctx context.Context, params models.DashboardQuery, template string) (*models.MonitoringDashboard, error) {
+	promClient := in.promClient
+
+	dashboard, err := in.loadAndResolveDashboardResource(template, map[string]bool{})
 	if err != nil {
 		return nil, err
 	}
 
-	filters := in.buildLabels(params.Namespace, params.LabelsFilters)
-	aggLabels := append(params.AdditionalLabels, models.ConvertAggregations(dashboard.Spec)...)
+	filters := in.buildLabelsQueryString(params.Namespace, params.LabelsFilters)
+	aggLabels := append(params.AdditionalLabels, models.ConvertAggregations(*dashboard)...)
 	if len(aggLabels) == 0 {
 		// Prevent null in json
 		aggLabels = []models.Aggregation{}
 	}
 
 	wg := sync.WaitGroup{}
-	wg.Add(len(dashboard.Spec.Items) + 1)
-	filledCharts := make([]models.Chart, len(dashboard.Spec.Items))
+	wg.Add(len(dashboard.Items) + 1)
+	filledCharts := make([]models.Chart, len(dashboard.Items))
 
-	for i, item := range dashboard.Spec.Items {
-		go func(idx int, chart v1alpha1.MonitoringDashboardChart) {
+	for i, item := range dashboard.Items {
+		go func(idx int, chart dashboards.MonitoringDashboardChart) {
 			defer wg.Done()
 			conversionParams := models.ConversionParams{Scale: 1.0, SortLabel: chart.SortLabel, SortLabelParseAs: chart.SortLabelParseAs}
 			if chart.UnitScale != 0.0 {
 				conversionParams.Scale = chart.UnitScale
 			}
-			// Group by labels is concat of what is defined in CR + what is passed as parameters
-			byLabels := append(chart.GroupLabels, params.ByLabels...)
+			// Group by labels is concat of chart GroupLabels + request ByLabels that the chart declares.
+			byLabels := append([]string{}, chart.GroupLabels...)
+			for _, lbl := range params.ByLabels {
+				if chartSupportsAggregationLabel(chart, lbl) {
+					byLabels = append(byLabels, lbl)
+				}
+			}
 			if len(chart.SortLabel) > 0 {
 				// We also need to group by the label used for sorting, if not explicitly present
 				present := false
@@ -232,21 +216,33 @@ func (in *DashboardsService) GetDashboard(authInfo *api.AuthInfo, params models.
 
 			filledCharts[idx] = models.ConvertChart(chart)
 			metrics := chart.GetMetrics()
+			displayNames := make([]string, 0, len(metrics))
 			for _, ref := range metrics {
+				if ref.DisplayName != "" {
+					displayNames = append(displayNames, ref.DisplayName)
+				}
+				var metricFilters string
+				if ref.IstioMetricLabelPrefix != "" && in.workload != nil {
+					metricFilters = in.buildIstioWorkloadMetricLabels(params.Namespace, ref)
+				} else if ref.UsePodSelector {
+					metricFilters = in.buildWorkloadPodMetricLabels(params.Namespace, ref.Labels)
+				} else {
+					metricFilters = appendPromLabelMatchers(filters, ref.Labels, ref.LabelRegexps)
+				}
 				var converted []models.Metric
 				var err error
-				if chart.DataType == v1alpha1.Raw {
+				switch chart.DataType {
+				case dashboards.Raw:
 					aggregator := params.RawDataAggregator
 					if chart.Aggregator != "" {
 						aggregator = chart.Aggregator
 					}
-					metric := promClient.FetchRange(ref.MetricName, filters, grouping, aggregator, &params.RangeQuery)
+					metric := promClient.FetchRange(ctx, ref.MetricName, metricFilters, grouping, aggregator, &params.RangeQuery)
 					converted, err = models.ConvertMetric(ref.DisplayName, metric, conversionParams)
-				} else if chart.DataType == v1alpha1.Rate {
-					metric := promClient.FetchRateRange(ref.MetricName, []string{filters}, grouping, &params.RangeQuery)
-					converted, err = models.ConvertMetric(ref.DisplayName, metric, conversionParams)
-				} else {
-					histo := promClient.FetchHistogramRange(ref.MetricName, filters, grouping, &params.RangeQuery)
+				case dashboards.Rate:
+					converted, err = fetchDashboardRateMetric(ctx, promClient, ref, metricFilters, grouping, &params.RangeQuery, conversionParams)
+				default:
+					histo := promClient.FetchHistogramRange(ctx, ref.MetricName, metricFilters, grouping, &params.RangeQuery)
 					converted, err = models.ConvertHistogram(ref.DisplayName, histo, conversionParams)
 				}
 
@@ -257,13 +253,14 @@ func (in *DashboardsService) GetDashboard(authInfo *api.AuthInfo, params models.
 					filledCharts[idx].Metrics = append(filledCharts[idx].Metrics, converted...)
 				}
 			}
+			filledCharts[idx].Metrics = models.EnsureDisplayNameMetrics(filledCharts[idx].Metrics, displayNames)
 		}(i, item.Chart)
 	}
 
 	var externalLinks []models.ExternalLink
 	go func() {
 		defer wg.Done()
-		links, _, err := GetGrafanaLinks(authInfo, dashboard.Spec.ExternalLinks)
+		links, _, err := in.grafana.Links(ctx, dashboard.ExternalLinks)
 		if err != nil {
 			log.Errorf("Error while getting Grafana links: %v", err)
 		}
@@ -275,35 +272,42 @@ func (in *DashboardsService) GetDashboard(authInfo *api.AuthInfo, params models.
 	}()
 
 	wg.Wait()
+	// A dashboard can define the rows used, if not defined, by default it will use 2 rows
+	rows := dashboard.Rows
+	if rows < 1 {
+		rows = 2
+	}
 	return &models.MonitoringDashboard{
-		Title:         dashboard.Spec.Title,
+		Name:          dashboard.Name,
+		Title:         dashboard.Title,
 		Charts:        filledCharts,
 		Aggregations:  aggLabels,
 		ExternalLinks: externalLinks,
+		Rows:          rows,
 	}, nil
 }
 
 // SearchExplicitDashboards will check annotations of all supplied pods to extract a unique list of dashboards
-//	Accepted annotations are "kiali.io/runtimes" and "kiali.io/dashboards"
-func (in *DashboardsService) SearchExplicitDashboards(namespace string, pods []models.Pod) []models.Runtime {
+// Accepted annotations are "kiali.io/runtimes" and "kiali.io/dashboards"
+func (in *DashboardsService) SearchExplicitDashboards(pods []models.Pod) []models.Runtime {
 	uniqueRefsList := extractUniqueDashboards(pods)
 	if len(uniqueRefsList) > 0 {
 		log.Tracef("getting dashboards from refs list: %v", uniqueRefsList)
-		return in.buildRuntimesList(namespace, uniqueRefsList)
+		return in.buildRuntimesList(uniqueRefsList)
 	}
 	return []models.Runtime{}
 }
 
-func (in *DashboardsService) buildRuntimesList(namespace string, templatesNames []string) []models.Runtime {
-	dashboards := make([]*v1alpha1.MonitoringDashboard, len(templatesNames))
+func (in *DashboardsService) buildRuntimesList(templatesNames []string) []models.Runtime {
+	dashboards := make([]*dashboards.MonitoringDashboard, len(templatesNames))
 	wg := sync.WaitGroup{}
 	wg.Add(len(templatesNames))
 	for idx, template := range templatesNames {
 		go func(i int, tpl string) {
 			defer wg.Done()
-			dashboard, err := in.loadRawDashboardResource(namespace, tpl)
+			dashboard, err := in.loadRawDashboardResource(tpl)
 			if err != nil {
-				log.Errorf("cannot get dashboard %s in namespace %s. Error was: %v", tpl, namespace, err)
+				log.Errorf("cannot get dashboard [%s]: %v", tpl, err)
 			} else {
 				dashboards[i] = dashboard
 			}
@@ -322,58 +326,51 @@ func (in *DashboardsService) buildRuntimesList(namespace string, templatesNames 
 	return runtimes
 }
 
-func (in *DashboardsService) fetchMetricNames(namespace string, labelsFilters map[string]string) []string {
-	promClient, err := in.prom()
-	if err != nil {
-		return []string{}
+func (in *DashboardsService) fetchDashboardMetricNames(ctx context.Context, namespace string, labelsFilters map[string]string) []string {
+	promClient := in.promClient
+
+	// Get the list of metrics that we look for to determine which dashboards can be used.
+	// Some dashboards cannot be discovered using metric lookups - ignore those.
+	discoverOnMetrics := make([]string, 0, len(in.dashboards))
+	for _, md := range in.dashboards {
+		if md.DiscoverOn != "" {
+			discoverOnMetrics = append(discoverOnMetrics, md.DiscoverOn)
+		}
 	}
 
-	labels := in.buildLabels(namespace, labelsFilters)
-	metrics, err := promClient.GetMetricsForLabels([]string{labels})
+	labels := in.buildLabelsQueryString(namespace, labelsFilters)
+	metrics, err := promClient.GetMetricsForLabels(ctx, discoverOnMetrics, labels)
 	if err != nil {
-		log.Errorf("runtimes discovery failed, cannot load metrics for labels: %s. Error was: %v", labels, err)
+		log.Errorf("custom dashboard discovery failed, cannot load metrics for labels [%s]: %v", labels, err)
 	}
 	return metrics
 }
 
 // discoverDashboards tries to discover dashboards based on existing metrics
-func (in *DashboardsService) discoverDashboards(namespace string, labelsFilters map[string]string) []models.Runtime {
-	log.Tracef("starting runtimes discovery on namespace %s with filters [%v]", namespace, labelsFilters)
+func (in *DashboardsService) discoverDashboards(ctx context.Context, namespace string, labelsFilters map[string]string) []models.Runtime {
+	log.Tracef("starting custom dashboard discovery on namespace [%s] with filters [%v]", namespace, labelsFilters)
 
-	var metrics []string
-	wg := sync.WaitGroup{}
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		metrics = in.fetchMetricNames(namespace, labelsFilters)
-	}()
+	metrics := in.fetchDashboardMetricNames(ctx, namespace, labelsFilters)
 
-	allDashboards, err := in.loadRawDashboardResources(namespace)
-	if err != nil {
-		log.Errorf("runtimes discovery failed, cannot load dashboards in namespace %s. Error was: %v", namespace, err)
-		return []models.Runtime{}
-	}
-
-	wg.Wait()
-	return runDiscoveryMatcher(metrics, allDashboards)
+	return runDiscoveryMatcher(metrics, in.dashboards)
 }
 
-func runDiscoveryMatcher(metrics []string, allDashboards map[string]v1alpha1.MonitoringDashboard) []models.Runtime {
+func runDiscoveryMatcher(metrics []string, allDashboards map[string]dashboards.MonitoringDashboard) []models.Runtime {
 	// In all dashboards, finds the ones that match the metrics set
 	// We must exclude from the results included dashboards when both the including and the included dashboards are matching
-	runtimesMap := make(map[string]*v1alpha1.MonitoringDashboard)
+	runtimesMap := make(map[string]*dashboards.MonitoringDashboard)
 	for _, d := range allDashboards {
 		dashboard := d // sticky reference
-		matchReference := strings.TrimSpace(dashboard.Spec.DiscoverOn)
+		matchReference := strings.TrimSpace(dashboard.DiscoverOn)
 		if matchReference != "" {
 			for _, metric := range metrics {
-				if matchReference == strings.TrimSpace(metric) {
+				if matchReference == metric {
 					if _, exists := runtimesMap[dashboard.Name]; !exists {
 						runtimesMap[dashboard.Name] = &dashboard
 					}
 					// Mark included dashboards as already found
 					// and set them "nil" to not show them as standalone dashboards even if they match
-					for _, item := range dashboard.Spec.Items {
+					for _, item := range dashboard.Items {
 						if item.Include != "" {
 							runtimesMap[item.Include] = nil
 						}
@@ -393,11 +390,11 @@ func runDiscoveryMatcher(metrics []string, allDashboards map[string]v1alpha1.Mon
 	return runtimes
 }
 
-func addDashboardToRuntimes(dashboard *v1alpha1.MonitoringDashboard, runtimes []models.Runtime) []models.Runtime {
-	runtime := dashboard.Spec.Runtime
+func addDashboardToRuntimes(dashboard *dashboards.MonitoringDashboard, runtimes []models.Runtime) []models.Runtime {
+	runtime := dashboard.Runtime
 	ref := models.DashboardRef{
 		Template: dashboard.Name,
-		Title:    dashboard.Spec.Title,
+		Title:    dashboard.Title,
 	}
 	found := false
 	for i := range runtimes {
@@ -417,17 +414,152 @@ func addDashboardToRuntimes(dashboard *v1alpha1.MonitoringDashboard, runtimes []
 	return runtimes
 }
 
-func (in *DashboardsService) buildLabels(namespace string, labelsFilters map[string]string) string {
+func (in *DashboardsService) buildLabelsQueryString(namespace string, labelsFilters map[string]string) string {
 	namespaceLabel := in.namespaceLabel
 	if namespaceLabel == "" {
 		namespaceLabel = defaultNamespaceLabel
 	}
 	labels := fmt.Sprintf(`{%s="%s"`, namespaceLabel, namespace)
 	for k, v := range labelsFilters {
-		labels += fmt.Sprintf(`,%s="%s"`, prometheus.SanitizeLabelName(k), v)
+		labels += fmt.Sprintf(`,%s="%s"`, prometheus.SanitizeLabelName(k), escapePromLabelValue(v))
 	}
+	for labelName, labelValue := range in.promConfig.QueryScope {
+		labels += fmt.Sprintf(`,%s="%s"`, prometheus.SanitizeLabelName(labelName), escapePromLabelValue(labelValue))
+	}
+
 	labels += "}"
 	return labels
+}
+
+// buildWorkloadPodMetricLabels builds a selector for cAdvisor-style metrics scoped to the
+// workload's pods (plus any extra exact label matchers such as container="istio-proxy").
+func (in *DashboardsService) buildWorkloadPodMetricLabels(namespace string, extraLabels map[string]string) string {
+	namespaceLabel := in.namespaceLabel
+	if namespaceLabel == "" {
+		namespaceLabel = defaultNamespaceLabel
+	}
+
+	podNames := make([]string, 0)
+	if in.workload != nil {
+		for _, pod := range in.workload.Pods {
+			if pod == nil || pod.Name == "" {
+				continue
+			}
+			podNames = append(podNames, escapePromLabelValue(pod.Name))
+		}
+		sort.Strings(podNames)
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, `{%s="%s"`, namespaceLabel, namespace)
+	if len(podNames) == 1 {
+		fmt.Fprintf(&b, `,pod="%s"`, podNames[0])
+	} else if len(podNames) > 1 {
+		fmt.Fprintf(&b, `,pod=~"%s"`, strings.Join(podNames, "|"))
+	}
+	keys := make([]string, 0, len(extraLabels))
+	for key := range extraLabels {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		fmt.Fprintf(&b, `,%s="%s"`, prometheus.SanitizeLabelName(key), escapePromLabelValue(extraLabels[key]))
+	}
+	for labelName, labelValue := range in.promConfig.QueryScope {
+		fmt.Fprintf(&b, `,%s="%s"`, prometheus.SanitizeLabelName(labelName), escapePromLabelValue(labelValue))
+	}
+	b.WriteByte('}')
+	return b.String()
+}
+
+// buildIstioWorkloadMetricLabels builds a Prometheus selector using Istio-intrinsic
+// workload labels instead of scrape-based labels.  The prefix (from
+// IstioMetricLabelPrefix) determines the label names (e.g. "source" produces
+// source_workload, source_workload_namespace).  Per-metric Labels and
+// LabelRegexps are appended.
+func (in *DashboardsService) buildIstioWorkloadMetricLabels(namespace string, ref dashboards.MonitoringDashboardMetric) string {
+	workloadName := ""
+	if in.workload != nil {
+		workloadName = in.workload.Name
+	}
+
+	direction := istioMetricLabelPrefixToDirection(ref.IstioMetricLabelPrefix)
+	lb := NewMetricsLabelsBuilder(direction, in.conf)
+	lb.Workload(workloadName, namespace).QueryScope()
+
+	return appendPromLabelMatchers(lb.Build(), ref.Labels, ref.LabelRegexps)
+}
+
+// chartSupportsAggregationLabel reports whether a chart declares an aggregation for label,
+// so request ByLabels are only applied to charts that can meaningfully group by that label.
+func chartSupportsAggregationLabel(chart dashboards.MonitoringDashboardChart, label string) bool {
+	for _, agg := range chart.Aggregations {
+		if agg.Label == label {
+			return true
+		}
+	}
+	for _, groupLabel := range chart.GroupLabels {
+		if groupLabel == label {
+			return true
+		}
+	}
+	return false
+}
+
+// istioMetricLabelPrefixToDirection maps an IstioMetricLabelPrefix value
+// ("source" or "destination") to the MetricsLabelsBuilder direction.
+func istioMetricLabelPrefixToDirection(prefix string) string {
+	if prefix == "source" {
+		return "outbound"
+	}
+	return "inbound"
+}
+
+// escapePromLabelValue escapes backslashes and double-quotes in a PromQL label value
+// so that user-supplied strings cannot break out of the surrounding "..." literal.
+func escapePromLabelValue(v string) string {
+	v = strings.ReplaceAll(v, `\`, `\\`)
+	v = strings.ReplaceAll(v, `"`, `\"`)
+	return v
+}
+
+// appendPromLabels merges exact label matchers into an existing Prometheus label selector.
+func appendPromLabels(selector string, labels map[string]string) string {
+	return appendPromLabelMatchers(selector, labels, nil)
+}
+
+// appendPromLabelMatchers merges exact (=) and regex (=~) label matchers into a selector.
+func appendPromLabelMatchers(selector string, labels, labelRegexps map[string]string) string {
+	if len(labels) == 0 && len(labelRegexps) == 0 {
+		return selector
+	}
+
+	body := strings.TrimSpace(selector)
+	body = strings.TrimPrefix(body, "{")
+	body = strings.TrimSuffix(body, "}")
+
+	var b strings.Builder
+	b.WriteByte('{')
+	b.WriteString(body)
+
+	appendMatchers := func(matchers map[string]string, op string) {
+		keys := make([]string, 0, len(matchers))
+		for key := range matchers {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			if b.Len() > 1 {
+				b.WriteByte(',')
+			}
+			fmt.Fprintf(&b, `%s%s"%s"`, prometheus.SanitizeLabelName(key), op, escapePromLabelValue(matchers[key]))
+		}
+	}
+	appendMatchers(labels, "=")
+	appendMatchers(labelRegexps, "=~")
+
+	b.WriteByte('}')
+	return b.String()
 }
 
 type istioChart struct {
@@ -442,7 +574,7 @@ func getIstioCharts() []istioChart {
 			Chart: models.Chart{
 				Name:  "Request volume",
 				Unit:  "ops",
-				Spans: 6,
+				Spans: 3,
 			},
 			refName: "request_count",
 		},
@@ -450,50 +582,82 @@ func getIstioCharts() []istioChart {
 			Chart: models.Chart{
 				Name:  "Request duration",
 				Unit:  "seconds",
-				Spans: 6,
+				Spans: 3,
 			},
 			refName: "request_duration_millis",
 			scale:   0.001,
 		},
 		{
 			Chart: models.Chart{
+				Name:  "Request size",
+				Unit:  "bytes",
+				Spans: 3,
+			},
+			refName: "request_size",
+		},
+		{
+			Chart: models.Chart{
+				Name:  "Response size",
+				Unit:  "bytes",
+				Spans: 3,
+			},
+			refName: "response_size",
+		},
+		{
+			Chart: models.Chart{
 				Name:  "Request throughput",
 				Unit:  "bitrate",
-				Spans: 6,
+				Spans: 3,
 			},
 			refName: "request_throughput",
 			scale:   8, // Bps to bps
 		},
 		{
 			Chart: models.Chart{
-				Name:  "Request size",
-				Unit:  "bytes",
-				Spans: 6,
-			},
-			refName: "request_size",
-		},
-		{
-			Chart: models.Chart{
 				Name:  "Response throughput",
 				Unit:  "bitrate",
-				Spans: 6,
+				Spans: 3,
 			},
 			refName: "response_throughput",
 			scale:   8, // Bps to bps
 		},
 		{
 			Chart: models.Chart{
-				Name:  "Response size",
-				Unit:  "bytes",
-				Spans: 6,
+				Name:  "gRPC received",
+				Unit:  "msgrate",
+				Spans: 3,
 			},
-			refName: "response_size",
+			refName: "grpc_received",
+		},
+		{
+			Chart: models.Chart{
+				Name:  "gRPC sent",
+				Unit:  "msgrate",
+				Spans: 3,
+			},
+			refName: "grpc_sent",
+		},
+		{
+			Chart: models.Chart{
+				Name:  "TCP opened",
+				Unit:  "connrate",
+				Spans: 3,
+			},
+			refName: "tcp_opened",
+		},
+		{
+			Chart: models.Chart{
+				Name:  "TCP closed",
+				Unit:  "connrate",
+				Spans: 3,
+			},
+			refName: "tcp_closed",
 		},
 		{
 			Chart: models.Chart{
 				Name:  "TCP received",
 				Unit:  "bitrate",
-				Spans: 6,
+				Spans: 3,
 			},
 			refName: "tcp_received",
 		},
@@ -501,9 +665,61 @@ func getIstioCharts() []istioChart {
 			Chart: models.Chart{
 				Name:  "TCP sent",
 				Unit:  "bitrate",
-				Spans: 6,
+				Spans: 3,
 			},
 			refName: "tcp_sent",
+		},
+	}
+	return istioCharts
+}
+
+func getZtunnelCharts() []istioChart {
+	istioCharts := []istioChart{
+		{
+			Chart: models.Chart{
+				Name:  "Ztunnel Connections",
+				Unit:  "cps",
+				Spans: 4,
+			},
+			refName: "ztunnel_connections",
+			scale:   100000000,
+		},
+		{
+			Chart: models.Chart{
+				Name:  "Ztunnel versions",
+				Spans: 4,
+			},
+			refName: "ztunnel_versions",
+		},
+		{
+			Chart: models.Chart{
+				Name:  "Ztunnel memory usage",
+				Unit:  "MiB",
+				Spans: 4,
+			},
+			refName: "ztunnel_memory_usage",
+		},
+		{
+			Chart: models.Chart{
+				Name:  "Ztunnel CPU usage",
+				Spans: 4,
+			},
+			refName: "ztunnel_cpu_usage",
+		},
+		{
+			Chart: models.Chart{
+				Name:  "Ztunnel bytes transmitted",
+				Unit:  "kB",
+				Spans: 4,
+			},
+			refName: "ztunnel_bytes_transmitted",
+		},
+		{
+			Chart: models.Chart{
+				Name:  "Ztunnel workload manager",
+				Spans: 4,
+			},
+			refName: "ztunnel_workload_manager",
 		},
 	}
 	return istioCharts
@@ -521,14 +737,41 @@ func GetIstioScaler() func(name string) float64 {
 	}
 }
 
-// GetIstioDashboard returns Istio dashboard (currently hard-coded) filled-in with metrics
+// BuildIstioDashboard returns Istio dashboard filled-in with metrics
+func (in *DashboardsService) BuildZtunnelDashboard(metrics models.MetricsMap) *models.MonitoringDashboard {
+	dashboard := models.MonitoringDashboard{
+		Title:        "Ztunnel Metrics",
+		Aggregations: []models.Aggregation{},
+		Charts:       []models.Chart{},
+		Rows:         2,
+	}
+
+	ztunnelCharts := getZtunnelCharts()
+
+	for _, chartTpl := range ztunnelCharts {
+		newChart := chartTpl.Chart
+		conversionParams := models.ConversionParams{Scale: 1.0}
+		if chartTpl.scale != 0.0 {
+			conversionParams.Scale = chartTpl.scale
+		}
+		if metrics := metrics[chartTpl.refName]; metrics != nil {
+			newChart.Metrics = metrics
+		} else {
+			newChart.Metrics = []models.Metric{}
+		}
+		dashboard.Charts = append(dashboard.Charts, newChart)
+	}
+	return &dashboard
+}
+
+// BuildIstioDashboard returns Istio dashboard filled-in with metrics
 func (in *DashboardsService) BuildIstioDashboard(metrics models.MetricsMap, direction string) *models.MonitoringDashboard {
 	var dashboard models.MonitoringDashboard
 	// Copy dashboard
 	if direction == "inbound" {
-		dashboard = models.PrepareIstioDashboard("Inbound", "destination", "source")
+		dashboard = models.PrepareIstioDashboard("Inbound")
 	} else {
-		dashboard = models.PrepareIstioDashboard("Outbound", "source", "destination")
+		dashboard = models.PrepareIstioDashboard("Outbound")
 	}
 
 	istioCharts := getIstioCharts()
@@ -550,35 +793,33 @@ func (in *DashboardsService) BuildIstioDashboard(metrics models.MetricsMap, dire
 }
 
 // GetCustomDashboardRefs finds all dashboard IDs and Titles associated to this app and add them to the model
-func (in *DashboardsService) GetCustomDashboardRefs(namespace, app, version string, pods []*models.Pod) []models.Runtime {
+func (in *DashboardsService) GetCustomDashboardRefs(ctx context.Context, namespace, app, version string, pods []*models.Pod) []models.Runtime {
 	if !in.CustomEnabled || app == "" {
 		// Custom dashboards are disabled or the app label is not configured
 		return []models.Runtime{}
 	}
-
-	var err error
-	promtimer := internalmetrics.GetGoFunctionMetric("business", "DashboardsService", "GetCustomDashboardRefs")
-	defer promtimer.ObserveNow(&err)
 
 	// A better way to do?
 	var podsCast []models.Pod
 	for _, p := range pods {
 		podsCast = append(podsCast, *p)
 	}
-	runtimes := in.SearchExplicitDashboards(namespace, podsCast)
+	runtimes := in.SearchExplicitDashboards(podsCast)
 
 	if len(runtimes) == 0 {
-		cfg := config.Get()
-		discoveryEnabled := cfg.ExternalServices.CustomDashboards.DiscoveryEnabled
+		discoveredRuntimes := map[string]models.Runtime{}
+		discoveryEnabled := in.conf.ExternalServices.CustomDashboards.DiscoveryEnabled
 		if discoveryEnabled == config.DashboardsDiscoveryEnabled ||
 			(discoveryEnabled == config.DashboardsDiscoveryAuto &&
-				len(pods) <= cfg.ExternalServices.CustomDashboards.DiscoveryAutoThreshold) {
-			filters := make(map[string]string)
-			filters[cfg.IstioLabels.AppLabelName] = app
-			if version != "" {
-				filters[cfg.IstioLabels.VersionLabelName] = version
+				len(pods) <= in.conf.ExternalServices.CustomDashboards.DiscoveryAutoThreshold) {
+			for _, appVersionLabelSelector := range in.conf.GetAppVersionLabelSelectors(app, version) {
+				for _, discoveredDashboard := range in.discoverDashboards(ctx, namespace, appVersionLabelSelector.Requirements) {
+					discoveredRuntimes[discoveredDashboard.Name] = discoveredDashboard
+				}
 			}
-			runtimes = in.discoverDashboards(namespace, filters)
+			for _, runtime := range discoveredRuntimes {
+				runtimes = append(runtimes, runtime)
+			}
 		}
 	}
 	return runtimes
@@ -618,4 +859,39 @@ func extractDashboardsFromAnnotation(pod models.Pod, annotation string) []string
 		}
 	}
 	return dashboards
+}
+
+func fetchDashboardRateMetric(
+	ctx context.Context,
+	promClient prometheus.ClientInterface,
+	ref dashboards.MonitoringDashboardMetric,
+	filters, grouping string,
+	q *prometheus.RangeQuery,
+	conversionParams models.ConversionParams,
+) ([]models.Metric, error) {
+	metricNames := rateMetricNameCandidates(ref.MetricName)
+	for i, metricName := range metricNames {
+		metric := promClient.FetchRateRange(ctx, metricName, []string{filters}, grouping, q)
+		converted, err := models.ConvertMetric(ref.DisplayName, metric, conversionParams)
+		if err != nil {
+			return nil, err
+		}
+		if len(converted) > 0 || i == len(metricNames)-1 {
+			return converted, nil
+		}
+	}
+	return nil, nil
+}
+
+func rateMetricNameCandidates(metricName string) []string {
+	if metricName == "" {
+		return nil
+	}
+	if strings.HasSuffix(metricName, "_total") {
+		return []string{metricName}
+	}
+	if strings.HasSuffix(metricName, "_rq") {
+		return []string{metricName, metricName + "_total"}
+	}
+	return []string{metricName}
 }

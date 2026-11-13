@@ -1,0 +1,57 @@
+import * as React from 'react';
+import type { Aggregator } from 'types/MetricsOptions';
+
+import { URLParam, HistoryManager } from '../../app/History';
+import { ToolbarDropdown } from '../Dropdown/ToolbarDropdown';
+
+interface Props {
+  onChanged: (aggregator: Aggregator) => void;
+}
+
+export class MetricsRawAggregation extends React.Component<Props> {
+  static Aggregators: { [key: string]: string } = {
+    sum: 'Sum',
+    avg: 'Average',
+    min: 'Min',
+    max: 'Max',
+    stddev: 'Standard deviation',
+    stdvar: 'Standard variance'
+  };
+
+  private aggregator: Aggregator;
+
+  constructor(props: Props) {
+    super(props);
+    this.aggregator = MetricsRawAggregation.initialAggregator();
+  }
+
+  static initialAggregator(): Aggregator {
+    const opParam = HistoryManager.getParam(URLParam.AGGREGATOR);
+
+    if (opParam !== undefined) {
+      return opParam as Aggregator;
+    }
+
+    return 'sum';
+  }
+
+  onAggregatorChanged = (aggregator: string): void => {
+    HistoryManager.setParam(URLParam.AGGREGATOR, aggregator);
+    this.aggregator = aggregator as Aggregator;
+    this.props.onChanged(this.aggregator);
+  };
+
+  render(): React.ReactNode {
+    return (
+      <ToolbarDropdown
+        id={'metrics_filter_aggregator'}
+        disabled={false}
+        handleSelect={this.onAggregatorChanged}
+        nameDropdown={'Pod Aggregation'}
+        value={this.aggregator}
+        label={MetricsRawAggregation.Aggregators[this.aggregator]}
+        options={MetricsRawAggregation.Aggregators}
+      />
+    );
+  }
+}

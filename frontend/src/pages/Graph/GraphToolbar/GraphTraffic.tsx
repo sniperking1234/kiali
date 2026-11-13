@@ -1,0 +1,448 @@
+import type { MenuToggleElement } from '@patternfly/react-core';
+import { Radio, Checkbox, Dropdown, DropdownList, MenuToggle } from '@patternfly/react-core';
+import * as React from 'react';
+import { connect } from 'react-redux';
+import type { KialiDispatch } from 'types/Redux';
+import { bindActionCreators } from 'redux';
+import type { KialiAppState } from '../../../store/Store';
+import { GraphToolbarActions } from '../../../actions/GraphToolbarActions';
+import { TrafficRate, isAmbientRate, isGrpcRate, isHttpRate, isTcpRate } from '../../../types/Graph';
+import { startCase } from 'lodash-es';
+import { trafficRatesSelector } from 'store/Selectors';
+import { useKialiTranslation } from 'utils/I18nUtils';
+import {
+  BoundingClientAwareComponent,
+  PropertyType
+} from 'components/BoundingClientAwareComponent/BoundingClientAwareComponent';
+import { ToolbarDropdownHelpRow } from 'components/ToolbarDropdown/ToolbarDropdownHelpRow';
+import { containerStyle, itemStyleWithoutInfo, menuStyle } from 'styles/DropdownStyles';
+import { serverConfig } from 'config';
+
+type ReduxDispatchProps = {
+  setTrafficRates: (trafficRates: TrafficRate[]) => void;
+};
+
+type ReduxStateProps = {
+  trafficRates: TrafficRate[];
+};
+
+type ReduxProps = ReduxDispatchProps & ReduxStateProps;
+
+type GraphTrafficProps = ReduxProps & {
+  disabled: boolean;
+};
+
+interface TrafficRateOptionType {
+  disabled?: boolean;
+  id: string;
+  isChecked: boolean;
+  isHidden?: boolean;
+  labelText: string;
+  onChange?: () => void;
+  tooltip?: React.ReactNode;
+}
+
+const marginBottom = 20;
+
+const GraphTrafficComponent: React.FC<GraphTrafficProps> = (props: GraphTrafficProps) => {
+  const { t } = useKialiTranslation();
+  const [isOpen, setIsOpen] = React.useState<boolean>(false);
+
+  const onToggle = (isOpen: boolean): void => {
+    setIsOpen(isOpen);
+  };
+
+  const getPopoverContent = (): React.ReactNode => {
+    const trafficRates = props.trafficRates;
+
+    const trafficRateOptions: TrafficRateOptionType[] = [
+      {
+        id: TrafficRate.AMBIENT_GROUP,
+        labelText: t(startCase(TrafficRate.AMBIENT_GROUP)),
+        isChecked: trafficRates.includes(TrafficRate.AMBIENT_GROUP),
+        isHidden: !serverConfig.ambientEnabled,
+        tooltip: (
+          <div style={{ textAlign: 'left' }}>
+            Displays active Edges for the time period, as reported by the enabled Istio Ambient components. This is
+            independent of specific protocols. Default: All.
+          </div>
+        )
+      },
+      {
+        id: TrafficRate.GRPC_GROUP,
+        labelText: t(startCase(TrafficRate.GRPC_GROUP)),
+        isChecked: trafficRates.includes(TrafficRate.GRPC_GROUP),
+        tooltip: (
+          <div style={{ textAlign: 'left' }}>
+            Displays active gRPC Edges for the time period, using the selected gRPC rate. To see idle gRPC Edges enable
+            the "Idle Edges" Display menu option. Default: Requests.
+          </div>
+        )
+      },
+      {
+        id: TrafficRate.HTTP_GROUP,
+        labelText: t(startCase(TrafficRate.HTTP_GROUP)),
+        isChecked: trafficRates.includes(TrafficRate.HTTP_GROUP),
+        tooltip: (
+          <div style={{ textAlign: 'left' }}>
+            Displays active HTTP Edges for the time period, using the selected HTTP rate. To see idle HTTP Edges enable
+            the "Idle Edges" Display menu option. Default: Requests.
+          </div>
+        )
+      },
+      {
+        id: TrafficRate.TCP_GROUP,
+        labelText: t(startCase(TrafficRate.TCP_GROUP)),
+        isChecked: trafficRates.includes(TrafficRate.TCP_GROUP),
+        tooltip: (
+          <div style={{ textAlign: 'left' }}>
+            Displays active TCP Edges for the time period, using the selected TCP rate. To see inactive TCP Edges enable
+            the "Idle Edges" Display menu option. Default: Sent Bytes.
+          </div>
+        )
+      }
+    ];
+
+    const ambientOptions: TrafficRateOptionType[] = [
+      {
+        id: TrafficRate.AMBIENT_WAYPOINT,
+        labelText: 'Waypoint',
+        isChecked: trafficRates.includes(TrafficRate.AMBIENT_WAYPOINT),
+        tooltip: (
+          <div style={{ textAlign: 'left' }}>Limit to only waypoint-reported traffic, for the enabled protocols.</div>
+        )
+      },
+      {
+        id: TrafficRate.AMBIENT_ZTUNNEL,
+        labelText: 'Ztunnel',
+        isChecked: trafficRates.includes(TrafficRate.AMBIENT_ZTUNNEL),
+        tooltip: (
+          <div style={{ textAlign: 'left' }}>
+            Limit to only ztunnel-reported traffic. Relevant only when TCP protocol is enabled.
+          </div>
+        )
+      },
+      {
+        id: TrafficRate.AMBIENT_TOTAL,
+        labelText: t('Total'),
+        isChecked: trafficRates.includes(TrafficRate.AMBIENT_TOTAL),
+        tooltip: (
+          <div style={{ textAlign: 'left' }}>
+            Total traffic reported by Ambient components, for the enabled protocols.
+          </div>
+        )
+      }
+    ];
+
+    const grpcOptions: TrafficRateOptionType[] = [
+      {
+        id: TrafficRate.GRPC_RECEIVED,
+        labelText: t('Received Messages'),
+        isChecked: trafficRates.includes(TrafficRate.GRPC_RECEIVED),
+        tooltip: (
+          <div style={{ textAlign: 'left' }}>
+            Received (i.e. Response) message rate in messages-per-second (mps). Captures server streaming RPCs.
+          </div>
+        )
+      },
+      {
+        id: TrafficRate.GRPC_REQUEST,
+        labelText: t('Requests'),
+        isChecked: trafficRates.includes(TrafficRate.GRPC_REQUEST),
+        tooltip: (
+          <div style={{ textAlign: 'left' }}>
+            Request message rate in requests-per-second (rps). Captures unary RPC, with status codes.
+          </div>
+        )
+      },
+      {
+        id: TrafficRate.GRPC_SENT,
+        labelText: t('Sent Messages'),
+        isChecked: trafficRates.includes(TrafficRate.GRPC_SENT),
+        tooltip: (
+          <div style={{ textAlign: 'left' }}>
+            Sent (i.e. Request) message rate in messages-per-second (mps). Captures client streaming RPCs.
+          </div>
+        )
+      },
+      {
+        id: TrafficRate.GRPC_TOTAL,
+        labelText: t('Total Messages'),
+        isChecked: trafficRates.includes(TrafficRate.GRPC_TOTAL),
+        tooltip: (
+          <div style={{ textAlign: 'left' }}>
+            Combined (Sent + Received) message rate in messages-per-second (mps). Captures all streaming RPCs.
+          </div>
+        )
+      }
+    ];
+
+    const httpOptions: TrafficRateOptionType[] = [
+      {
+        id: TrafficRate.HTTP_REQUEST,
+        labelText: t('Requests'),
+        isChecked: trafficRates.includes(TrafficRate.HTTP_REQUEST),
+        tooltip: (
+          <div style={{ textAlign: 'left' }}>
+            Request message rate in requests-per-second (rps). Captures status codes.
+          </div>
+        )
+      }
+    ];
+
+    const tcpOptions: TrafficRateOptionType[] = [
+      {
+        id: TrafficRate.TCP_RECEIVED,
+        labelText: t('Received Bytes'),
+        isChecked: trafficRates.includes(TrafficRate.TCP_RECEIVED),
+        tooltip: <div style={{ textAlign: 'left' }}>Received bytes rate in bytes-per-second (bps).</div>
+      },
+      {
+        id: TrafficRate.TCP_SENT,
+        labelText: t('Sent Bytes'),
+        isChecked: trafficRates.includes(TrafficRate.TCP_SENT),
+        tooltip: <div style={{ textAlign: 'left' }}>Sent bytes rate in bytes-per-second (bps).</div>
+      },
+      {
+        id: TrafficRate.TCP_TOTAL,
+        labelText: t('Total Bytes'),
+        isChecked: trafficRates.includes(TrafficRate.TCP_TOTAL),
+        tooltip: (
+          <div style={{ textAlign: 'left' }}>Combined (Sent + Received) byte rate in bytes-per-second (bps).</div>
+        )
+      }
+    ];
+
+    return (
+      <BoundingClientAwareComponent
+        className={containerStyle}
+        maxHeight={{ type: PropertyType.VIEWPORT_HEIGHT_MINUS_TOP, margin: marginBottom }}
+      >
+        <div id="graph-traffic-menu" className={menuStyle} style={{ width: '16.5em' }}>
+          {trafficRateOptions
+            .filter((trafficRateOption: TrafficRateOptionType) => !trafficRateOption.isHidden)
+            .map((trafficRateOption: TrafficRateOptionType) => (
+              <React.Fragment key={trafficRateOption.id}>
+                <ToolbarDropdownHelpRow helpBody={trafficRateOption.tooltip} helpTitle={trafficRateOption.labelText}>
+                  <label className={itemStyleWithoutInfo}>
+                    <Checkbox
+                      id={trafficRateOption.id}
+                      name="trafficRateOptions"
+                      isChecked={trafficRateOption.isChecked}
+                      isDisabled={props.disabled}
+                      label={trafficRateOption.labelText}
+                      onChange={(event, _) => toggleTrafficRate(_, event)}
+                      value={trafficRateOption.id}
+                    />
+                  </label>
+                </ToolbarDropdownHelpRow>
+
+                {trafficRateOption.id === TrafficRate.AMBIENT_GROUP && ambientOptions.some(o => o.isChecked) && (
+                  <div>
+                    {ambientOptions.map((ambientOption: TrafficRateOptionType) => (
+                      <ToolbarDropdownHelpRow
+                        key={ambientOption.id}
+                        helpBody={ambientOption.tooltip}
+                        helpTitle={ambientOption.labelText}
+                      >
+                        <label className={itemStyleWithoutInfo} style={{ paddingLeft: '2rem' }}>
+                          <Radio
+                            id={ambientOption.id}
+                            style={{ paddingLeft: '0.25rem' }}
+                            name="ambientOptions"
+                            isChecked={ambientOption.isChecked}
+                            isDisabled={props.disabled}
+                            label={ambientOption.labelText}
+                            onChange={(event, _) => toggleTrafficRateAmbient(_, event)}
+                            value={ambientOption.id}
+                          />
+                        </label>
+                      </ToolbarDropdownHelpRow>
+                    ))}
+                  </div>
+                )}
+
+                {trafficRateOption.id === TrafficRate.GRPC_GROUP && grpcOptions.some(o => o.isChecked) && (
+                  <div>
+                    {grpcOptions.map((grpcOption: TrafficRateOptionType) => (
+                      <ToolbarDropdownHelpRow
+                        key={grpcOption.id}
+                        helpBody={grpcOption.tooltip}
+                        helpTitle={grpcOption.labelText}
+                      >
+                        <label className={itemStyleWithoutInfo} style={{ paddingLeft: '2rem' }}>
+                          <Radio
+                            id={grpcOption.id}
+                            style={{ paddingLeft: '0.25rem' }}
+                            name="grpcOptions"
+                            isChecked={grpcOption.isChecked}
+                            isDisabled={props.disabled}
+                            label={grpcOption.labelText}
+                            onChange={(event, _) => toggleTrafficRateGrpc(_, event)}
+                            value={grpcOption.id}
+                          />
+                        </label>
+                      </ToolbarDropdownHelpRow>
+                    ))}
+                  </div>
+                )}
+
+                {trafficRateOption.id === TrafficRate.HTTP_GROUP && httpOptions.some(o => o.isChecked) && (
+                  <div>
+                    {httpOptions.map((httpOption: TrafficRateOptionType) => (
+                      <ToolbarDropdownHelpRow
+                        key={httpOption.id}
+                        helpBody={httpOption.tooltip}
+                        helpTitle={httpOption.labelText}
+                      >
+                        <label className={itemStyleWithoutInfo} style={{ paddingLeft: '2rem' }}>
+                          <Radio
+                            id={httpOption.id}
+                            style={{ paddingLeft: '0.25rem' }}
+                            name="httpOptions"
+                            isChecked={httpOption.isChecked}
+                            isDisabled={props.disabled}
+                            label={httpOption.labelText}
+                            onChange={(event, _) => toggleTrafficRateHttp(_, event)}
+                            value={httpOption.id}
+                          />
+                        </label>
+                      </ToolbarDropdownHelpRow>
+                    ))}
+                  </div>
+                )}
+
+                {trafficRateOption.id === TrafficRate.TCP_GROUP && tcpOptions.some(o => o.isChecked) && (
+                  <div>
+                    {tcpOptions.map((tcpOption: TrafficRateOptionType) => (
+                      <ToolbarDropdownHelpRow
+                        key={tcpOption.id}
+                        helpBody={tcpOption.tooltip}
+                        helpTitle={tcpOption.labelText}
+                      >
+                        <label className={itemStyleWithoutInfo} style={{ paddingLeft: '2rem' }}>
+                          <Radio
+                            id={tcpOption.id}
+                            style={{ paddingLeft: '0.25rem' }}
+                            name="tcpOptions"
+                            isChecked={tcpOption.isChecked}
+                            isDisabled={props.disabled}
+                            label={tcpOption.labelText}
+                            onChange={(event, _) => toggleTrafficRateTcp(_, event)}
+                            value={tcpOption.id}
+                          />
+                        </label>
+                      </ToolbarDropdownHelpRow>
+                    ))}
+                  </div>
+                )}
+              </React.Fragment>
+            ))}
+        </div>
+      </BoundingClientAwareComponent>
+    );
+  };
+
+  const toggleTrafficRate = (_, event): void => {
+    const rate = event.target.value as TrafficRate;
+
+    if (props.trafficRates.includes(rate)) {
+      let newRates: TrafficRate[];
+
+      switch (rate) {
+        case TrafficRate.AMBIENT_GROUP:
+          newRates = props.trafficRates.filter(r => !isAmbientRate(r));
+          break;
+        case TrafficRate.GRPC_GROUP:
+          newRates = props.trafficRates.filter(r => !isGrpcRate(r));
+          break;
+        case TrafficRate.HTTP_GROUP:
+          newRates = props.trafficRates.filter(r => !isHttpRate(r));
+          break;
+        case TrafficRate.TCP_GROUP:
+          newRates = props.trafficRates.filter(r => !isTcpRate(r));
+          break;
+        default:
+          newRates = props.trafficRates.filter(r => r !== rate);
+      }
+
+      props.setTrafficRates(newRates);
+    } else {
+      switch (rate) {
+        case TrafficRate.AMBIENT_GROUP:
+          props.setTrafficRates([...props.trafficRates, rate, TrafficRate.AMBIENT_TOTAL]);
+          break;
+        case TrafficRate.GRPC_GROUP:
+          props.setTrafficRates([...props.trafficRates, rate, TrafficRate.GRPC_REQUEST]);
+          break;
+        case TrafficRate.HTTP_GROUP:
+          props.setTrafficRates([...props.trafficRates, rate, TrafficRate.HTTP_REQUEST]);
+          break;
+        case TrafficRate.TCP_GROUP:
+          props.setTrafficRates([...props.trafficRates, rate, TrafficRate.TCP_SENT]);
+          break;
+        default:
+          props.setTrafficRates([...props.trafficRates, rate]);
+      }
+    }
+  };
+
+  const toggleTrafficRateAmbient = (_, event): void => {
+    const rate = event.target.value as TrafficRate;
+    const newRates = props.trafficRates.filter(r => !isAmbientRate(r));
+    props.setTrafficRates([...newRates, TrafficRate.AMBIENT_GROUP, rate]);
+  };
+
+  const toggleTrafficRateGrpc = (_, event): void => {
+    const rate = event.target.value as TrafficRate;
+    const newRates = props.trafficRates.filter(r => !isGrpcRate(r));
+    props.setTrafficRates([...newRates, TrafficRate.GRPC_GROUP, rate]);
+  };
+
+  const toggleTrafficRateHttp = (_, event): void => {
+    const rate = event.target.value as TrafficRate;
+    const newRates = props.trafficRates.filter(r => !isHttpRate(r));
+    props.setTrafficRates([...newRates, TrafficRate.HTTP_GROUP, rate]);
+  };
+
+  const toggleTrafficRateTcp = (_, event): void => {
+    const rate = event.target.value as TrafficRate;
+    const newRates = props.trafficRates.filter(r => !isTcpRate(r));
+    props.setTrafficRates([...newRates, TrafficRate.TCP_GROUP, rate]);
+  };
+
+  return (
+    <Dropdown
+      toggle={(toggleRef: React.Ref<MenuToggleElement>) => (
+        <MenuToggle
+          ref={toggleRef}
+          id="graph-traffic-dropdown"
+          isDisabled={props.disabled}
+          onClick={() => onToggle(!isOpen)}
+          isExpanded={isOpen}
+        >
+          {t('Traffic')}
+        </MenuToggle>
+      )}
+      isOpen={isOpen}
+      onOpenChange={(isOpen: boolean) => onToggle(isOpen)}
+    >
+      <DropdownList>{getPopoverContent()}</DropdownList>
+    </Dropdown>
+  );
+};
+
+// Allow Redux to map sections of our global app state to our props
+const mapStateToProps = (state: KialiAppState): ReduxStateProps => ({
+  trafficRates: trafficRatesSelector(state)
+});
+
+// Map our actions to Redux
+const mapDispatchToProps = (dispatch: KialiDispatch): ReduxDispatchProps => {
+  return {
+    setTrafficRates: bindActionCreators(GraphToolbarActions.setTrafficRates, dispatch)
+  };
+};
+
+// hook up to Redux for our State to be mapped to props
+export const GraphTraffic = connect(mapStateToProps, mapDispatchToProps)(GraphTrafficComponent);

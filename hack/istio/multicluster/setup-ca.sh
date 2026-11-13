@@ -1,4 +1,5 @@
 #!/bin/bash
+set -e
 
 ##############################################################################
 # setup-ca.sh
@@ -10,8 +11,8 @@
 #
 ##############################################################################
 
-SCRIPT_DIR="$(cd $(dirname "${BASH_SOURCE[0]}") && pwd)"
-source ${SCRIPT_DIR}/env.sh $*
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source ${SCRIPT_DIR}/env.sh "$@"
 
 create_secret() {
   local clustername="${1}"
@@ -21,13 +22,11 @@ create_secret() {
   fi
 
   if ! ${CLIENT_EXE} get secret cacerts -n ${ISTIO_NAMESPACE}; then
-    ${CLIENT_EXE} create secret generic cacerts -n ${ISTIO_NAMESPACE} \
+    if ! ${CLIENT_EXE} create secret generic cacerts -n ${ISTIO_NAMESPACE} \
         --from-file ${CERTS_DIR}/${clustername}/ca-cert.pem           \
         --from-file ${CERTS_DIR}/${clustername}/ca-key.pem            \
         --from-file ${CERTS_DIR}/${clustername}/root-cert.pem         \
-        --from-file ${CERTS_DIR}/${clustername}/cert-chain.pem
-
-    if [ "$?" != "0" ]; then
+        --from-file ${CERTS_DIR}/${clustername}/cert-chain.pem; then
       echo "Failed to create secret in cluster [${clustername}]"
       exit 1
     fi
@@ -41,11 +40,11 @@ if [ ! -d "${CERTS_DIR}" ]; then
   echo "Cannot create certs directory - ${CERTS_DIR}"
   exit 1
 fi
-pushd "${CERTS_DIR}"
+pushd "${CERTS_DIR}" || exit
 make -f ${CERT_MAKEFILE} root-ca
 make -f ${CERT_MAKEFILE} ${CLUSTER1_NAME}-cacerts
 make -f ${CERT_MAKEFILE} ${CLUSTER2_NAME}-cacerts
-popd
+popd || exit
 
 echo "==== CREATE CERTS FOR CLUSTER #1 [${CLUSTER1_NAME}] - ${CLUSTER1_CONTEXT}"
 switch_cluster "${CLUSTER1_CONTEXT}" "${CLUSTER1_USER}" "${CLUSTER1_PASS}"

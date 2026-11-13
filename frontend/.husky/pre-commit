@@ -1,0 +1,7 @@
+#!/usr/bin/env sh
+
+# Unset GIT_DIR to avoid issues when git gui sets it to a relative path
+unset GIT_DIR
+
+cd frontend
+yarn pre-commit

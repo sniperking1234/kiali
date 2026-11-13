@@ -1,56 +1,105 @@
 package checkers
 
 import (
+	networking_v1 "istio.io/client-go/pkg/apis/networking/v1"
 	core_v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/labels"
 
 	"github.com/kiali/kiali/business/checkers/destinationrules"
-	"github.com/kiali/kiali/business/checkers/virtual_services"
+	"github.com/kiali/kiali/business/checkers/virtualservices"
+	"github.com/kiali/kiali/config"
 	"github.com/kiali/kiali/kubernetes"
 	"github.com/kiali/kiali/models"
 )
 
-const ServiceRoleCheckerType = "servicerole"
-
 type NoServiceChecker struct {
-	Namespace            string
-	Namespaces           models.Namespaces
-	IstioDetails         *kubernetes.IstioDetails
-	Services             []core_v1.Service
-	WorkloadList         models.WorkloadList
-	GatewaysPerNamespace [][]kubernetes.IstioObject
-	AuthorizationDetails *kubernetes.RBACDetails
+	AuthorizationDetails  *kubernetes.RBACDetails
+	Cluster               string
+	Conf                  *config.Config
+	IdentityDomain        string
+	IsGatewayToNamespace  bool
+	IstioConfigList       *models.IstioConfigList
+	KubeServiceHosts      kubernetes.KubeServiceHosts
+	Namespaces            models.Namespaces
+	PolicyAllowAny        bool
+	Services              []core_v1.Service
+	ValidatingNamespace   string
+	WorkloadsPerNamespace map[string]models.Workloads
 }
 
 func (in NoServiceChecker) Check() models.IstioValidations {
 	validations := models.IstioValidations{}
 
-	if in.IstioDetails == nil || in.Services == nil {
-		return validations
-	}
+	serviceHosts := kubernetes.ServiceEntryHostnames(in.IstioConfigList.ServiceEntries)
+	gatewayNames := kubernetes.GatewayNames(in.IstioConfigList.Gateways, in.IdentityDomain)
+	gatewayWorkloadScope := in.gatewayWorkloadScope()
 
-	serviceNames := getServiceNames(in.Services)
-	serviceHosts := kubernetes.ServiceEntryHostnames(in.IstioDetails.ServiceEntries)
-	gatewayNames := kubernetes.GatewayNames(in.GatewaysPerNamespace)
+	for _, virtualService := range in.IstioConfigList.VirtualServices {
+		validations.MergeValidations(runVirtualServiceCheck(virtualService, serviceHosts, in.Namespaces, in.KubeServiceHosts, in.PolicyAllowAny, in.Cluster, in.IdentityDomain, in.ValidatingNamespace, gatewayWorkloadScope))
 
-	for _, virtualService := range in.IstioDetails.VirtualServices {
-		validations.MergeValidations(runVirtualServiceCheck(virtualService, in.Namespace, serviceNames, serviceHosts, in.Namespaces))
-		validations.MergeValidations(runGatewayCheck(virtualService, gatewayNames))
+		validations.MergeValidations(runGatewayCheck(virtualService, gatewayNames, in.Cluster, in.IdentityDomain))
 	}
-	for _, destinationRule := range in.IstioDetails.DestinationRules {
-		validations.MergeValidations(runDestinationRuleCheck(destinationRule, in.Namespace, in.WorkloadList, in.Services, serviceHosts, in.Namespaces))
+	for _, destinationRule := range in.IstioConfigList.DestinationRules {
+		validations.MergeValidations(runDestinationRuleCheck(destinationRule, in.WorkloadsPerNamespace, in.IstioConfigList.ServiceEntries, in.Namespaces, in.KubeServiceHosts, in.Services, in.IstioConfigList.VirtualServices, in.PolicyAllowAny, in.Cluster, in.Conf, in.IdentityDomain))
 	}
 	return validations
 }
 
-func runVirtualServiceCheck(virtualService kubernetes.IstioObject, namespace string, serviceNames []string, serviceHosts map[string][]string, clusterNamespaces models.Namespaces) models.IstioValidations {
-	key, validations := EmptyValidValidation(virtualService.GetObjectMeta().Name, virtualService.GetObjectMeta().Namespace, VirtualCheckerType)
+// gatewayWorkloadScope resolves only gateways referenced by gateway-only routes.
+// The index and results are built lazily and reused across this namespace's
+// VirtualServices, including negative results. Nothing persists across validations.
+func (in NoServiceChecker) gatewayWorkloadScope() virtualservices.GatewayWorkloadScope {
+	if in.ValidatingNamespace == "" || len(in.IstioConfigList.VirtualServices) == 0 || len(in.IstioConfigList.Gateways) == 0 {
+		return nil
+	}
+	var gateways map[string]*networking_v1.Gateway
+	var scope map[string]bool
+	return func(host kubernetes.Host) (bool, bool) {
+		key := host.String()
+		if applies, cached := scope[key]; cached {
+			return applies, true
+		}
+		if gateways == nil {
+			gateways = make(map[string]*networking_v1.Gateway, len(in.IstioConfigList.Gateways))
+			for _, gateway := range in.IstioConfigList.Gateways {
+				gateways[kubernetes.ParseHost(gateway.Name, gateway.Namespace, in.IdentityDomain).String()] = gateway
+			}
+		}
+		gateway, known := gateways[key]
+		if !known {
+			return false, false
+		}
+		applies := false
+		workloads := in.WorkloadsPerNamespace[in.ValidatingNamespace]
+		if (!in.IsGatewayToNamespace || gateway.Namespace == in.ValidatingNamespace) && len(workloads) > 0 {
+			selector := labels.SelectorFromSet(gateway.Spec.Selector)
+			for _, workload := range workloads {
+				if selector.Matches(labels.Set(workload.Labels)) {
+					applies = true
+					break
+				}
+			}
+		}
+		if scope == nil {
+			scope = make(map[string]bool)
+		}
+		scope[key] = applies
+		return applies, true
+	}
+}
 
-	result, valid := virtual_services.NoHostChecker{
-		Namespace:         namespace,
-		Namespaces:        clusterNamespaces,
-		ServiceNames:      serviceNames,
-		VirtualService:    virtualService,
-		ServiceEntryHosts: serviceHosts,
+func runVirtualServiceCheck(virtualService *networking_v1.VirtualService, serviceHosts map[string][]string, clusterNamespaces models.Namespaces, kubeServiceHosts kubernetes.KubeServiceHosts, policyAllowAny bool, cluster string, identityDomain string, validatingNamespace string, gatewayWorkloadScope virtualservices.GatewayWorkloadScope) models.IstioValidations {
+	key, validations := EmptyValidValidation(virtualService.Name, virtualService.Namespace, kubernetes.VirtualServices, cluster)
+
+	result, valid := virtualservices.NoHostChecker{
+		GatewayWorkloadScope: gatewayWorkloadScope,
+		IdentityDomain:       identityDomain,
+		KubeServiceHosts:     kubeServiceHosts,
+		Namespaces:           clusterNamespaces.GetNames(),
+		PolicyAllowAny:       policyAllowAny,
+		ServiceEntryHosts:    serviceHosts,
+		ValidatingNamespace:  validatingNamespace,
+		VirtualService:       virtualService,
 	}.Check()
 
 	validations.Valid = valid
@@ -59,12 +108,13 @@ func runVirtualServiceCheck(virtualService kubernetes.IstioObject, namespace str
 	return models.IstioValidations{key: validations}
 }
 
-func runGatewayCheck(virtualService kubernetes.IstioObject, gatewayNames map[string]struct{}) models.IstioValidations {
-	key, validations := EmptyValidValidation(virtualService.GetObjectMeta().Name, virtualService.GetObjectMeta().Namespace, VirtualCheckerType)
+func runGatewayCheck(virtualService *networking_v1.VirtualService, gatewayNames map[string]struct{}, cluster string, identityDomain string) models.IstioValidations {
+	key, validations := EmptyValidValidation(virtualService.Name, virtualService.Namespace, kubernetes.VirtualServices, cluster)
 
-	result, valid := virtual_services.NoGatewayChecker{
-		VirtualService: virtualService,
+	result, valid := virtualservices.NoGatewayChecker{
 		GatewayNames:   gatewayNames,
+		IdentityDomain: identityDomain,
+		VirtualService: virtualService,
 	}.Check()
 
 	validations.Valid = valid
@@ -73,29 +123,26 @@ func runGatewayCheck(virtualService kubernetes.IstioObject, gatewayNames map[str
 	return models.IstioValidations{key: validations}
 }
 
-func runDestinationRuleCheck(destinationRule kubernetes.IstioObject, namespace string, workloads models.WorkloadList,
-	services []core_v1.Service, serviceHosts map[string][]string, clusterNamespaces models.Namespaces) models.IstioValidations {
-	key, validations := EmptyValidValidation(destinationRule.GetObjectMeta().Name, destinationRule.GetObjectMeta().Namespace, DestinationRuleCheckerType)
+func runDestinationRuleCheck(destinationRule *networking_v1.DestinationRule, workloads map[string]models.Workloads,
+	serviceEntries []*networking_v1.ServiceEntry, clusterNamespaces models.Namespaces, kubeServiceHosts kubernetes.KubeServiceHosts, services []core_v1.Service, virtualServices []*networking_v1.VirtualService,
+	policyAllowAny bool, cluster string, conf *config.Config, identityDomain string) models.IstioValidations {
+	key, validations := EmptyValidValidation(destinationRule.Name, destinationRule.Namespace, kubernetes.DestinationRules, cluster)
 
 	result, valid := destinationrules.NoDestinationChecker{
-		Namespace:       namespace,
-		Namespaces:      clusterNamespaces,
-		WorkloadList:    workloads,
-		DestinationRule: destinationRule,
-		Services:        services,
-		ServiceEntries:  serviceHosts,
+		Conf:                  conf,
+		IdentityDomain:        identityDomain,
+		Namespaces:            clusterNamespaces.GetNames(),
+		WorkloadsPerNamespace: workloads,
+		DestinationRule:       destinationRule,
+		VirtualServices:       virtualServices,
+		ServiceEntries:        serviceEntries,
+		KubeServiceHosts:      kubeServiceHosts,
+		Services:              services,
+		PolicyAllowAny:        policyAllowAny,
 	}.Check()
 
 	validations.Valid = valid
 	validations.Checks = result
 
 	return models.IstioValidations{key: validations}
-}
-
-func getServiceNames(services []core_v1.Service) []string {
-	serviceNames := make([]string, 0)
-	for _, item := range services {
-		serviceNames = append(serviceNames, item.Name)
-	}
-	return serviceNames
 }

@@ -1,101 +1,304 @@
 package business
 
 import (
-	"fmt"
+	"context"
+	"strings"
 	"sync"
 	"time"
 
-	core_v1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/labels"
-
+	"github.com/kiali/kiali/cache"
 	"github.com/kiali/kiali/config"
+	"github.com/kiali/kiali/istio"
 	"github.com/kiali/kiali/kubernetes"
 	"github.com/kiali/kiali/log"
 	"github.com/kiali/kiali/models"
+	"github.com/kiali/kiali/observability"
+	"github.com/kiali/kiali/prometheus/internalmetrics"
+	"github.com/kiali/kiali/util"
 	"github.com/kiali/kiali/util/httputil"
+	"github.com/kiali/kiali/util/sliceutil"
 )
 
-// SvcService deals with fetching istio/kubernetes services related content and convert to kiali model
+func NewIstioStatusService(
+	cache cache.KialiCache,
+	conf *config.Config,
+	discovery istio.MeshDiscovery,
+	homeClusterSAClient kubernetes.ClientInterface,
+	tracing *TracingService,
+	userClients map[string]kubernetes.UserClientInterface,
+	workloads *WorkloadService,
+	health *HealthService,
+	namespace *NamespaceService,
+) IstioStatusService {
+	return IstioStatusService{
+		cache:               cache,
+		conf:                conf,
+		discovery:           discovery,
+		health:              health,
+		homeClusterSAClient: homeClusterSAClient,
+		namespace:           namespace,
+		tracing:             tracing,
+		userClients:         userClients,
+		workloads:           workloads,
+	}
+}
+
+// IstioStatusService deals with fetching istio/kubernetes component status
 type IstioStatusService struct {
-	k8s           kubernetes.ClientInterface
-	businessLayer *Layer
+	// The global kiali cache. This should be passed into the IstioStatusService rather than created inside of it.
+	cache               cache.KialiCache
+	conf                *config.Config
+	discovery           istio.MeshDiscovery
+	health              *HealthService
+	homeClusterSAClient kubernetes.ClientInterface
+	namespace           *NamespaceService
+	tracing             *TracingService
+	userClients         map[string]kubernetes.UserClientInterface
+	workloads           *WorkloadService
 }
 
-type ComponentStatus struct {
-	// The app label value of the Istio component
-	//
-	// example: istio-ingressgateway
-	// required: true
-	Name string `json:"name"`
+func (iss *IstioStatusService) GetStatus(ctx context.Context) (kubernetes.IstioComponentStatus, error) {
+	var end observability.EndFunc
+	ctx, end = observability.StartSpan(ctx, "GetStatus",
+		observability.Attribute("package", "business"),
+	)
+	defer end()
 
-	// The status of a Istio component
-	//
-	// example:  Not Found
-	// required: true
-	Status string `json:"status"`
-
-	// When true, the component is necessary for Istio to function. Otherwise, it is an addon
-	//
-	// example:  true
-	// required: true
-	IsCore bool `json:"is_core"`
-}
-
-type IstioComponentStatus []ComponentStatus
-
-func (ics *IstioComponentStatus) merge(cs IstioComponentStatus) IstioComponentStatus {
-	*ics = append(*ics, cs...)
-	return *ics
-}
-
-const (
-	Healthy     string = "Healthy"
-	NotFound    string = "NotFound"
-	NotReady    string = "NotReady"
-	Unhealthy   string = "Unhealthy"
-	Unreachable string = "Unreachable"
-)
-
-func (iss *IstioStatusService) GetStatus() (IstioComponentStatus, error) {
-	if !config.Get().ExternalServices.Istio.ComponentStatuses.Enabled {
-		return IstioComponentStatus{}, nil
+	if !iss.conf.ExternalServices.Istio.ComponentStatuses.Enabled {
+		return kubernetes.IstioComponentStatus{}, nil
 	}
 
-	ics, err := iss.getIstioComponentStatus()
+	// When Istio API is disabled we cannot query istiod for component health, but we still
+	// want to resolve clusters to support queries about clusters.
+	// Use the health cache (workload health for the control plane namespace) when available.
+	if !iss.conf.ExternalServices.Istio.IstioAPIEnabled {
+		mesh, err := iss.discovery.Mesh(ctx)
+		if err != nil {
+			return nil, err
+		}
+		result := kubernetes.IstioComponentStatus{}
+		seen := make(map[string]bool)
+		for _, cp := range mesh.ControlPlanes {
+			var cpStatus string
+			if cp.Cluster != nil {
+				cpStatus = iss.GetNamespaceStatus(ctx, cp.Cluster.Name, cp.IstiodNamespace)
+			}
+			if cp.Cluster != nil && !seen[cp.Cluster.Name] {
+				seen[cp.Cluster.Name] = true
+				meshId := getMeshId(&cp)
+				result = append(result, kubernetes.ComponentStatus{
+					Cluster:   cp.Cluster.Name,
+					Name:      cp.IstiodName,
+					Namespace: cp.IstiodNamespace,
+					Status:    cpStatus,
+					IsCore:    true,
+					MeshId:    meshId,
+				})
+			}
+			for _, cl := range cp.ManagedClusters {
+				if cl != nil && !seen[cl.Name] {
+					seen[cl.Name] = true
+					result = append(result, kubernetes.ComponentStatus{
+						Cluster: cl.Name,
+						Name:    "istiod",
+						Status:  cpStatus,
+						IsCore:  true,
+					})
+				}
+			}
+		}
+		return result, nil
+	}
+
+	if istioStatus, ok := iss.cache.GetIstioStatus(); ok {
+		return iss.filterStatusForUser(ctx, istioStatus)
+	}
+
+	// Fetch mesh once and build lookup maps to avoid repeated calls
+	mesh, err := iss.discovery.Mesh(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	return ics.merge(iss.getAddonComponentStatus()), nil
+	// Build efficient lookup maps
+	namespaceMeshMap := iss.buildNamespaceMeshMap(mesh)
+
+	result := kubernetes.IstioComponentStatus{}
+
+	for cluster := range iss.userClients {
+		ics, err := iss.getIstioComponentStatus(ctx, cluster, mesh, namespaceMeshMap)
+		if err != nil {
+			// istiod should be running
+			return nil, err
+		}
+		result.Merge(ics)
+	}
+
+	// for local cluster only get addons
+	result.Merge(iss.getAddonComponentStatus(ctx, iss.conf.KubernetesConfig.ClusterName))
+
+	iss.cache.SetIstioStatus(result)
+
+	return iss.filterStatusForUser(ctx, result)
 }
 
-func (iss *IstioStatusService) getIstioComponentStatus() (IstioComponentStatus, error) {
+// filterStatusForUser removes the status entries the requesting user cannot
+// see. The autodiscovered gateways are tenant data — they live in arbitrary
+// namespaces and the shared status and gateway caches hold them SA-wide — so
+// a namespace-bearing entry outside the control-plane namespaces is kept
+// only when the user can access its namespace in its cluster. Control-plane
+// entries are kept for every user: the control plane's status is mesh-wide
+// information Kiali exposes deliberately, like the mesh endpoints do. The
+// istiod namespaces discovered from the mesh exempt only the cluster that
+// hosts the control plane — a same-named namespace in another cluster is
+// ordinary tenant space and is not exempt — while the configured component
+// namespaces are a deliberate global exemption (the operator declares them
+// by name, without cluster identity). Entries without a namespace (addons,
+// managed-cluster istiod placeholders) disclose no namespace and are kept.
+func (iss *IstioStatusService) filterStatusForUser(ctx context.Context, status kubernetes.IstioComponentStatus) (kubernetes.IstioComponentStatus, error) {
+	if len(status) == 0 {
+		return status, nil
+	}
+	accessible, err := iss.namespace.GetNamespaces(ctx)
+	if err != nil {
+		return nil, err
+	}
+	accessiblePairs := make(map[string]struct{}, len(accessible))
+	for _, ns := range accessible {
+		accessiblePairs[models.ClusterNamespaceKey(ns.Cluster, ns.Name)] = struct{}{}
+	}
+
+	mesh, err := iss.discovery.Mesh(ctx)
+	if err != nil {
+		return nil, err
+	}
+	// Discovered control-plane namespaces are cluster-scoped: a namespace
+	// that hosts a control plane in one cluster may be an ordinary tenant
+	// namespace in another, and must not exempt the latter's entries.
+	controlPlanePairs := make(map[string]struct{})
+	for _, cp := range mesh.ControlPlanes {
+		if cp.Cluster != nil && cp.IstiodNamespace != "" {
+			controlPlanePairs[models.ClusterNamespaceKey(cp.Cluster.Name, cp.IstiodNamespace)] = struct{}{}
+		}
+	}
+	// Configured component namespaces are a deliberate global exemption:
+	// the operator declares them by name, without cluster identity.
+	configuredNamespaces := make(map[string]struct{})
+	for _, ns := range getComponentNamespaces(iss.conf) {
+		configuredNamespaces[ns] = struct{}{}
+	}
+
+	filtered := make(kubernetes.IstioComponentStatus, 0, len(status))
+	for _, component := range status {
+		if component.Namespace == "" {
+			filtered = append(filtered, component)
+			continue
+		}
+		if _, ok := controlPlanePairs[models.ClusterNamespaceKey(component.Cluster, component.Namespace)]; ok {
+			filtered = append(filtered, component)
+			continue
+		}
+		if _, ok := configuredNamespaces[component.Namespace]; ok {
+			filtered = append(filtered, component)
+			continue
+		}
+		if _, ok := accessiblePairs[models.ClusterNamespaceKey(component.Cluster, component.Namespace)]; ok {
+			filtered = append(filtered, component)
+		}
+	}
+	return filtered, nil
+}
+
+func (iss *IstioStatusService) getIstioComponentStatus(ctx context.Context, cluster string, mesh *models.Mesh, namespaceMeshMap namespaceMeshMap) (kubernetes.IstioComponentStatus, error) {
 	// Fetching workloads from component namespaces
-	workloads, err := iss.getComponentNamespacesWorkloads()
-	if err != nil {
-		return IstioComponentStatus{}, err
+	// If there's some explicit config then use that. Otherwise autodiscover.
+	if len(iss.conf.ExternalServices.Istio.ComponentStatuses.Components) > 0 {
+		log.Trace("Istio components config set. Using this instead of autodetecting components.")
+		workloads, err := iss.getComponentNamespacesWorkloads(ctx, cluster)
+		if err != nil {
+			return kubernetes.IstioComponentStatus{}, err
+		}
+
+		return iss.getStatusOf(workloads, cluster, namespaceMeshMap), nil
 	}
 
-	deploymentStatus, err := iss.getStatusOf(workloads)
-	if err != nil {
-		return IstioComponentStatus{}, err
+	log.Trace("Istio components config not set. Autodetecting components.")
+
+	var istiodStatus kubernetes.IstioComponentStatus
+	isManaged := false
+	for _, cp := range mesh.ControlPlanes {
+		if cp.Cluster.Name == cluster {
+			// Get mesh ID for this specific control plane
+			cpMeshId := getMeshId(&cp)
+			istiodStatus = append(istiodStatus, kubernetes.ComponentStatus{
+				Cluster:   cp.Cluster.Name,
+				Name:      cp.IstiodName,
+				Namespace: cp.IstiodNamespace,
+				Status:    cp.Status,
+				IsCore:    true,
+				MeshId:    cpMeshId,
+			})
+		}
+		for _, cl := range cp.ManagedClusters {
+			if cl.Name == cluster {
+				isManaged = true
+				break
+			}
+		}
 	}
 
-	istiodStatus, err := iss.getIstiodReachingCheck()
-	if err != nil {
-		return IstioComponentStatus{}, err
+	// Ignore istiod status for a mgmt cluster (external kiali)
+	if mesh.ExternalKiali == nil || cluster != mesh.ExternalKiali.Cluster.Name {
+		// if no control plane and no any other control plane which manages this cluster
+		if len(istiodStatus) == 0 && !isManaged {
+			// Since istiod is not found and we don't have namespace information,
+			// and a cluster can have multiple meshes, we cannot determine the mesh ID.
+			// Leave mesh ID empty.
+			istiodStatus = append(istiodStatus, kubernetes.ComponentStatus{
+				Cluster:   cluster,
+				Name:      "istiod",
+				Namespace: "",
+				Status:    kubernetes.ComponentNotFound,
+				IsCore:    true,
+				MeshId:    "",
+			})
+		}
 	}
 
-	return deploymentStatus.merge(istiodStatus), nil
+	// Autodiscover gateways.
+	allGateways, err := iss.workloads.GetGateways(ctx)
+	if err != nil {
+		// Don't error on gateways since they are non-essential.
+		log.Debugf("Unable to get gateway workloads when building istio component status. Cluster: %s. Err: %s", cluster, err)
+		return istiodStatus, nil
+	}
+	gateways := sliceutil.Filter(allGateways, func(gw *models.Workload) bool {
+		return gw.Cluster == cluster
+	})
+
+	// Get mesh ID for each gateway based on its namespace
+	for _, gateway := range gateways {
+		gatewayMeshId := namespaceMeshMap[makeNamespaceKey(gateway.Cluster, gateway.Namespace)]
+		istiodStatus = append(istiodStatus, kubernetes.ComponentStatus{
+			Cluster:   gateway.Cluster,
+			Name:      gateway.Name,
+			Namespace: gateway.Namespace,
+			Status:    GetWorkloadStatus(*gateway),
+			IsCore:    false,
+			MeshId:    gatewayMeshId,
+		})
+	}
+
+	return istiodStatus, nil
 }
 
-func (iss *IstioStatusService) getComponentNamespacesWorkloads() ([]*models.Workload, error) {
+func (iss *IstioStatusService) getComponentNamespacesWorkloads(ctx context.Context, cluster string) ([]*models.Workload, error) {
 	var wg sync.WaitGroup
 
 	nss := map[string]bool{}
 	wls := make([]*models.Workload, 0)
 
-	comNs := getComponentNamespaces()
+	comNs := getComponentNamespaces(iss.conf)
 
 	wlChan := make(chan []*models.Workload, len(comNs))
 	errChan := make(chan error, len(comNs))
@@ -105,14 +308,14 @@ func (iss *IstioStatusService) getComponentNamespacesWorkloads() ([]*models.Work
 			wg.Add(1)
 			nss[n] = true
 
-			go func(n string, wliChan chan []*models.Workload, errChan chan error) {
+			go func(ctx context.Context, n string, wliChan chan []*models.Workload, errChan chan error) {
 				defer wg.Done()
 				var wls models.Workloads
 				var err error
-				wls, err = fetchWorkloads(iss.businessLayer, n, "")
+				wls, err = iss.workloads.GetNamespaceWorkloads(ctx, cluster, n, "")
 				wliChan <- wls
 				errChan <- err
-			}(n, wlChan, errChan)
+			}(ctx, n, wlChan, errChan)
 		}
 	}
 
@@ -135,14 +338,11 @@ func (iss *IstioStatusService) getComponentNamespacesWorkloads() ([]*models.Work
 	return wls, nil
 }
 
-func getComponentNamespaces() []string {
+func getComponentNamespaces(conf *config.Config) []string {
 	nss := make([]string, 0)
 
-	// By default, add the istio control plane namespace
-	nss = append(nss, config.Get().IstioNamespace)
-
 	// Adding Istio Components namespaces
-	externalServices := config.Get().ExternalServices
+	externalServices := conf.ExternalServices
 	for _, cmp := range externalServices.Istio.ComponentStatuses.Components {
 		if cmp.Namespace != "" {
 			nss = append(nss, cmp.Namespace)
@@ -152,158 +352,297 @@ func getComponentNamespaces() []string {
 	return nss
 }
 
-func istioCoreComponents() map[string]bool {
-	components := map[string]bool{}
-	cs := config.Get().ExternalServices.Istio.ComponentStatuses
+// namespaceMeshMap provides fast lookup from cluster:namespace to meshID
+type namespaceMeshMap map[string]string
+
+// getMeshId returns the mesh ID from a control plane's mesh config.
+// It uses MeshId if available, otherwise falls back to TrustDomain.
+func getMeshId(cp *models.ControlPlane) string {
+	if cp == nil || cp.MeshConfig == nil {
+		return ""
+	}
+	meshId := cp.MeshConfig.DefaultConfig.MeshId
+	if meshId == "" {
+		// MeshId defaults to trust domain in istio if not set.
+		meshId = cp.MeshConfig.TrustDomain
+	}
+	return meshId
+}
+
+// GetNamespaceStatus returns the component status (Healthy, NotReady, Unhealthy) for the given
+// cluster and namespace by merging app, service, and workload health from the health cache, or
+// by computing health on-demand when the cache is disabled.
+func (iss *IstioStatusService) GetNamespaceStatus(ctx context.Context, cluster, namespace string) string {
+	cachedData, found := iss.cache.GetHealth(cluster, namespace, internalmetrics.HealthTypeNamespace)
+	if found && cachedData != nil {
+		return iss.mergeCachedHealthToStatus(cachedData)
+	}
+	// Cache miss: compute on-demand when health service is available (e.g. when health cache is disabled)
+	if iss.health != nil {
+		criteria := NamespaceHealthCriteria{
+			Cluster:        cluster,
+			IncludeMetrics: true,
+			Namespace:      namespace,
+			QueryTime:      util.Clock.Now(),
+			RateInterval:   "10m",
+		}
+		appHealth, appErr := iss.health.GetNamespaceAppHealth(ctx, criteria)
+		serviceHealth, svcErr := iss.health.GetNamespaceServiceHealth(ctx, criteria)
+		workloadHealth, wkErr := iss.health.GetNamespaceWorkloadHealth(ctx, criteria)
+		if appErr != nil && svcErr != nil && wkErr != nil {
+			log.Debugf("failed to compute namespace health for %s/%s: app=%v service=%v workload=%v", cluster, namespace, appErr, svcErr, wkErr)
+			return kubernetes.ComponentHealthy
+		}
+		var worst models.HealthStatus
+		for _, ah := range appHealth {
+			if ah != nil && ah.Status != nil {
+				if worst == "" {
+					worst = ah.Status.Status
+				} else {
+					worst = models.MergeHealthStatus(worst, ah.Status.Status)
+				}
+			}
+		}
+		for _, sh := range serviceHealth {
+			if sh != nil && sh.Status != nil {
+				if worst == "" {
+					worst = sh.Status.Status
+				} else {
+					worst = models.MergeHealthStatus(worst, sh.Status.Status)
+				}
+			}
+		}
+		for _, wh := range workloadHealth {
+			if wh != nil && wh.Status != nil {
+				if worst == "" {
+					worst = wh.Status.Status
+				} else {
+					worst = models.MergeHealthStatus(worst, wh.Status.Status)
+				}
+			}
+		}
+		return healthStatusToComponentStatus(worst)
+	}
+	return kubernetes.ComponentHealthy
+}
+
+func (iss *IstioStatusService) mergeCachedHealthToStatus(cachedData *models.CachedHealthData) string {
+	var worst models.HealthStatus
+	for _, ah := range cachedData.AppHealth {
+		if ah != nil && ah.Status != nil {
+			if worst == "" {
+				worst = ah.Status.Status
+			} else {
+				worst = models.MergeHealthStatus(worst, ah.Status.Status)
+			}
+		}
+	}
+	for _, sh := range cachedData.ServiceHealth {
+		if sh != nil && sh.Status != nil {
+			if worst == "" {
+				worst = sh.Status.Status
+			} else {
+				worst = models.MergeHealthStatus(worst, sh.Status.Status)
+			}
+		}
+	}
+	for _, wh := range cachedData.WorkloadHealth {
+		if wh != nil && wh.Status != nil {
+			if worst == "" {
+				worst = wh.Status.Status
+			} else {
+				worst = models.MergeHealthStatus(worst, wh.Status.Status)
+			}
+		}
+	}
+	return healthStatusToComponentStatus(worst)
+}
+
+// healthStatusToComponentStatus maps models.HealthStatus to kubernetes component status string.
+func healthStatusToComponentStatus(h models.HealthStatus) string {
+	switch h {
+	case models.HealthStatusHealthy:
+		return kubernetes.ComponentHealthy
+	case models.HealthStatusNotReady:
+		return kubernetes.ComponentNotReady
+	case models.HealthStatusFailure, models.HealthStatusDegraded:
+		return kubernetes.ComponentUnhealthy
+	default:
+		return kubernetes.ComponentHealthy
+	}
+}
+
+// makeNamespaceKey creates a "cluster:namespace" key for namespace-based lookups.
+func makeNamespaceKey(cluster, namespace string) string {
+	return cluster + ":" + namespace
+}
+
+// buildNamespaceMeshMap builds efficient lookup map from mesh data to avoid repeated iterations.
+// Handles the hierarchy: multiple clusters -> each cluster can have multiple meshes -> each mesh can have multiple control planes.
+func (iss *IstioStatusService) buildNamespaceMeshMap(mesh *models.Mesh) namespaceMeshMap {
+	nsMeshMap := make(namespaceMeshMap)
+
+	for _, cp := range mesh.ControlPlanes {
+		meshId := getMeshId(&cp)
+
+		// Map control plane namespace (e.g., istio-system) - this is the most reliable mapping
+		// Components in the control plane namespace belong to that control plane's mesh
+		nsMeshMap[makeNamespaceKey(cp.Cluster.Name, cp.IstiodNamespace)] = meshId
+	}
+
+	return nsMeshMap
+}
+
+func istioCoreComponents(conf *config.Config) map[string]config.ComponentStatus {
+	components := map[string]config.ComponentStatus{}
+	cs := conf.ExternalServices.Istio.ComponentStatuses
 	for _, c := range cs.Components {
-		components[c.AppLabel] = c.IsCore
+		components[c.AppLabel] = c
 	}
 	return components
 }
 
-func (iss *IstioStatusService) getStatusOf(workloads []*models.Workload) (IstioComponentStatus, error) {
-	statusComponents := istioCoreComponents()
-	isc := IstioComponentStatus{}
+func (iss *IstioStatusService) getStatusOf(workloads []*models.Workload, cluster string, namespaceMeshMap namespaceMeshMap) kubernetes.IstioComponentStatus {
+	statusComponents := istioCoreComponents(iss.conf)
+	isc := kubernetes.IstioComponentStatus{}
+	// cf tracks which non-multicluster components (by appLabel) have been found
 	cf := map[string]bool{}
+	// mcf tracks which multicluster components (by appLabel) have been found and counts instances
+	mcf := map[string]int{}
+	// Track added components to prevent duplicates: cluster+namespace+name
+	addedComponents := make(map[string]bool)
 
 	// Map workloads there by app name
 	for _, workload := range workloads {
-		appLabel := labels.Set(workload.Labels).Get("app")
+		appLabelName, hasAppLabel := iss.conf.GetAppLabelName(workload.Labels)
+		if !hasAppLabel {
+			continue
+		}
+		appLabel := workload.Labels[appLabelName]
 		if appLabel == "" {
 			continue
 		}
 
-		isCore, found := statusComponents[appLabel]
+		stat, found := statusComponents[appLabel]
 		if !found {
 			continue
 		}
 
-		// Component found
-		cf[appLabel] = true
-
-		if status := GetWorkloadStatus(*workload); status != Healthy {
-			// Check status
-			isc = append(isc, ComponentStatus{
-				Name:   workload.Name,
-				Status: status,
-				IsCore: isCore,
-			},
-			)
+		// Determine namespace to use
+		namespace := workload.Namespace
+		if stat.Namespace != "" {
+			namespace = stat.Namespace
 		}
+
+		// Create unique key for this component to prevent duplicates
+		componentKey := strings.Join([]string{cluster, namespace, workload.Name}, ":")
+		if addedComponents[componentKey] {
+			continue
+		}
+
+		if stat.IsMultiCluster {
+			mcf[appLabel]++
+		} else {
+			// Component found
+			cf[appLabel] = true
+			// @TODO when components exists on remote clusters only but config not marked multicluster
+		}
+
+		// Get mesh ID for this component based on its namespace
+		componentMeshId := namespaceMeshMap[makeNamespaceKey(cluster, namespace)]
+
+		status := GetWorkloadStatus(*workload)
+		// Add status
+		isc = append(isc, kubernetes.ComponentStatus{
+			Cluster:   cluster,
+			Namespace: namespace,
+			Name:      workload.Name,
+			Status:    status,
+			IsCore:    stat.IsCore,
+			MeshId:    componentMeshId,
+		})
+		addedComponents[componentKey] = true
+
 	}
 
 	// Add missing deployments
 	componentNotFound := 0
-	for comp, isCore := range statusComponents {
+	for comp, stat := range statusComponents {
 		if _, found := cf[comp]; !found {
-			componentNotFound += 1
-			isc = append(isc, ComponentStatus{
-				Name:   comp,
-				Status: NotFound,
-				IsCore: isCore,
-			})
+			// @TODO for remote cluster
+			// multicluster components should exist on all clusters
+			// !mfound || number < len(iss.userClients)
+			if _, mfound := mcf[comp]; !mfound {
+				componentNotFound += 1
+				namespace := ""
+				if stat.Namespace != "" {
+					namespace = stat.Namespace
+				}
+				// Get mesh ID for missing component based on its namespace
+				componentMeshId := namespaceMeshMap[makeNamespaceKey(cluster, namespace)]
+				isc = append(isc, kubernetes.ComponentStatus{
+					Cluster:   cluster,
+					Namespace: namespace,
+					Name:      comp,
+					Status:    kubernetes.ComponentNotFound,
+					IsCore:    stat.IsCore,
+					MeshId:    componentMeshId,
+				})
+			}
 		}
 	}
 
-	// When all the deployments are missing,
-	// Warn users that their kiali config might be wrong
-	if componentNotFound == len(statusComponents) {
-		return isc, fmt.Errorf(
-			"Kiali is unable to find any Istio deployment in namespace %s. Are you sure the Istio namespace is configured correctly in Kiali?",
-			config.Get().IstioNamespace)
-	}
-
-	return isc, nil
+	return isc
 }
 
 func GetWorkloadStatus(wl models.Workload) string {
-	status := Unhealthy
+	status := kubernetes.ComponentUnhealthy
 
 	if wl.DesiredReplicas == 0 {
-		status = NotReady
+		status = kubernetes.ComponentNotReady
 	} else if wl.DesiredReplicas == wl.AvailableReplicas && wl.DesiredReplicas == wl.CurrentReplicas {
-		status = Healthy
+		status = kubernetes.ComponentHealthy
 	}
 	return status
 }
 
-func (iss *IstioStatusService) getAddonComponentStatus() IstioComponentStatus {
+func (iss *IstioStatusService) getAddonComponentStatus(ctx context.Context, cluster string) kubernetes.IstioComponentStatus {
 	var wg sync.WaitGroup
-	wg.Add(4)
+	wg.Add(5)
 
-	staChan := make(chan IstioComponentStatus, 4)
-	extServices := config.Get().ExternalServices
-	ics := IstioComponentStatus{}
+	staChan := make(chan kubernetes.IstioComponentStatus, 5)
+	extServices := iss.conf.ExternalServices
 
-	go getAddonStatus("prometheus", true, extServices.Prometheus.IsCore, &extServices.Prometheus.Auth, extServices.Prometheus.URL, extServices.Prometheus.HealthCheckUrl, staChan, &wg)
-	go getAddonStatus("grafana", extServices.Grafana.Enabled, extServices.Grafana.IsCore, &extServices.Grafana.Auth, extServices.Grafana.InClusterURL, extServices.Grafana.HealthCheckUrl, staChan, &wg)
-	go getAddonStatus("jaeger", extServices.Tracing.Enabled, extServices.Tracing.IsCore, &extServices.Tracing.Auth, extServices.Tracing.InClusterURL, extServices.Tracing.HealthCheckUrl, staChan, &wg)
+	// https://github.com/kiali/kiali/issues/6966 - use the well-known Prom healthy endpoint
+	if extServices.Prometheus.HealthCheckUrl == "" {
+		extServices.Prometheus.HealthCheckUrl = extServices.Prometheus.URL + "/-/healthy"
+	}
+
+	ics := kubernetes.IstioComponentStatus{}
+
+	go iss.getAddonStatus(cluster, "prometheus", extServices.Prometheus.Enabled, extServices.Prometheus.IsCore, &extServices.Prometheus.Auth, extServices.Prometheus.URL, extServices.Prometheus.HealthCheckUrl, staChan, &wg)
+	go iss.getAddonStatus(cluster, "grafana", extServices.Grafana.Enabled, extServices.Grafana.IsCore, &extServices.Grafana.Auth, extServices.Grafana.InternalURL, extServices.Grafana.HealthCheckUrl, staChan, &wg)
+	go iss.getAddonStatus(cluster, "perses", extServices.Perses.Enabled, extServices.Perses.IsCore, &extServices.Perses.Auth, extServices.Perses.InternalURL, extServices.Perses.HealthCheckUrl, staChan, &wg)
+	go iss.getTracingStatus(cluster, "tracing", extServices.Tracing.Enabled, extServices.Tracing.IsCore, staChan, &wg)
 
 	// Custom dashboards may use the main Prometheus config
 	customProm := extServices.CustomDashboards.Prometheus
 	if customProm.URL == "" {
 		customProm = extServices.Prometheus
 	}
-	go getAddonStatus("custom dashboards", extServices.CustomDashboards.Enabled, extServices.CustomDashboards.IsCore, &customProm.Auth, customProm.URL, customProm.HealthCheckUrl, staChan, &wg)
+	go iss.getAddonStatus(cluster, "custom dashboards", extServices.CustomDashboards.Enabled, extServices.CustomDashboards.IsCore, &customProm.Auth, customProm.URL, customProm.HealthCheckUrl, staChan, &wg)
 
 	wg.Wait()
 
 	close(staChan)
 	for stat := range staChan {
-		ics.merge(stat)
+		ics.Merge(stat)
 	}
 
 	return ics
 }
 
-func (iss *IstioStatusService) getIstiodReachingCheck() (IstioComponentStatus, error) {
-	cfg := config.Get()
-
-	istiods, err := iss.k8s.GetPods(cfg.IstioNamespace, labels.Set(map[string]string{"app": "istiod"}).String())
-	if err != nil {
-		return nil, err
-	}
-
-	healthyIstiods := make([]*core_v1.Pod, 0, len(istiods))
-	for i, istiod := range istiods {
-		if istiod.Status.Phase == "Running" {
-			healthyIstiods = append(healthyIstiods, &istiods[i])
-		}
-	}
-
-	wg := sync.WaitGroup{}
-	wg.Add(len(healthyIstiods))
-	syncChan := make(chan ComponentStatus, len(healthyIstiods))
-
-	for _, istiod := range healthyIstiods {
-		go func(name, namespace string) {
-			defer wg.Done()
-			// Using the proxy method to make sure that K8s API has access to the Istio Control Plane namespace.
-			// By proxying one Istiod, we ensure that the following connection is allowed:
-			// Kiali -> K8s API (proxy) -> istiod
-			// This scenario is no obvious for private clusters (like GKE private cluster)
-			_, err := iss.k8s.GetPodProxy(namespace, name, "/ready")
-			if err != nil {
-				syncChan <- ComponentStatus{
-					Name:   name,
-					Status: Unreachable,
-					IsCore: true,
-				}
-			}
-		}(istiod.Name, istiod.Namespace)
-	}
-
-	wg.Wait()
-	close(syncChan)
-	ics := IstioComponentStatus{}
-	for componentStatus := range syncChan {
-		ics.merge(IstioComponentStatus{componentStatus})
-	}
-
-	return ics, nil
-}
-
-func getAddonStatus(name string, enabled bool, isCore bool, auth *config.Auth, url string, healthCheckUrl string, staChan chan<- IstioComponentStatus, wg *sync.WaitGroup) {
+func (iss *IstioStatusService) getAddonStatus(cluster string, name string, enabled bool, isCore bool, auth *config.Auth, url string, healthCheckUrl string, staChan chan<- kubernetes.IstioComponentStatus, wg *sync.WaitGroup) {
 	defer wg.Done()
 
 	// When the addOn is disabled, don't perform any check
@@ -317,22 +656,48 @@ func getAddonStatus(name string, enabled bool, isCore bool, auth *config.Auth, u
 	}
 
 	if auth.UseKialiToken {
-		token, err := kubernetes.GetKialiToken()
-		if err != nil {
-			log.Errorf("Could not read the Kiali Service Account token: %v", err)
-		}
-		auth.Token = token
+		auth.Token = config.Credential(iss.userClients[cluster].GetToken())
 	}
 
+	status := kubernetes.ComponentHealthy
 	// Call the addOn service endpoint to find out whether is reachable or not
-	_, statusCode, err := httputil.HttpGet(url, auth, 10*time.Second)
+	_, statusCode, _, err := httputil.HttpGet(url, auth, 10*time.Second, nil, nil, iss.conf)
 	if err != nil || statusCode > 399 {
-		staChan <- IstioComponentStatus{
-			ComponentStatus{
-				Name:   name,
-				Status: Unreachable,
-				IsCore: isCore,
-			},
-		}
+		log.Tracef("addon health check failed: name=[%v], url=[%v], code=[%v]", name, url, statusCode)
+		status = kubernetes.ComponentUnreachable
+	}
+
+	staChan <- kubernetes.IstioComponentStatus{
+		kubernetes.ComponentStatus{
+			Cluster: cluster,
+			Name:    name,
+			Status:  status,
+			IsCore:  isCore,
+		},
+	}
+}
+
+func (iss *IstioStatusService) getTracingStatus(cluster string, name string, enabled bool, isCore bool, staChan chan<- kubernetes.IstioComponentStatus, wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	if !enabled {
+		return
+	}
+
+	status := kubernetes.ComponentHealthy
+
+	accessible, err := iss.tracing.GetStatus(context.TODO())
+	if !accessible {
+		log.Errorf("Error fetching availability of the tracing service: %v", err)
+		status = kubernetes.ComponentUnreachable
+	}
+
+	staChan <- kubernetes.IstioComponentStatus{
+		kubernetes.ComponentStatus{
+			Cluster: cluster,
+			Name:    name,
+			Status:  status,
+			IsCore:  isCore,
+		},
 	}
 }

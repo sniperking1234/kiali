@@ -1,22 +1,51 @@
 package checkers
 
 import (
-	core_v1 "k8s.io/api/core/v1"
+	networking_v1 "istio.io/client-go/pkg/apis/networking/v1"
 
 	"github.com/kiali/kiali/business/checkers/common"
 	"github.com/kiali/kiali/business/checkers/sidecars"
+	"github.com/kiali/kiali/config"
 	"github.com/kiali/kiali/kubernetes"
 	"github.com/kiali/kiali/models"
 )
 
-const SidecarCheckerType = "sidecar"
-
 type SidecarChecker struct {
-	Sidecars       []kubernetes.IstioObject
-	ServiceEntries []kubernetes.IstioObject
-	Services       []core_v1.Service
-	Namespaces     models.Namespaces
-	WorkloadList   models.WorkloadList
+	Cluster               string
+	Conf                  *config.Config
+	IdentityDomain        string
+	KubeServiceHosts      kubernetes.KubeServiceHosts
+	Namespaces            models.Namespaces
+	RootNamespaces        map[string]string
+	ServiceEntries        []*networking_v1.ServiceEntry
+	Sidecars              []*networking_v1.Sidecar
+	WorkloadsPerNamespace map[string]models.Workloads
+}
+
+// NewSidecarChecker creates a new SidecarChecker with all required fields.
+// rootNamespaces maps each namespace to its control plane's root namespace.
+func NewSidecarChecker(
+	cluster string,
+	conf *config.Config,
+	identityDomain string,
+	rootNamespaces map[string]string,
+	namespaces models.Namespaces,
+	kubeServiceHosts kubernetes.KubeServiceHosts,
+	serviceEntries []*networking_v1.ServiceEntry,
+	sidecars []*networking_v1.Sidecar,
+	workloadsPerNamespace map[string]models.Workloads,
+) SidecarChecker {
+	return SidecarChecker{
+		Cluster:               cluster,
+		Conf:                  conf,
+		IdentityDomain:        identityDomain,
+		KubeServiceHosts:      kubeServiceHosts,
+		Namespaces:            namespaces,
+		RootNamespaces:        rootNamespaces,
+		ServiceEntries:        serviceEntries,
+		Sidecars:              sidecars,
+		WorkloadsPerNamespace: workloadsPerNamespace,
+	}
 }
 
 func (s SidecarChecker) Check() models.IstioValidations {
@@ -32,7 +61,7 @@ func (s SidecarChecker) runGroupChecks() models.IstioValidations {
 	validations := models.IstioValidations{}
 
 	enabledDRCheckers := []GroupChecker{
-		common.WorkloadSelectorMultiMatchChecker(SidecarCheckerType, s.Sidecars, s.WorkloadList),
+		common.SidecarSelectorMultiMatchChecker(s.Cluster, kubernetes.Sidecars, s.Sidecars, s.WorkloadsPerNamespace),
 	}
 
 	for _, checker := range enabledDRCheckers {
@@ -52,15 +81,20 @@ func (s SidecarChecker) runIndividualChecks() models.IstioValidations {
 	return validations
 }
 
-func (s SidecarChecker) runChecks(sidecar kubernetes.IstioObject) models.IstioValidations {
-	policyName := sidecar.GetObjectMeta().Name
-	key, rrValidation := EmptyValidValidation(policyName, sidecar.GetObjectMeta().Namespace, SidecarCheckerType)
+func (s SidecarChecker) runChecks(sidecar *networking_v1.Sidecar) models.IstioValidations {
+	policyName := sidecar.Name
+	key, rrValidation := EmptyValidValidation(policyName, sidecar.Namespace, kubernetes.Sidecars, s.Cluster)
 	serviceHosts := kubernetes.ServiceEntryHostnames(s.ServiceEntries)
+	selectorLabels := make(map[string]string)
+	if sidecar.Spec.WorkloadSelector != nil {
+		selectorLabels = sidecar.Spec.WorkloadSelector.Labels
+	}
 
 	enabledCheckers := []Checker{
-		common.WorkloadSelectorNoWorkloadFoundChecker(SidecarCheckerType, sidecar, s.WorkloadList),
-		sidecars.EgressHostChecker{Sidecar: sidecar, Services: s.Services, ServiceEntries: serviceHosts},
-		sidecars.GlobalChecker{Sidecar: sidecar},
+		common.WorkloadSelectorNoWorkloadFoundChecker(kubernetes.Sidecars, sidecar.Namespace, selectorLabels, s.WorkloadsPerNamespace),
+		sidecars.EgressHostChecker{IdentityDomain: s.IdentityDomain, KubeServiceHosts: s.KubeServiceHosts, ServiceEntries: serviceHosts, Sidecar: sidecar},
+		sidecars.NewGlobalChecker(s.RootNamespaces[sidecar.Namespace], sidecar),
+		sidecars.OutboundTrafficPolicyModeChecker{Sidecar: sidecar},
 	}
 
 	for _, checker := range enabledCheckers {

@@ -3,6 +3,7 @@ package graph
 // Options.go holds the option settings for a single graph request.
 
 import (
+	"context"
 	"fmt"
 	net_http "net/http"
 	"net/url"
@@ -12,32 +13,44 @@ import (
 
 	"github.com/gorilla/mux"
 	"github.com/prometheus/common/model"
-	"k8s.io/client-go/tools/clientcmd/api"
 
 	"github.com/kiali/kiali/business"
 	"github.com/kiali/kiali/config"
+	"github.com/kiali/kiali/handlers/authentication"
 	"github.com/kiali/kiali/log"
 )
 
 // The supported vendors
 const (
-	VendorCytoscape        string = "cytoscape"
+	VendorCommon           string = "common"
 	VendorIstio            string = "istio"
-	defaultConfigVendor    string = VendorCytoscape
+	defaultConfigVendor    string = VendorCommon
 	defaultTelemetryVendor string = VendorIstio
 )
 
 const (
+	AmbientTrafficNone        string = "none"
+	AmbientTrafficTotal       string = "total"
+	AmbientTrafficWaypoint    string = "waypoint"
+	AmbientTrafficZtunnel     string = "ztunnel"
 	BoxByApp                  string = "app"
 	BoxByCluster              string = "cluster"
 	BoxByNamespace            string = "namespace"
 	BoxByNone                 string = "none"
-	NamespaceIstio            string = "istio-system"
+	RateNone                  string = "none"
+	RateReceived              string = "received" // tcp bytes received, grpc response messages, etc
+	RateRequests              string = "requests" // request count
+	RateSent                  string = "sent"     // tcp bytes sent, grpc request messages, etc
+	RateTotal                 string = "total"    // Sent+Received
+	defaultAmbientTraffic     string = AmbientTrafficTotal
 	defaultBoxBy              string = BoxByNone
 	defaultDuration           string = "10m"
 	defaultGraphType          string = GraphTypeWorkload
 	defaultIncludeIdleEdges   bool   = false
 	defaultInjectServiceNodes bool   = false
+	defaultRateGrpc           string = RateRequests
+	defaultRateHttp           string = RateRequests
+	defaultRateTcp            string = RateSent
 )
 
 const (
@@ -51,7 +64,7 @@ type NodeOptions struct {
 	AggregateValue string
 	App            string
 	Cluster        string
-	Namespace      string
+	Namespace      NamespaceInfo
 	Service        string
 	Version        string
 	Workload       string
@@ -76,13 +89,57 @@ type RequestedAppenders struct {
 	AppenderNames []string
 }
 
+type RequestedRates struct {
+	Ambient string
+	Grpc    string
+	Http    string
+	Tcp     string
+}
+
+// ClusterSensitiveKey is the recommended [string] type for maps keying on a cluster-sensitive name
+type ClusterSensitiveKey = string
+
+// GetClusterSensitiveKey returns a valid key for maps using a ClusterSensitiveKey
+func GetClusterSensitiveKey(cluster, name string) ClusterSensitiveKey {
+	return cluster + ":" + name
+}
+
+type AccessibleNamespace struct {
+	Annotations       map[string]string
+	Cluster           string
+	CreationTimestamp time.Time
+	IsAmbient         bool
+	Labels            map[string]string
+	Name              string
+}
+
+// AccessibleNamepaces is a map with Key: ClusterSensitive namespace Key, Value: *AccessibleNamespace
+type AccessibleNamespaces map[ClusterSensitiveKey]*AccessibleNamespace
+
+// HasCluster reports whether the user has at least one accessible namespace in
+// the cluster, which implies a user client exists for it. Graph appenders use
+// this to skip clusters the requesting user has no session for: a cluster-wide
+// fetch has no client to run on there and must be skipped, not fail the graph.
+func (a AccessibleNamespaces) HasCluster(cluster string) bool {
+	for _, ns := range a {
+		if ns.Cluster == cluster {
+			return true
+		}
+	}
+	return false
+}
+
 // TelemetryOptions are those supplied to Telemetry Vendors
 type TelemetryOptions struct {
-	AccessibleNamespaces map[string]time.Time
+	AccessibleNamespaces AccessibleNamespaces
 	Appenders            RequestedAppenders // requested appenders, nil if param not supplied
 	IncludeIdleEdges     bool               // include edges with request rates of 0
 	InjectServiceNodes   bool               // inject destination service nodes between source and destination nodes.
 	Namespaces           NamespaceInfoMap
+	QueryTimeProvided    bool // true if queryTime was explicitly provided (historical query, bypass cache)
+	Rates                RequestedRates
+	RefreshInterval      time.Duration // requested refresh interval for background cache updates (<= 0 no refresh)
+	SessionID            string        // unique session identifier for caching (extracted from session cookie)
 	CommonOptions
 	NodeOptions
 }
@@ -95,7 +152,7 @@ type Options struct {
 	TelemetryOptions
 }
 
-func NewOptions(r *net_http.Request) Options {
+func NewOptions(r *net_http.Request, businessLayer *business.Layer, conf *config.Config) Options {
 	// path variables (0 or more will be set)
 	vars := mux.Vars(r)
 	aggregate := vars["aggregate"]
@@ -112,9 +169,16 @@ func NewOptions(r *net_http.Request) Options {
 	var includeIdleEdges bool
 	var injectServiceNodes bool
 	var queryTime int64
+	var queryTimeProvided bool
+	var refreshInterval time.Duration
+	ambientTraffic := params.Get("ambientTraffic")
 	appenders := RequestedAppenders{All: true}
 	boxBy := params.Get("boxBy")
-	cluster := params.Get("cluster")
+
+	// Extract session ID from the request context
+	sessionID := getSessionID(r)
+	// @TODO requires refactoring to use clusterNameFromQuery
+	cluster := params.Get("clusterName")
 	configVendor := params.Get("configVendor")
 	durationString := params.Get("duration")
 	graphType := params.Get("graphType")
@@ -122,6 +186,10 @@ func NewOptions(r *net_http.Request) Options {
 	injectServiceNodesString := params.Get("injectServiceNodes")
 	namespaces := params.Get("namespaces") // csl of namespaces
 	queryTimeString := params.Get("queryTime")
+	rateGrpc := params.Get("rateGrpc")
+	rateHttp := params.Get("rateHttp")
+	rateTcp := params.Get("rateTcp")
+	refreshIntervalString := params.Get("refreshInterval")
 	telemetryVendor := params.Get("telemetryVendor")
 
 	if _, ok := params["appenders"]; ok {
@@ -131,13 +199,12 @@ func NewOptions(r *net_http.Request) Options {
 		}
 		appenders = RequestedAppenders{All: false, AppenderNames: appenderNames}
 	}
-
 	if cluster == "" {
 		cluster = Unknown
 	}
 	if configVendor == "" {
 		configVendor = defaultConfigVendor
-	} else if configVendor != VendorCytoscape {
+	} else if configVendor != VendorCommon {
 		BadRequest(fmt.Sprintf("Invalid configVendor [%s]", configVendor))
 	}
 	if durationString == "" {
@@ -149,10 +216,15 @@ func NewOptions(r *net_http.Request) Options {
 			BadRequest(fmt.Sprintf("Invalid duration [%s]", durationString))
 		}
 	}
+
 	if graphType == "" {
 		graphType = defaultGraphType
 	} else if graphType != GraphTypeApp && graphType != GraphTypeService && graphType != GraphTypeVersionedApp && graphType != GraphTypeWorkload {
 		BadRequest(fmt.Sprintf("Invalid graphType [%s]", graphType))
+	}
+	// service graphs do not inject service nodes
+	if graphType == GraphTypeService {
+		injectServiceNodesString = "false"
 	}
 	// app node graphs require an app graph type
 	if app != "" && graphType != GraphTypeApp && graphType != GraphTypeVersionedApp {
@@ -194,13 +266,41 @@ func NewOptions(r *net_http.Request) Options {
 	}
 	if queryTimeString == "" {
 		queryTime = time.Now().Unix()
+		queryTimeProvided = false
 	} else {
 		var queryTimeErr error
 		queryTime, queryTimeErr = strconv.ParseInt(queryTimeString, 10, 64)
 		if queryTimeErr != nil {
 			BadRequest(fmt.Sprintf("Invalid queryTime [%s]", queryTimeString))
 		}
+		queryTimeProvided = true // Client requested specific time (historical query)
 	}
+	if refreshIntervalString == "" {
+		if parsed, err := time.ParseDuration(conf.KialiInternal.GraphCache.RefreshInterval); err == nil {
+			refreshInterval = parsed
+		} else {
+			refreshInterval = -1 // Let invalid config just act like disable
+		}
+	} else {
+		refreshMillis, refreshErr := strconv.ParseInt(refreshIntervalString, 10, 64)
+		if refreshErr != nil {
+			BadRequest(fmt.Sprintf("Invalid refresh interval [%s]", refreshIntervalString))
+		}
+		// Negative or zero means disable caching for this request
+		if refreshMillis <= 0 {
+			refreshInterval = -1 // Special value to indicate cache bypass
+		} else {
+			refreshInterval = time.Duration(refreshMillis) * time.Millisecond
+			// Sanity check: minimum 10 seconds, maximum 15 minutes
+			if refreshInterval < 10*time.Second {
+				BadRequest("Refresh interval must be at least 10000ms (10 seconds), or 0 to disable caching")
+			}
+			if refreshInterval > 15*time.Minute {
+				BadRequest("Refresh interval must not exceed 900000ms (15 minutes)")
+			}
+		}
+	}
+	// Note: refreshInterval <= 0 means disable caching (bypass)
 	if telemetryVendor == "" {
 		telemetryVendor = defaultTelemetryVendor
 	} else if telemetryVendor != VendorIstio {
@@ -209,20 +309,7 @@ func NewOptions(r *net_http.Request) Options {
 
 	// Process namespaces options:
 	namespaceMap := NewNamespaceInfoMap()
-
-	authInfoContext := r.Context().Value("authInfo")
-	var authInfo *api.AuthInfo
-	if authInfoContext != nil {
-		if authInfoCheck, ok := authInfoContext.(*api.AuthInfo); !ok {
-			Error("authInfo is not of type *api.AuthInfo")
-		} else {
-			authInfo = authInfoCheck
-		}
-	} else {
-		Error("token missing in request context")
-	}
-
-	accessibleNamespaces := getAccessibleNamespaces(authInfo)
+	accessibleNamespaces := getAccessibleNamespaces(r.Context(), &businessLayer.Namespace)
 
 	// If path variable is set then it is the only relevant namespace (it's a node graph)
 	// Else if namespaces query param is set it specifies the relevant namespaces
@@ -232,19 +319,97 @@ func NewOptions(r *net_http.Request) Options {
 	}
 
 	if namespaces == "" {
-		BadRequest(fmt.Sprintf("At least one namespace must be specified via the namespaces query parameter."))
+		BadRequest("At least one namespace must be specified via the namespaces query parameter.")
 	}
 
-	for _, namespaceToken := range strings.Split(namespaces, ",") {
-		namespaceToken = strings.TrimSpace(namespaceToken)
-		if creationTime, found := accessibleNamespaces[namespaceToken]; found {
-			namespaceMap[namespaceToken] = NamespaceInfo{
-				Name:     namespaceToken,
-				Duration: getSafeNamespaceDuration(namespaceToken, creationTime, time.Duration(duration), queryTime),
-				IsIstio:  config.IsIstioNamespace(namespaceToken),
+	for _, namespaceName := range strings.Split(namespaces, ",") {
+		namespaceName = strings.TrimSpace(namespaceName)
+		var earliestCreationTimestamp *time.Time
+		var isAmbient bool
+		for _, an := range accessibleNamespaces {
+			if namespaceName == an.Name {
+				if nil == earliestCreationTimestamp || earliestCreationTimestamp.After(an.CreationTimestamp) {
+					earliestCreationTimestamp = &an.CreationTimestamp
+				}
+				isAmbient = an.IsAmbient
 			}
+		}
+		if nil == earliestCreationTimestamp {
+			Forbidden(fmt.Sprintf("Requested namespace [%s] is not accessible.", namespaceName))
 		} else {
-			Forbidden(fmt.Sprintf("Requested namespace [%s] is not accessible.", namespaceToken))
+			namespaceMap[namespaceName] = NamespaceInfo{
+				Name:      namespaceName,
+				Duration:  getSafeNamespaceDuration(r.Context(), namespaceName, *earliestCreationTimestamp, time.Duration(duration), queryTime),
+				IsAmbient: isAmbient,
+				IsIstio:   businessLayer.Mesh.IsControlPlane(r.Context(), "", namespaceName),
+			}
+		}
+	}
+
+	// Process Rate Options
+
+	rates := RequestedRates{
+		Ambient: defaultAmbientTraffic,
+		Grpc:    defaultRateGrpc,
+		Http:    defaultRateHttp,
+		Tcp:     defaultRateTcp,
+	}
+
+	if ambientTraffic != "" {
+		switch ambientTraffic {
+		case AmbientTrafficNone:
+			rates.Ambient = AmbientTrafficNone
+		case AmbientTrafficTotal:
+			rates.Ambient = AmbientTrafficTotal
+		case AmbientTrafficWaypoint:
+			rates.Ambient = AmbientTrafficWaypoint
+		case AmbientTrafficZtunnel:
+			rates.Ambient = AmbientTrafficZtunnel
+		default:
+			BadRequest(fmt.Sprintf("Invalid Ambient Traffic [%s]", rates.Ambient))
+		}
+	}
+
+	if rateGrpc != "" {
+		switch rateGrpc {
+		case RateNone:
+			rates.Grpc = RateNone
+		case RateReceived:
+			rates.Grpc = RateReceived
+		case RateRequests:
+			rates.Grpc = RateRequests
+		case RateSent:
+			rates.Grpc = RateSent
+		case RateTotal:
+			rates.Grpc = RateTotal
+		default:
+			BadRequest(fmt.Sprintf("Invalid gRPC Rate [%s]", rateGrpc))
+		}
+	}
+
+	if rateHttp != "" {
+		switch rateHttp {
+		case RateNone:
+			rates.Http = RateNone
+		case RateRequests:
+			rates.Http = RateRequests
+		default:
+			BadRequest(fmt.Sprintf("Invalid HTTP Rate [%s]", rateHttp))
+		}
+	}
+
+	if rateTcp != "" {
+		switch rateTcp {
+		case RateNone:
+			rates.Tcp = RateNone
+		case RateReceived:
+			rates.Tcp = RateReceived
+		case RateSent:
+			rates.Tcp = RateSent
+		case RateTotal:
+			rates.Tcp = RateTotal
+		default:
+			BadRequest(fmt.Sprintf("Invalid TCP Rate [%s]", rateTcp))
 		}
 	}
 
@@ -271,6 +436,10 @@ func NewOptions(r *net_http.Request) Options {
 			IncludeIdleEdges:     includeIdleEdges,
 			InjectServiceNodes:   injectServiceNodes,
 			Namespaces:           namespaceMap,
+			QueryTimeProvided:    queryTimeProvided,
+			Rates:                rates,
+			RefreshInterval:      refreshInterval,
+			SessionID:            sessionID,
 			CommonOptions: CommonOptions{
 				Duration:  time.Duration(duration),
 				GraphType: graphType,
@@ -282,7 +451,7 @@ func NewOptions(r *net_http.Request) Options {
 				AggregateValue: aggregateValue,
 				App:            app,
 				Cluster:        cluster,
-				Namespace:      namespace,
+				Namespace:      namespaceMap[namespace],
 				Service:        service,
 				Version:        version,
 				Workload:       workload,
@@ -293,12 +462,21 @@ func NewOptions(r *net_http.Request) Options {
 	return options
 }
 
+// getSessionID retrieves the session ID from the request context.
+// The session ID is set by AuthenticationHandler.Handle for all auth strategies:
+// - For authenticated strategies: the unique session ID from the session cookie
+// - For anonymous strategy: the shared AnonymousSessionID constant
+// - Returns empty string for 3rd-party auth (e.g., OpenShift Bearer header/oauth_token)
+func getSessionID(r *net_http.Request) string {
+	return authentication.GetSessionIDContext(r.Context())
+}
+
 // GetGraphKind will return the kind of graph represented by the options.
 func (o *TelemetryOptions) GetGraphKind() string {
-	if o.NodeOptions.App != "" ||
-		o.NodeOptions.Version != "" ||
-		o.NodeOptions.Workload != "" ||
-		o.NodeOptions.Service != "" {
+	if o.App != "" ||
+		o.Version != "" ||
+		o.Workload != "" ||
+		o.Service != "" {
 		return graphKindNode
 	}
 	return graphKindNamespace
@@ -308,28 +486,31 @@ func (o *TelemetryOptions) GetGraphKind() string {
 // The Set is implemented using the map convention. Each map entry is set to the
 // creation timestamp of the namespace, to be used to ensure valid time ranges for
 // queries against the namespace.
-func getAccessibleNamespaces(authInfo *api.AuthInfo) map[string]time.Time {
-	// Get the namespaces
-	business, err := business.Get(authInfo)
-	CheckError(err)
-
-	namespaces, err := business.Namespace.GetNamespaces()
+func getAccessibleNamespaces(ctx context.Context, namespacesService *business.NamespaceService) AccessibleNamespaces {
+	namespaces, err := namespacesService.GetNamespaces(ctx)
 	CheckError(err)
 
 	// Create a map to store the namespaces
-	namespaceMap := make(map[string]time.Time)
+	accessibleNamespaces := make(AccessibleNamespaces)
 	for _, namespace := range namespaces {
-		namespaceMap[namespace.Name] = namespace.CreationTimestamp
+		accessibleNamespaces[GetClusterSensitiveKey(namespace.Cluster, namespace.Name)] = &AccessibleNamespace{
+			Annotations:       namespace.Annotations,
+			Cluster:           namespace.Cluster,
+			CreationTimestamp: namespace.CreationTimestamp,
+			IsAmbient:         namespace.IsAmbient,
+			Labels:            namespace.Labels,
+			Name:              namespace.Name,
+		}
 	}
 
-	return namespaceMap
+	return accessibleNamespaces
 }
 
 // getSafeNamespaceDuration returns a safe duration for the query. If queryTime-requestedDuration > namespace
 // creation time just return the requestedDuration.  Otherwise reduce the duration as needed to ensure the
 // namespace existed for the entire time range.  An error is generated if no safe duration exists (i.e. the
 // queryTime precedes the namespace).
-func getSafeNamespaceDuration(ns string, nsCreationTime time.Time, requestedDuration time.Duration, queryTime int64) time.Duration {
+func getSafeNamespaceDuration(ctx context.Context, ns string, nsCreationTime time.Time, requestedDuration time.Duration, queryTime int64) time.Duration {
 	var endTime time.Time
 	safeDuration := requestedDuration
 
@@ -347,7 +528,7 @@ func getSafeNamespaceDuration(ns string, nsCreationTime time.Time, requestedDura
 
 		if nsLifetime < safeDuration {
 			safeDuration = nsLifetime
-			log.Debugf("Reducing requestedDuration [%v] to safeDuration [%v]", requestedDuration, safeDuration)
+			log.FromContext(ctx).Debug().Msgf("Reducing requestedDuration [%v] to safeDuration [%v]", requestedDuration, safeDuration)
 		}
 	}
 

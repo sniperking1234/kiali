@@ -2,11 +2,12 @@ package kubernetes
 
 import (
 	"fmt"
-	"reflect"
 	"strings"
 
+	networking_v1 "istio.io/client-go/pkg/apis/networking/v1"
 	core_v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	k8s_networking_v1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
 
 	"github.com/kiali/kiali/config"
 )
@@ -22,11 +23,9 @@ type Host struct {
 	CompleteInput bool `json:"complete_input"`
 }
 
-// ParseHost takes as an input a hostname (simple or full FQDN), namespace and clusterName and returns a parsed Host struct
-func ParseHost(hostName, namespace, cluster string) Host {
-	if cluster == "" {
-		cluster = config.Get().ExternalServices.Istio.IstioIdentityDomain
-	}
+// ParseHost takes as an input a hostname (simple or full FQDN), namespace and identityDomain and returns a parsed Host struct
+func ParseHost(hostName, namespace, identityDomain string) Host {
+	cluster := identityDomain
 
 	domainParts := strings.Split(hostName, ".")
 	host := Host{
@@ -60,7 +59,9 @@ func ParseHost(hostName, namespace, cluster string) Host {
 
 // GetHost parses hostName and returns a Host struct. It considers Namespaces in the cluster to be more accurate
 // when deciding if the hostName is a ServiceEntry or a service.namespace host definition.
-func GetHost(hostName, namespace, cluster string, clusterNamespaces []string) Host {
+func GetHost(hostName, namespace string, clusterNamespaces []string, identityDomain string) Host {
+	cluster := identityDomain
+
 	hParts := strings.Split(hostName, ".")
 	// It might be a service entry or a 2-format host specification
 	if len(hParts) == 2 {
@@ -76,7 +77,17 @@ func GetHost(hostName, namespace, cluster string, clusterNamespaces []string) Ho
 		}
 	}
 
-	return ParseHost(hostName, namespace, cluster)
+	// Case where it's a short name with the format <service>.<namespace>.svc
+	if len(hParts) == 3 && hParts[2] == "svc" {
+		return Host{
+			Service:       hParts[0],
+			Namespace:     hParts[1],
+			Cluster:       cluster,
+			CompleteInput: true,
+		}
+	}
+
+	return ParseHost(hostName, namespace, identityDomain)
 }
 
 func includes(nss []string, namespace string) bool {
@@ -103,6 +114,10 @@ func (h Host) String() string {
 	return hostname
 }
 
+func (h Host) IsWildcard() bool {
+	return strings.HasPrefix(h.Service, "*")
+}
+
 func ParseTwoPartHost(host Host) (string, string) {
 	localSvc, localNs := host.Service, host.Namespace
 	if !host.CompleteInput {
@@ -115,13 +130,13 @@ func ParseTwoPartHost(host Host) (string, string) {
 	return localSvc, localNs
 }
 
-func HasMatchingWorkloads(service string, workloadList []labels.Set) bool {
-	appLabel := config.Get().IstioLabels.AppLabelName
-
+func HasMatchingWorkloads(service string, workloadList []labels.Set, conf *config.Config) bool {
 	// Check Workloads
 	for _, wl := range workloadList {
-		if service == wl.Get(appLabel) {
-			return true
+		if appLabelName, found := conf.GetAppLabelName(wl); found {
+			if service == wl.Get(appLabelName) {
+				return true
+			}
 		}
 	}
 
@@ -155,23 +170,13 @@ func HasMatchingServiceEntries(service string, serviceEntries map[string][]strin
 	return false
 }
 
-func HasMatchingVirtualServices(host Host, virtualServices []IstioObject) bool {
+func HasMatchingVirtualServices(host Host, virtualServices []*networking_v1.VirtualService, identityDomain string) bool {
+	vHostTwoParts := fmt.Sprintf("%s.%s", host.Service, host.Namespace)
+	vHostFqdnNoWild := fmt.Sprintf("%s.%s.%s", host.Service, host.Namespace, identityDomain)
+	vHostFqdnWild := fmt.Sprintf("*.%s.%s", host.Namespace, identityDomain)
 	for _, vs := range virtualServices {
-		rawHosts, found := vs.GetSpec()["hosts"]
-		if !found {
-			continue
-		}
-
-		slice := reflect.ValueOf(rawHosts)
-		if slice.Kind() != reflect.Slice {
-			continue
-		}
-
-		for hostIdx := 0; hostIdx < slice.Len(); hostIdx++ {
-			vHost, ok := slice.Index(hostIdx).Interface().(string)
-			if !ok {
-				continue
-			}
+		for hostIdx := 0; hostIdx < len(vs.Spec.Hosts); hostIdx++ {
+			vHost := vs.Spec.Hosts[hostIdx]
 
 			// vHost is wildcard, then any host fit in
 			if vHost == "*" {
@@ -179,27 +184,27 @@ func HasMatchingVirtualServices(host Host, virtualServices []IstioObject) bool {
 			}
 
 			// vHost is simple name (namespaces should match)
-			if vHost == host.Service && vs.GetObjectMeta().Namespace == host.Namespace {
+			if vHost == host.Service && vs.Namespace == host.Namespace {
 				return true
 			}
 
 			// vHost twoparts name
-			if vHost == fmt.Sprintf("%s.%s", host.Service, host.Namespace) {
+			if vHost == vHostTwoParts {
 				return true
 			}
 
 			// vHost FQDN (no-wildcarded)
-			if vHost == fmt.Sprintf("%s.%s.%s", host.Service, host.Namespace, config.Get().ExternalServices.Istio.IstioIdentityDomain) {
+			if vHost == vHostFqdnNoWild {
 				return true
 			}
 
 			// vHost if wildcard FQDN
-			if vHost == fmt.Sprintf("*.%s.%s", host.Namespace, config.Get().ExternalServices.Istio.IstioIdentityDomain) {
+			if vHost == vHostFqdnWild {
 				return true
 			}
 
 			// Non-internal service name
-			hostS := ParseHost(vHost, vs.GetObjectMeta().Namespace, vs.GetObjectMeta().ClusterName)
+			hostS := ParseHost(vHost, vs.Namespace, identityDomain)
 			if hostS.Service == host.Service && hostS.CompleteInput == host.CompleteInput && !hostS.CompleteInput {
 				return true
 			}
@@ -214,15 +219,47 @@ func HasMatchingVirtualServices(host Host, virtualServices []IstioObject) bool {
 	return false
 }
 
-func HostWithinWildcardHost(subdomain, wildcardDomain string) bool {
-	if !strings.HasPrefix(wildcardDomain, "*") {
-		return false
+// HasMatchingReferenceGrant returns true when any From entry matches fromNamespace/fromKind
+// and any To entry matches toKind for a ReferenceGrant in toNamespace.
+func HasMatchingReferenceGrant(fromNamespace string, toNamespace string, fromKind string, toKind string, referenceGrants []*k8s_networking_v1beta1.ReferenceGrant) bool {
+	for _, rGrant := range referenceGrants {
+		if rGrant == nil || rGrant.Namespace != toNamespace {
+			continue
+		}
+		fromMatch := false
+		for _, from := range rGrant.Spec.From {
+			if string(from.Namespace) == fromNamespace && string(from.Kind) == fromKind {
+				fromMatch = true
+				break
+			}
+		}
+		if !fromMatch {
+			continue
+		}
+		for _, to := range rGrant.Spec.To {
+			if string(to.Kind) == toKind {
+				return true
+			}
+		}
 	}
-
-	return len(wildcardDomain) > 2 && strings.HasSuffix(subdomain, wildcardDomain[2:])
+	return false
 }
 
-func ParseGatewayAsHost(gateway, currentNamespace, currentCluster string) Host {
+func HostWithinWildcardHost(subdomain, wildcardDomain string) bool {
+	if wildcardDomain == "*" {
+		return true
+	}
+	// "*.suffix" only — require a DNS-label boundary so "*.test.svc..." does not
+	// match "...istio-test.svc..." (suffix of the namespace label).
+	if !strings.HasPrefix(wildcardDomain, "*.") {
+		return false
+	}
+	return strings.HasSuffix(subdomain, wildcardDomain[1:])
+}
+
+func ParseGatewayAsHost(gateway, currentNamespace, identityDomain string) Host {
+	currentCluster := identityDomain
+
 	host := Host{
 		Service:       gateway,
 		Namespace:     currentNamespace,

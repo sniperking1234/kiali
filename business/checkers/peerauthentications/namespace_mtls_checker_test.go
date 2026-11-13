@@ -4,11 +4,14 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	networking_v1 "istio.io/client-go/pkg/apis/networking/v1"
+	security_v1 "istio.io/client-go/pkg/apis/security/v1"
 
 	"github.com/kiali/kiali/config"
 	"github.com/kiali/kiali/kubernetes"
 	"github.com/kiali/kiali/models"
 	"github.com/kiali/kiali/tests/data"
+	"github.com/kiali/kiali/tests/testutils/validations"
 )
 
 // Describe the validation of a PeerAuthn that enables mTLS for one namespace. The validation is risen when there isn't any
@@ -24,25 +27,26 @@ func TestPeerAuthnmTLSEnabled(t *testing.T) {
 
 	policy := data.CreateEmptyPeerAuthentication("default", "bar", data.CreateMTLS("STRICT"))
 	mTLSDetails := kubernetes.MTLSDetails{
-		DestinationRules: []kubernetes.IstioObject{
+		DestinationRules: []*networking_v1.DestinationRule{
 			data.CreateEmptyDestinationRule("bar", "default", "*.bar.svc.cluster.local"),
 		},
 	}
 
-	validations, valid := NamespaceMtlsChecker{
-		PeerAuthn:   policy,
-		MTLSDetails: mTLSDetails,
+	vals, valid := NamespaceMtlsChecker{
+		IdentityDomain: "svc.cluster.local",
+		PeerAuthn:      policy,
+		MTLSDetails:    mTLSDetails,
 	}.Check()
 
-	assert.NotEmpty(validations)
-	assert.Equal(1, len(validations))
+	assert.NotEmpty(vals)
+	assert.Equal(1, len(vals))
 	assert.False(valid)
 
-	validation := validations[0]
+	validation := vals[0]
 	assert.NotNil(validation)
 	assert.Equal(models.ErrorSeverity, validation.Severity)
 	assert.Equal("spec/mtls", validation.Path)
-	assert.Equal(models.CheckMessage("peerauthentications.mtls.destinationrulemissing"), validation.Message)
+	assert.NoError(validations.ConfirmIstioCheckMessage("peerauthentications.mtls.destinationrulemissing", validation))
 }
 
 // Context: PeerAuthn enables mTLS for a namespace
@@ -51,7 +55,7 @@ func TestPeerAuthnmTLSEnabled(t *testing.T) {
 func TestPolicyEnabledDRmTLSEnabled(t *testing.T) {
 	peerAuthn := data.CreateEmptyPeerAuthentication("default", "bar", data.CreateMTLS("STRICT"))
 	mTLSDetails := kubernetes.MTLSDetails{
-		DestinationRules: []kubernetes.IstioObject{
+		DestinationRules: []*networking_v1.DestinationRule{
 			data.AddTrafficPolicyToDestinationRule(data.CreateMTLSTrafficPolicyForDestinationRules(),
 				data.CreateEmptyDestinationRule("bar", "default", "*.bar.svc.cluster.local")),
 		},
@@ -68,7 +72,7 @@ func TestPolicyEnabledDRmTLSMeshWideEnabled(t *testing.T) {
 	peerAuthn := data.CreateEmptyPeerAuthentication("default", "bar", data.CreateMTLS("STRICT"))
 
 	mTLSDetails := kubernetes.MTLSDetails{
-		DestinationRules: []kubernetes.IstioObject{
+		DestinationRules: []*networking_v1.DestinationRule{
 			data.AddTrafficPolicyToDestinationRule(data.CreateMTLSTrafficPolicyForDestinationRules(),
 				data.CreateEmptyDestinationRule("bar", "default", "*.local")),
 		},
@@ -84,23 +88,43 @@ func TestPolicyEnabledDRmTLSMeshWideEnabled(t *testing.T) {
 func TestPolicyPermissive(t *testing.T) {
 	peerAuthn := data.CreateEmptyPeerAuthentication("default", "bar", data.CreateMTLS("PERMISSIVE"))
 	mTLSDetails := kubernetes.MTLSDetails{
-		DestinationRules: []kubernetes.IstioObject{
+		DestinationRules: []*networking_v1.DestinationRule{
 			data.CreateEmptyDestinationRule("bar", "default", "*.bar.svc.cluster.local"),
 		},
 	}
 	assertNoValidations(t, peerAuthn, mTLSDetails)
 }
 
-func assertNoValidations(t *testing.T, peerAuth kubernetes.IstioObject, mTLSDetails kubernetes.MTLSDetails) {
+func assertNoValidations(t *testing.T, peerAuth *security_v1.PeerAuthentication, mTLSDetails kubernetes.MTLSDetails) {
 	assert := assert.New(t)
 	conf := config.NewConfig()
 	config.Set(conf)
 
-	validations, valid := NamespaceMtlsChecker{
-		PeerAuthn:   peerAuth,
+	vals, valid := NamespaceMtlsChecker{
+		IdentityDomain: "svc.cluster.local",
+		PeerAuthn:      peerAuth,
+		MTLSDetails:    mTLSDetails,
+	}.Check()
+
+	assert.Empty(vals)
+	assert.True(valid)
+}
+
+func TestNoNamespaceWideValidationsAddedWhenStrictAndAutoMtlsEnabled(t *testing.T) {
+	assert := assert.New(t)
+
+	meshPolicy := data.CreateEmptyMeshPeerAuthentication("default", data.CreateMTLS("STRICT"))
+	mTLSDetails := kubernetes.MTLSDetails{
+		DestinationRules: []*networking_v1.DestinationRule{},
+		EnabledAutoMtls:  true,
+	}
+
+	vals, valid := MeshMtlsChecker{
+		MeshPolicy:  meshPolicy,
 		MTLSDetails: mTLSDetails,
 	}.Check()
 
-	assert.Empty(validations)
+	assert.Empty(vals)
 	assert.True(valid)
+
 }

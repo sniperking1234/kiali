@@ -6,24 +6,61 @@ import (
 	"github.com/kiali/kiali/log"
 )
 
-// NamespaceAppHealth is an alias of map of app name x health
+// ClustersNamespaceHealth is a map NamespaceHealth for namespaces of given clusters
+type ClustersNamespaceHealth struct {
+	AppHealth       map[string]*NamespaceAppHealth       `json:"namespaceAppHealth,omitempty"`
+	NamespaceHealth map[string]*NamespaceHealthAggregate `json:"namespaceHealth,omitempty"`
+	ServiceHealth   map[string]*NamespaceServiceHealth   `json:"namespaceServiceHealth,omitempty"`
+	WorkloadHealth  map[string]*NamespaceWorkloadHealth  `json:"namespaceWorkloadHealth,omitempty"`
+}
+
+// NamespaceHealthBucket buckets entity names by health status (matches frontend NamespaceStatus)
+type NamespaceHealthBucket struct {
+	InError      []string `json:"inError"`
+	InNotReady   []string `json:"inNotReady"`
+	InSuccess    []string `json:"inSuccess"`
+	InWarning    []string `json:"inWarning"`
+	NotAvailable []string `json:"notAvailable"`
+}
+
+// NamespaceHealthAggregate is the pre-aggregated namespace health returned with cluster health (matches frontend)
+type NamespaceHealthAggregate struct {
+	StatusApp      *NamespaceHealthBucket `json:"statusApp,omitempty"`
+	StatusService  *NamespaceHealthBucket `json:"statusService,omitempty"`
+	StatusWorkload *NamespaceHealthBucket `json:"statusWorkload,omitempty"`
+	WorstStatus    string                 `json:"worstStatus"`
+}
+
+// NamespaceAppsHealth is a list of app name x health for a given namespace
 type NamespaceAppHealth map[string]*AppHealth
 
-// NamespaceServiceHealth is an alias of map of service name x health
+// NamespaceServicesHealth is a list of service name x health for a given namespace
 type NamespaceServiceHealth map[string]*ServiceHealth
 
-// NamespaceWorkloadHealth is an alias of map of workload name x health
+// NamespaceWorkloadsHealth is a list of workload name x health for a given namespace
 type NamespaceWorkloadHealth map[string]*WorkloadHealth
+
+// CalculatedHealthStatus represents the calculated health status with additional context
+// This is populated by the backend's health calculation logic.
+type CalculatedHealthStatus struct {
+	ErrorRatio       float64      `json:"errorRatio,omitempty"`       // Actual error ratio as percentage (0-100)
+	Status           HealthStatus `json:"status"`                     // Calculated health status (Healthy, Degraded, Failure, NotReady, NA)
+	TotalRequestRate float64      `json:"totalRequestRate,omitempty"` // Total request rate (req/s) from inbound and outbound traffic
+}
 
 // ServiceHealth contains aggregated health from various sources, for a given service
 type ServiceHealth struct {
 	Requests RequestHealth `json:"requests"`
+	// Status is the calculated health status. Populated by the backend when available.
+	Status *CalculatedHealthStatus `json:"status,omitempty"`
 }
 
 // AppHealth contains aggregated health from various sources, for a given app
 type AppHealth struct {
-	WorkloadStatuses []*WorkloadStatus `json:"workloadStatuses"`
-	Requests         RequestHealth     `json:"requests"`
+	Requests RequestHealth `json:"requests"`
+	// Status is the calculated health status. Populated by the backend when available.
+	Status           *CalculatedHealthStatus `json:"status,omitempty"`
+	WorkloadStatuses []*WorkloadStatus       `json:"workloadStatuses"`
 }
 
 func NewEmptyRequestHealth() RequestHealth {
@@ -54,14 +91,17 @@ func EmptyServiceHealth() ServiceHealth {
 // EmptyWorkloadHealth create an empty WorkloadHealth
 func EmptyWorkloadHealth() *WorkloadHealth {
 	return &WorkloadHealth{
-		Requests: NewEmptyRequestHealth(),
+		Requests:       NewEmptyRequestHealth(),
+		WorkloadStatus: nil,
 	}
 }
 
 // WorkloadHealth contains aggregated health from various sources, for a given workload
 type WorkloadHealth struct {
-	WorkloadStatus *WorkloadStatus `json:"workloadStatus"`
-	Requests       RequestHealth   `json:"requests"`
+	Requests RequestHealth `json:"requests"`
+	// Status is the calculated health status. Populated by the backend when available.
+	Status         *CalculatedHealthStatus `json:"status,omitempty"`
+	WorkloadStatus *WorkloadStatus         `json:"workloadStatus"`
 }
 
 // WorkloadStatus gives
@@ -71,13 +111,13 @@ type WorkloadHealth struct {
 // In healthy scenarios all variables should point same value.
 // When something wrong happens the different values can indicate an unhealthy situation.
 // i.e.
-// 	desired = 1, current = 10, available = 0 would means that a user scaled down a workload from 10 to 1
-//  but in the operaton 10 pods showed problems, so no pod is available/ready but user will see 10 pods under a workload
+// - desired = 1, current = 10, available = 0 would means that a user scaled down a workload from 10 to 1
+// - but in the operaton 10 pods showed problems, so no pod is available/ready but user will see 10 pods under a workload
 type WorkloadStatus struct {
-	Name              string `json:"name"`
-	DesiredReplicas   int32  `json:"desiredReplicas"`
-	CurrentReplicas   int32  `json:"currentReplicas"`
 	AvailableReplicas int32  `json:"availableReplicas"`
+	CurrentReplicas   int32  `json:"currentReplicas"`
+	DesiredReplicas   int32  `json:"desiredReplicas"`
+	Name              string `json:"name"`
 	SyncedProxies     int32  `json:"syncedProxies"`
 }
 
@@ -93,13 +133,13 @@ type ProxyStatus struct {
 
 // RequestHealth holds several stats about recent request errors
 // - Inbound//Outbound are the rates of requests by protocol and status_code.
-//   Example:   Inbound: { "http": {"200": 1.5, "400": 2.3}, "grpc": {"1": 1.2} }
+// Example:   Inbound: { "http": {"200": 1.5, "400": 2.3}, "grpc": {"1": 1.2} }
 type RequestHealth struct {
+	HealthAnnotations  map[string]string             `json:"healthAnnotations"`
 	Inbound            map[string]map[string]float64 `json:"inbound"`
 	Outbound           map[string]map[string]float64 `json:"outbound"`
-	HealthAnnotations  map[string]string             `json:"healthAnnotations"`
-	inboundSource      map[string]map[string]float64
 	inboundDestination map[string]map[string]float64
+	inboundSource      map[string]map[string]float64
 }
 
 // AggregateInbound adds the provided metric sample to internal inbound counters and updates error ratios
@@ -109,7 +149,7 @@ func (in *RequestHealth) AggregateInbound(sample *model.Sample) {
 	switch reporter {
 	case "source":
 		aggregate(sample, in.inboundSource)
-	case "destination":
+	case "destination", "waypoint":
 		aggregate(sample, in.inboundDestination)
 	default:
 		log.Tracef("Inbound metric without reporter %v ", sample)
@@ -119,9 +159,9 @@ func (in *RequestHealth) AggregateInbound(sample *model.Sample) {
 
 // AggregateOutbound adds the provided metric sample to internal outbound counters and updates error ratios
 func (in *RequestHealth) AggregateOutbound(sample *model.Sample) {
-	// Outbound traffic will be aggregated per source reporter
+	// Outbound traffic is reported by sidecars and ztunnels as source, or by a destination waypoint.
 	reporter := string(sample.Metric[model.LabelName("reporter")])
-	if reporter == "source" {
+	if reporter == "source" || reporter == "waypoint" {
 		aggregate(sample, in.Outbound)
 	}
 }
@@ -172,20 +212,18 @@ func aggregate(sample *model.Sample, requests map[string]map[string]float64) {
 			code = string(grpcStatus)
 		}
 	}
+
 	if _, ok := requests[protocol]; !ok {
 		requests[protocol] = make(map[string]float64)
 	}
-	if _, ok := requests[protocol][code]; ok {
-		requests[protocol][code] += float64(sample.Value)
-	} else {
-		requests[protocol][code] = float64(sample.Value)
-	}
+
+	requests[protocol][code] += float64(sample.Value)
 }
 
 // CastWorkloadStatus returns a WorkloadStatus out of a given Workload
 func (w Workload) CastWorkloadStatus() *WorkloadStatus {
 	syncedProxies := int32(-1)
-	if w.HasIstioSidecar() {
+	if w.HasIstioSidecar() && !w.IsGatewayWorkload() {
 		syncedProxies = w.Pods.SyncedPodProxiesCount()
 	}
 
@@ -216,4 +254,149 @@ func (ps ProxyStatus) IsSynced() bool {
 // isComponentStatusSynced returns true when componentStatus is Synced
 func isComponentStatusSynced(componentStatus string) bool {
 	return componentStatus == "Synced"
+}
+
+// newNamespaceHealthBucket returns a bucket with all slices initialized so JSON never marshals null.
+func newNamespaceHealthBucket() *NamespaceHealthBucket {
+	return &NamespaceHealthBucket{
+		InError:      []string{},
+		InNotReady:   []string{},
+		InSuccess:    []string{},
+		InWarning:    []string{},
+		NotAvailable: []string{},
+	}
+}
+
+// bucketFromAppHealth builds a NamespaceHealthBucket from app health map
+func bucketFromAppHealth(m NamespaceAppHealth) *NamespaceHealthBucket {
+	if m == nil {
+		return nil
+	}
+	b := newNamespaceHealthBucket()
+	for name, ah := range m {
+		if ah == nil || ah.Status == nil {
+			b.NotAvailable = append(b.NotAvailable, name)
+			continue
+		}
+		switch ah.Status.Status {
+		case HealthStatusFailure:
+			b.InError = append(b.InError, name)
+		case HealthStatusDegraded:
+			b.InWarning = append(b.InWarning, name)
+		case HealthStatusHealthy:
+			b.InSuccess = append(b.InSuccess, name)
+		case HealthStatusNotReady:
+			b.InNotReady = append(b.InNotReady, name)
+		default:
+			b.NotAvailable = append(b.NotAvailable, name)
+		}
+	}
+	return b
+}
+
+// bucketFromServiceHealth builds a NamespaceHealthBucket from service health map
+func bucketFromServiceHealth(m NamespaceServiceHealth) *NamespaceHealthBucket {
+	if m == nil {
+		return nil
+	}
+	b := newNamespaceHealthBucket()
+	for name, sh := range m {
+		if sh == nil || sh.Status == nil {
+			b.NotAvailable = append(b.NotAvailable, name)
+			continue
+		}
+		switch sh.Status.Status {
+		case HealthStatusFailure:
+			b.InError = append(b.InError, name)
+		case HealthStatusDegraded:
+			b.InWarning = append(b.InWarning, name)
+		case HealthStatusHealthy:
+			b.InSuccess = append(b.InSuccess, name)
+		case HealthStatusNotReady:
+			b.InNotReady = append(b.InNotReady, name)
+		default:
+			b.NotAvailable = append(b.NotAvailable, name)
+		}
+	}
+	return b
+}
+
+// bucketFromWorkloadHealth builds a NamespaceHealthBucket from workload health map
+func bucketFromWorkloadHealth(m NamespaceWorkloadHealth) *NamespaceHealthBucket {
+	if m == nil {
+		return nil
+	}
+	b := newNamespaceHealthBucket()
+	for name, wh := range m {
+		if wh == nil || wh.Status == nil {
+			b.NotAvailable = append(b.NotAvailable, name)
+			continue
+		}
+		switch wh.Status.Status {
+		case HealthStatusFailure:
+			b.InError = append(b.InError, name)
+		case HealthStatusDegraded:
+			b.InWarning = append(b.InWarning, name)
+		case HealthStatusHealthy:
+			b.InSuccess = append(b.InSuccess, name)
+		case HealthStatusNotReady:
+			b.InNotReady = append(b.InNotReady, name)
+		default:
+			b.NotAvailable = append(b.NotAvailable, name)
+		}
+	}
+	return b
+}
+
+// worstStatusFromBucket returns the worst HealthStatus represented in a bucket
+func worstStatusFromBucket(b *NamespaceHealthBucket) HealthStatus {
+	if b == nil {
+		return HealthStatusNA
+	}
+	if len(b.InError) > 0 {
+		return HealthStatusFailure
+	}
+	if len(b.InWarning) > 0 {
+		return HealthStatusDegraded
+	}
+	if len(b.InNotReady) > 0 {
+		return HealthStatusNotReady
+	}
+	if len(b.InSuccess) > 0 {
+		return HealthStatusHealthy
+	}
+	return HealthStatusNA
+}
+
+// AggregateNamespaceStatus derives NamespaceHealthAggregate from app, service, and workload health maps
+func AggregateNamespaceStatus(
+	appHealth *NamespaceAppHealth,
+	serviceHealth *NamespaceServiceHealth,
+	workloadHealth *NamespaceWorkloadHealth,
+) *NamespaceHealthAggregate {
+	var app NamespaceAppHealth
+	var svc NamespaceServiceHealth
+	var wl NamespaceWorkloadHealth
+	if appHealth != nil {
+		app = *appHealth
+	}
+	if serviceHealth != nil {
+		svc = *serviceHealth
+	}
+	if workloadHealth != nil {
+		wl = *workloadHealth
+	}
+	statusApp := bucketFromAppHealth(app)
+	statusService := bucketFromServiceHealth(svc)
+	statusWorkload := bucketFromWorkloadHealth(wl)
+	worst := MergeHealthStatus(
+		worstStatusFromBucket(statusApp),
+		MergeHealthStatus(worstStatusFromBucket(statusService), worstStatusFromBucket(statusWorkload)),
+	)
+	return &NamespaceHealthAggregate{
+		StatusApp:      statusApp,
+		StatusService:  statusService,
+		StatusWorkload: statusWorkload,
+		WorstStatus:    string(worst),
+	}
 }

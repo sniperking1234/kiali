@@ -3,7 +3,7 @@
 We'd love your help!
 
 Kiali is [Apache 2.0 licensed](LICENSE) and accepts contributions via GitHub
-pull requests. 
+pull requests.
 Kiali does not require any contributor agreement to submit patches.
 
 This document outlines some of the conventions on development
@@ -12,52 +12,49 @@ it easier to get your contribution accepted.
 
 We gratefully welcome improvements to documentation as well as to code.
 
-
-
 ## Making a change
 
-The Kiali code base is split into several repositories. For the application these
-are:
+Before you make a change, please:
 
-* Kiali : server part, written in Golang
-* Kiali-UI : UI part, written in Typescript, using the React framework.
-
-Bug tracking happens centrally for both repositories.
-Before you make a change, please [open an issue in GitHub](https://github.com/kiali/kiali/issues/new/choose). 
+- Open a [discussion](https://github.com/kiali/kiali/discussions) or an [issue](https://github.com/kiali/kiali/issues) describing in detail the motivation of work. Regardless of the repo where the work should be done (server, UI, operator, or helm charts), all discussions and issues should be submitted to the main kiali/kiali repo using those links provided.
+- Let the maintainers comment on the question or refine the issue.
+- Before starting work, make sure maintainers have agreed that the work should be done and has added the issue to the backlog.
+- When the design/approach/discussion is ready, prepare a Pull Request with the changes.
 
 ### Good first issues
 
-If you are new to contributing to Kiali and want to pick some easier tasks to 
+If you are new to contributing to Kiali and want to pick some easier tasks to
 get accustomed to the code base, you can pick [issues that are marked _good first issue_
 on GitHub](https://github.com/kiali/kiali/labels/good%20first%20issue).
 
-### Discussing changes
-
-For large changes it is probably good to first discuss them on the [Kiali-dev](https://groups.google.com/forum/#!forum/kiali-dev) mailing list.
-
 ### Developing
 
-The [README for the server](./README.adoc#building) and the [README for the UI](https://github.com/kiali/kiali-ui#developing) have a pretty exhausting guide on building Kiali server and UI. 
+The [README for the server](./README.adoc#building) and the [README for the UI](./frontend/README.adoc) have a pretty extensive guide on building Kiali server and UI.
+
+### Internationalization
+
+If you want to add a new language or improve an existing one, you can check the internationalization section of the [README for UI](./frontend/README.adoc#internationalization-i18n) and the shared [i18n conventions guide](./I18N-AGENTS.md) for defaults that apply to every locale and any language-specific glossary/style rules.
 
 ### Code Style Guide
 
-See the [Backend Style Guide](./STYLE_GUIDE.adoc) and the [Frontend Style Guide](https://github.com/kiali/kiali-ui/blob/master/STYLE_GUIDE.adoc) about getting your code in style.
+See the [Style Guide](./STYLE_GUIDE.adoc) about getting your code in style.
 
+### AI-Assisted Contributions
+
+If you use AI tools (such as GitHub Copilot, ChatGPT, Claude, Cursor, or similar) to assist with your contributions, please review the [AI Policy](./AI_POLICY.md) for guidelines on responsible use, disclosure requirements, and quality standards.
+
+### Commit Signing
+
+All repositories in the Kiali organization require commits to be cryptographically signed. Before submitting changes to any Kiali repo, make sure your git environment is configured to sign commits. See [COMMIT-SIGNING-SETUP.md](./COMMIT-SIGNING-SETUP.md) for step-by-step instructions.
 
 ### Submitting changes
 
-Once the issue has been agreed upon and developed, you can send a pull-request. 
+Once the issue has been agreed upon and developed, you can send a pull-request.
 
-The pull-request should have a detailed explanation of the changes that you are doing.
+The pull-request should have a detailed explanation of the changes that you are doing (i.e. include screenshots for UI changes).
 If you worked on a GitHub issue, please provide the link as part of the description.
 
-If your changes have impact on the front-end, an image showing the changed screen will be
-very helpful to understand your changes. If possible, provide a screenshot before the change
-and another one after the change. 
-
-The pull-request template will help you here.
-
-Pull requests will be reviewed by the team of committers and they will come up with 
+Pull requests will be reviewed by the team of committers and they will come up with
 suggestions on how to improve the pull-request. You should be prepared to take that
 feedback into account, add further commits into the pull-request until the pull-request
 is eventually merged.

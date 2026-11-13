@@ -1,0 +1,695 @@
+import * as React from 'react';
+import {
+  getBadge,
+  getLink,
+  renderBadgedHost,
+  renderBadgedLink,
+  renderDestServicesLinks,
+  renderHealth
+} from './SummaryLink';
+import type { DecoratedGraphNodeData, DestService, RankResult, SummaryPanelPropType } from '../../types/Graph';
+import { NodeType } from '../../types/Graph';
+import { getTitle, summaryBodyTabs, summaryFont, summaryPanel } from './SummaryPanelCommon';
+import { KialiIcon } from 'config/KialiIcon';
+import { clickHandler, getOptions } from 'pages/Graph/ContextMenu/NodeContextMenu';
+import type { MenuToggleElement } from '@patternfly/react-core';
+import {
+  Button,
+  ButtonVariant,
+  Dropdown,
+  DropdownGroup,
+  DropdownItem,
+  DropdownList,
+  MenuToggle,
+  Popover,
+  PopoverPosition,
+  Tab
+} from '@patternfly/react-core';
+import { SummaryPanelNodeTraffic } from './SummaryPanelNodeTraffic';
+import { SummaryPanelNodeTraces } from './SummaryPanelNodeTraces';
+import { SimpleTabs } from 'components/Tab/SimpleTabs';
+import type { TracingState } from 'reducers/TracingState';
+import { classes } from 'typestyle';
+import { kialiStyle } from 'styles/StyleUtils';
+import { PFSpacer } from 'styles/PfSpacer';
+import { PFBadge, PFBadges } from 'components/Pf/PfBadges';
+import type { ServiceDetailsInfo } from 'types/ServiceInfo';
+import { LoadingWizardActionsDropdownGroup } from 'components/IstioWizards/LoadingWizardActionsDropdownGroup';
+import type { WizardAction, WizardMode } from 'components/IstioWizards/WizardActions';
+import { ServiceWizardActionsDropdownGroup } from 'components/IstioWizards/ServiceWizardActionsDropdownGroup';
+import type { PeerAuthentication } from '../../types/IstioObjects';
+import { useServiceDetailForGraphNode } from '../../hooks/services';
+import { useKialiSelector } from '../../hooks/redux';
+import { groupMenuStyle, kebabToggleStyle, titleStyle } from 'styles/DropdownStyles';
+import { isMultiCluster, serverConfig } from '../../config';
+import { panelBodyStyle, panelHeadingStyle, panelStyle } from './SummaryPanelStyle';
+import { dicTypeToGVK, gvkType } from '../../types/IstioConfigList';
+import { renderWaypointLabel } from '../../components/Ambient/WaypointLabel';
+import type { Node } from '@patternfly/react-topology';
+import { KialiLink } from 'components/Link/KialiLink';
+import { KialiPageLink } from 'components/Link/KialiPageLink';
+import type { KioskData, KioskMode } from 'types/Common';
+import { getNamespaceDetailUrl } from 'utils/NamespaceUtils';
+import { t } from 'utils/I18nUtils';
+
+type SummaryPanelNodeState = {
+  isActionOpen: boolean;
+};
+
+const defaultState: SummaryPanelNodeState = {
+  isActionOpen: false
+};
+
+type ReduxProps = {
+  kiosk: KioskMode;
+  kioskData?: KioskData;
+  rankResult: RankResult;
+  showRank: boolean;
+  tracingState: TracingState;
+};
+
+export type SummaryPanelNodeProps = Omit<SummaryPanelPropType, 'kiosk'> & {
+  onDeleteTrafficRouting?: (key: string, serviceDetails: ServiceDetailsInfo) => void;
+  onLaunchWizard?: (
+    key: WizardAction,
+    mode: WizardMode,
+    namespace: string,
+    serviceDetails: ServiceDetailsInfo,
+    gateways: string[],
+    peerAuths: PeerAuthentication[]
+  ) => void;
+};
+
+export type SummaryPanelNodeComponentProps = ReduxProps &
+  SummaryPanelNodeProps & {
+    gateways: string[] | null;
+    onKebabToggled?: (isOpen: boolean) => void;
+    peerAuthentications: PeerAuthentication[] | null;
+    serviceDetails: ServiceDetailsInfo | null | undefined;
+  };
+
+const badgeSummaryTextStyle = kialiStyle({
+  paddingLeft: PFSpacer.xs
+});
+
+const itemCountStyle = kialiStyle({
+  whiteSpace: 'nowrap'
+});
+
+const itemCountButtonStyle = kialiStyle({
+  fontSize: 'inherit'
+});
+
+const itemsPopoverStyle = kialiStyle({
+  maxHeight: '16rem',
+  overflowWrap: 'anywhere',
+  overflowY: 'auto'
+});
+
+const nodeInfoStyle = kialiStyle({
+  display: 'flex',
+  alignItems: 'center',
+  marginTop: '0.25rem'
+});
+
+const dropdownMenuStyle = kialiStyle({
+  maxHeight: '400px',
+  overflowY: 'auto'
+});
+
+export class SummaryPanelNodeComponent extends React.Component<SummaryPanelNodeComponentProps, SummaryPanelNodeState> {
+  private readonly mainDivRef: React.RefObject<HTMLDivElement>;
+
+  constructor(props: SummaryPanelNodeComponentProps) {
+    super(props);
+
+    this.state = { ...defaultState };
+    this.mainDivRef = React.createRef<HTMLDivElement>();
+  }
+
+  componentDidUpdate(prevProps: SummaryPanelNodeComponentProps): void {
+    if (prevProps.data.summaryTarget !== this.props.data.summaryTarget) {
+      if (this.mainDivRef.current) {
+        this.mainDivRef.current.scrollTop = 0;
+      }
+    }
+  }
+
+  render(): React.ReactNode {
+    const node = this.props.data.summaryTarget as Node;
+    const nodeData = node.getData();
+    const { nodeType, app, service, workload, isServiceEntry } = nodeData;
+    const servicesList = nodeType !== NodeType.SERVICE && renderDestServicesLinks(nodeData);
+    const destsList = nodeType === NodeType.SERVICE && isServiceEntry && this.renderDestServices(nodeData);
+
+    const hasNetobserv = this.props.kioskData?.hasNetobserv;
+    const shouldRenderDestsList = destsList && destsList.length > 0;
+    const shouldRenderSvcList = servicesList && servicesList.length > 0;
+    const shouldRenderService = service && ![NodeType.SERVICE, NodeType.UNKNOWN].includes(nodeType);
+    const shouldRenderApp = app && ![NodeType.APP, NodeType.UNKNOWN].includes(nodeType) && !nodeData.isWaypoint;
+    const shouldRenderWorkload = workload && ![NodeType.WORKLOAD, NodeType.UNKNOWN].includes(nodeType);
+    const shouldRenderNetobservWorkload = hasNetobserv && (nodeType === NodeType.WORKLOAD || shouldRenderWorkload);
+    const shouldRenderTraces =
+      !isServiceEntry &&
+      !nodeData.isInaccessible &&
+      this.props.tracingState.info &&
+      this.props.tracingState.info.enabled &&
+      this.props.tracingState.info.integration;
+
+    const options = getOptions(nodeData);
+    const items: React.ReactNode[] = [];
+
+    if (options.length > 0) {
+      items.push(
+        <React.Fragment key="show-group">
+          <div className={titleStyle}>{t('Show')}</div>
+          <DropdownGroup key="show" className={groupMenuStyle}>
+            {options.map((o, i) => {
+              return (
+                <DropdownItem key={`option-${i}`} onClick={() => clickHandler(o, this.props.kiosk)}>
+                  {t(o.text)} {o.target === '_blank' && <KialiIcon.ExternalLink />}
+                </DropdownItem>
+              );
+            })}
+          </DropdownGroup>
+        </React.Fragment>
+      );
+    }
+
+    if (nodeType === NodeType.SERVICE) {
+      if (this.props.serviceDetails === undefined) {
+        items.push(<LoadingWizardActionsDropdownGroup key="loading" />);
+      } else if (this.props.serviceDetails !== null) {
+        items.push(
+          <ServiceWizardActionsDropdownGroup
+            key="wizard-actions"
+            virtualServices={this.props.serviceDetails.virtualServices ?? []}
+            destinationRules={this.props.serviceDetails.destinationRules ?? []}
+            k8sHTTPRoutes={this.props.serviceDetails.k8sHTTPRoutes ?? []}
+            k8sGRPCRoutes={this.props.serviceDetails.k8sGRPCRoutes ?? []}
+            istioPermissions={this.props.serviceDetails.istioPermissions}
+            onAction={this.handleLaunchWizard}
+            onDelete={this.handleDeleteTrafficRouting}
+          />
+        );
+      }
+    }
+
+    const nsLink = (
+      <KialiLink to={getNamespaceDetailUrl({ name: nodeData.namespace, cluster: nodeData.cluster })}>
+        {nodeData.namespace}
+      </KialiLink>
+    );
+
+    const firstBadge = isMultiCluster ? (
+      <>
+        <PFBadge badge={PFBadges.Cluster} size="sm" />
+        {nodeData.cluster}
+      </>
+    ) : (
+      <>
+        <PFBadge badge={PFBadges.Namespace} size="sm" />
+        {nsLink}
+      </>
+    );
+
+    const secondBadge = isMultiCluster ? (
+      <div>
+        <PFBadge badge={PFBadges.Namespace} size="sm" />
+        {nsLink}
+      </div>
+    ) : (
+      <></>
+    );
+
+    // Note: NetObserv link removed per current requirements
+
+    return (
+      <div ref={this.mainDivRef} className={classes(panelStyle, summaryPanel)}>
+        <div className={panelHeadingStyle}>
+          {getTitle(nodeType)}
+
+          <div>
+            <span>
+              {firstBadge}
+
+              {options.length > 0 && (
+                <Dropdown
+                  id="summary-node-actions"
+                  toggle={(toggleRef: React.Ref<MenuToggleElement>) => (
+                    <MenuToggle
+                      ref={toggleRef}
+                      id="summary-node-kebab"
+                      className={kebabToggleStyle}
+                      aria-label={t('Actions')}
+                      variant="plain"
+                      onClick={() => this.onToggleActions(!this.state.isActionOpen)}
+                      isExpanded={this.state.isActionOpen}
+                      style={{ float: 'right' }}
+                    >
+                      <KialiIcon.KebabToggle />
+                    </MenuToggle>
+                  )}
+                  isOpen={this.state.isActionOpen}
+                  onOpenChange={(isOpen: boolean) => this.onToggleActions(isOpen)}
+                  popperProps={{ position: 'right', enableFlip: true }}
+                >
+                  <DropdownList className={dropdownMenuStyle}>{items}</DropdownList>
+                </Dropdown>
+              )}
+
+              {secondBadge}
+              {nodeData.isWaypoint ? (
+                <>
+                  <div className={nodeInfoStyle}>{renderBadgedLink(nodeData, NodeType.WORKLOAD)}</div>
+                  {renderWaypointLabel('sm')}
+                </>
+              ) : (
+                <div className={nodeInfoStyle}>
+                  {renderBadgedLink(nodeData)}
+                  {renderHealth(nodeData.health)}
+                </div>
+              )}
+            </span>
+          </div>
+
+          <div>
+            {this.renderBadgeSummary(nodeData)}
+            {shouldRenderDestsList && <div>{destsList}</div>}
+            {shouldRenderSvcList && <div key={Date.now()}>{servicesList}</div>}
+            {shouldRenderService && <div>{renderBadgedLink(nodeData, NodeType.SERVICE)}</div>}
+            {shouldRenderApp && <div>{renderBadgedLink(nodeData, NodeType.APP)}</div>}
+            {shouldRenderWorkload && this.renderWorkloadSection(nodeData)}
+            {shouldRenderNetobservWorkload && this.renderNetobservLink(nodeData, NodeType.WORKLOAD)}
+          </div>
+        </div>
+
+        {shouldRenderTraces ? this.renderWithTabs(nodeData) : this.renderTrafficOnly()}
+      </div>
+    );
+  }
+
+  // this is relevant only to linking to a netobserv tab in OSSMC
+  private renderNetobservLink = (nodeData: DecoratedGraphNodeData, nodeType: NodeType): React.ReactNode => {
+    // prefix the workload or service link with '/netobserv' to indicate that we want to link
+    // to the netobserv 'Network Traffic' tab for the entity, not the 'Service Mesh' tab. The link will be intercepted
+    // by KialiIntegration in OSSM, and redirected as needed.
+    const link = `/netobserv${getLink(nodeData, nodeType).link}`;
+    return (
+      <div className={nodeInfoStyle}>
+        <PFBadge badge={PFBadges.NetworkTraffic} size="sm" />
+        <KialiPageLink href={link} cluster={nodeData.cluster}>
+          network traffic
+        </KialiPageLink>
+      </div>
+    );
+  };
+
+  private renderWorkloadSection = (nodeData: DecoratedGraphNodeData): React.ReactNode => {
+    if (!nodeData.hasWorkloadEntry) {
+      return <div>{renderBadgedLink(nodeData, NodeType.WORKLOAD)}</div>;
+    }
+    const weGVK = dicTypeToGVK[gvkType.WorkloadEntry];
+
+    const workloadEntryLinks = nodeData.hasWorkloadEntry.map(we => (
+      <div key={we.name}>
+        {
+          getLink(nodeData, NodeType.WORKLOAD, () => ({
+            link: `/namespaces/${encodeURIComponent(nodeData.namespace)}/istio/${weGVK.Group}/${weGVK.Version}/${
+              weGVK.Kind
+            }/${encodeURIComponent(we.name)}`,
+            displayName: we.name,
+            key: `${nodeData.namespace}.wle.${we.name}`
+          })).elem
+        }
+      </div>
+    ));
+
+    return (
+      <>
+        {getBadge(nodeData, NodeType.WORKLOAD)}
+
+        {this.renderCountPopover(
+          `${nodeData.hasWorkloadEntry.length} ${
+            nodeData.hasWorkloadEntry.length === 1 ? t('workload entry') : t('workload entries')
+          }`,
+          t('Workload Entries'),
+          workloadEntryLinks,
+          'workload-entries-popover-toggle'
+        )}
+      </>
+    );
+  };
+
+  private renderGatewayHostnames = (nodeData: DecoratedGraphNodeData): React.ReactNode => {
+    if (nodeData.isGateway?.ingressInfo?.hostnames && nodeData.isGateway?.ingressInfo?.hostnames.length > 0) {
+      return this.renderHostnamesPopover(
+        nodeData.isGateway.ingressInfo.hostnames,
+        t('Gateway Hosts'),
+        'gateway-hosts-popover-toggle'
+      );
+    }
+
+    if (nodeData.isGateway?.egressInfo?.hostnames && nodeData.isGateway?.egressInfo?.hostnames.length > 0) {
+      return this.renderHostnamesPopover(
+        nodeData.isGateway.egressInfo.hostnames,
+        t('Gateway Hosts'),
+        'gateway-hosts-popover-toggle'
+      );
+    }
+
+    if (nodeData.isGateway?.gatewayAPIInfo?.hostnames && nodeData.isGateway?.gatewayAPIInfo?.hostnames.length > 0) {
+      return this.renderHostnamesPopover(
+        nodeData.isGateway.gatewayAPIInfo.hostnames,
+        t('Gateway Hosts'),
+        'gateway-hosts-popover-toggle'
+      );
+    }
+
+    return null;
+  };
+
+  private renderVsHostnamesPopover = (hostnames: string[]): React.ReactNode =>
+    this.renderHostnamesPopover(hostnames, t('VirtualService Hosts'), 'vs-hosts-popover-toggle');
+
+  private renderHostnamesPopover = (hostnames: string[], title: string, dataTest: string): React.ReactNode =>
+    this.renderCountPopover(
+      `${hostnames.length} ${hostnames.length === 1 ? t('host') : t('hosts')}`,
+      title,
+      hostnames.map(hostname => <div key={hostname}>{hostname === '*' ? t('* (all hosts)') : hostname}</div>),
+      dataTest
+    );
+
+  private renderCountPopover = (
+    countText: string,
+    title: string,
+    content: React.ReactNode,
+    dataTest: string
+  ): React.ReactNode => (
+    <span className={itemCountStyle}>
+      {' ('}
+      <Popover
+        position={PopoverPosition.left}
+        headerContent={title}
+        closeBtnAriaLabel={t('Close')}
+        bodyContent={<div className={itemsPopoverStyle}>{content}</div>}
+      >
+        <Button
+          variant={ButtonVariant.link}
+          isInline
+          className={itemCountButtonStyle}
+          aria-haspopup="dialog"
+          data-test={dataTest}
+        >
+          {countText}
+        </Button>
+      </Popover>
+      {')'}
+    </span>
+  );
+
+  private renderTrafficOnly(): React.ReactNode {
+    return (
+      <div className={panelBodyStyle}>
+        <SummaryPanelNodeTraffic {...this.props} />
+      </div>
+    );
+  }
+
+  private renderWithTabs(nodeData: DecoratedGraphNodeData): React.ReactNode {
+    return (
+      <div className={summaryBodyTabs}>
+        <SimpleTabs id="graph_summary_tabs" defaultTab={0} style={{ paddingBottom: '0.5rem' }}>
+          <Tab style={summaryFont} title={t('Traffic')} eventKey={0}>
+            <div style={summaryFont}>
+              <SummaryPanelNodeTraffic {...this.props} />
+            </div>
+          </Tab>
+
+          <Tab style={summaryFont} title={t('Traces')} eventKey={1}>
+            <SummaryPanelNodeTraces
+              kiosk={this.props.kiosk}
+              nodeData={nodeData}
+              queryTime={this.props.queryTime - this.props.duration}
+            />
+          </Tab>
+        </SimpleTabs>
+      </div>
+    );
+  }
+
+  private onToggleActions = (isOpen: boolean): void => {
+    this.setState({
+      isActionOpen: isOpen
+    });
+
+    if (this.props.onKebabToggled) {
+      this.props.onKebabToggled(isOpen);
+    }
+  };
+
+  private renderK8sGatewayAPI(isK8sGatewayAPI?: boolean): React.ReactNode {
+    return isK8sGatewayAPI ? ' (K8s GW API)' : '';
+  }
+
+  // TODO:(see https://github.com/kiali/kiali-design/issues/63) If we want to show an icon for SE uncomment below
+  private renderBadgeSummary = (nodeData: DecoratedGraphNodeData): React.ReactNode => {
+    const {
+      hasCB,
+      hasFaultInjection,
+      hasMirroring,
+      hasRequestRouting,
+      hasRequestTimeout,
+      hasTCPTrafficShifting,
+      hasTrafficShifting,
+      hasVS,
+      isDead,
+      isGateway,
+      isK8sGatewayAPI,
+      isOutOfMesh
+    } = nodeData;
+
+    const hasTrafficScenario =
+      hasRequestRouting ||
+      hasFaultInjection ||
+      hasMirroring ||
+      hasTrafficShifting ||
+      hasTCPTrafficShifting ||
+      hasRequestTimeout;
+
+    const shouldRenderGatewayHostnames =
+      (nodeData.isGateway?.ingressInfo?.hostnames !== undefined &&
+        nodeData.isGateway.ingressInfo.hostnames.length !== 0) ||
+      (nodeData.isGateway?.egressInfo?.hostnames !== undefined &&
+        nodeData.isGateway.egressInfo.hostnames.length !== 0) ||
+      (nodeData.isGateway?.gatewayAPIInfo?.hostnames !== undefined &&
+        nodeData.isGateway.gatewayAPIInfo.hostnames.length !== 0);
+
+    const shouldRenderVsHostnames = nodeData.hasVS?.hostnames !== undefined && nodeData.hasVS?.hostnames.length !== 0;
+
+    const shouldRenderRank = this.props.showRank;
+
+    return (
+      <div style={{ marginTop: '0.5rem', marginBottom: '0.5rem' }}>
+        {hasCB && (
+          <div>
+            <KialiIcon.CircuitBreaker />
+            <span style={{ paddingLeft: '0.25rem' }}>
+              Has Circuit Breaker{this.renderK8sGatewayAPI(isK8sGatewayAPI)}
+            </span>
+          </div>
+        )}
+
+        {hasVS && !hasTrafficScenario && (
+          <div>
+            <KialiIcon.VirtualService />
+            <span className={badgeSummaryTextStyle}>
+              {t('Has Virtual Service')}
+              {this.renderK8sGatewayAPI(isK8sGatewayAPI)}
+              {shouldRenderVsHostnames && this.renderVsHostnamesPopover(nodeData.hasVS!.hostnames!)}
+            </span>
+          </div>
+        )}
+
+        {hasMirroring && (
+          <div>
+            <KialiIcon.Mirroring />
+            <span style={{ paddingLeft: '0.25rem' }}>Has Mirroring{this.renderK8sGatewayAPI(isK8sGatewayAPI)}</span>
+          </div>
+        )}
+
+        {isOutOfMesh && !serverConfig.ambientEnabled && (
+          <div>
+            <KialiIcon.OutOfMesh />
+            <span style={{ paddingLeft: '0.25rem' }}>Has Missing Sidecar</span>
+          </div>
+        )}
+
+        {isOutOfMesh && serverConfig.ambientEnabled && (
+          <div>
+            <KialiIcon.OutOfMesh />
+            <span style={{ paddingLeft: '0.25rem' }}>Out of Mesh</span>
+          </div>
+        )}
+
+        {isDead && (
+          <div>
+            <span style={{ marginRight: '0.25rem' }}>
+              <KialiIcon.Info />
+            </span>
+            <span style={{ paddingLeft: '0.25rem' }}>Has No Running Pods</span>
+          </div>
+        )}
+
+        {hasRequestRouting && (
+          <div>
+            <KialiIcon.RequestRouting />
+            <span className={badgeSummaryTextStyle}>
+              {t('Has Request Routing')}
+              {this.renderK8sGatewayAPI(isK8sGatewayAPI)}
+              {shouldRenderVsHostnames && this.renderVsHostnamesPopover(nodeData.hasVS!.hostnames!)}
+            </span>
+          </div>
+        )}
+
+        {hasFaultInjection && (
+          <div>
+            <KialiIcon.FaultInjection />
+            <span style={{ paddingLeft: '0.25rem' }}>
+              Has Fault Injection{this.renderK8sGatewayAPI(isK8sGatewayAPI)}
+            </span>
+          </div>
+        )}
+
+        {hasTrafficShifting && (
+          <div>
+            <KialiIcon.TrafficShifting />
+            <span style={{ paddingLeft: '0.25rem' }}>
+              Has Traffic Shifting{this.renderK8sGatewayAPI(isK8sGatewayAPI)}
+            </span>
+          </div>
+        )}
+
+        {hasTCPTrafficShifting && (
+          <div>
+            <KialiIcon.TrafficShifting />
+            <span style={{ paddingLeft: '0.25rem' }}>
+              Has TCP Traffic Shifting{this.renderK8sGatewayAPI(isK8sGatewayAPI)}
+            </span>
+          </div>
+        )}
+
+        {hasRequestTimeout && (
+          <div>
+            <KialiIcon.RequestTimeout />
+            <span style={{ paddingLeft: '0.25rem' }}>
+              Has Request Timeout{this.renderK8sGatewayAPI(isK8sGatewayAPI)}
+            </span>
+          </div>
+        )}
+
+        {isGateway && (
+          <div>
+            <KialiIcon.Gateway />
+            <span className={badgeSummaryTextStyle}>
+              {t('Is Gateway')}
+              {this.renderK8sGatewayAPI(isK8sGatewayAPI)}
+              {shouldRenderGatewayHostnames && this.renderGatewayHostnames(nodeData)}
+            </span>
+          </div>
+        )}
+
+        {shouldRenderRank && (
+          <div>
+            <KialiIcon.Rank />
+            <span style={{ paddingLeft: '0.25rem' }}>
+              Rank: {nodeData.rank !== undefined ? `${nodeData.rank} / ${this.props.rankResult.upperBound}` : 'N/A'}
+            </span>
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  private renderDestServices = (data: DecoratedGraphNodeData): React.ReactNode => {
+    const destServices: DestService[] | undefined = data.destServices;
+
+    const entries: React.ReactNode[] = [];
+
+    if (!destServices) {
+      return entries;
+    }
+
+    destServices.forEach(ds => {
+      entries.push(renderBadgedHost(ds.name));
+    });
+
+    return entries;
+  };
+
+  private handleLaunchWizard = (key: WizardAction, mode: WizardMode): void => {
+    this.onToggleActions(false);
+
+    if (this.props.onLaunchWizard) {
+      const node = this.props.data.summaryTarget as Node;
+      const nodeData = node.getData();
+
+      this.props.onLaunchWizard(
+        key,
+        mode,
+        nodeData.namespace,
+        this.props.serviceDetails!,
+        this.props.gateways!,
+        this.props.peerAuthentications!
+      );
+    }
+  };
+
+  private handleDeleteTrafficRouting = (key: string): void => {
+    this.onToggleActions(false);
+
+    if (this.props.onDeleteTrafficRouting) {
+      this.props.onDeleteTrafficRouting(key, this.props.serviceDetails!);
+    }
+  };
+}
+
+export const SummaryPanelNode: React.FC<SummaryPanelNodeProps> = (props: SummaryPanelNodeProps) => {
+  const tracingState = useKialiSelector(state => state.tracingState);
+  const kiosk = useKialiSelector(state => state.globalState.kiosk);
+  const kioskData = useKialiSelector(state => state.globalState.kioskData);
+  const rankResult = useKialiSelector(state => state.graph.rankResult);
+  const showRank = useKialiSelector(state => state.graph.toolbarState.showRank);
+  const updateTime = useKialiSelector(state => state.graph.updateTime);
+
+  const [isKebabOpen, setIsKebabOpen] = React.useState<boolean>(false);
+
+  const node = props.data.summaryTarget as Node;
+  const nodeData = node.getData();
+
+  const [serviceDetails, gateways, peerAuthentications, isServiceDetailsLoading] = useServiceDetailForGraphNode(
+    nodeData,
+    isKebabOpen,
+    props.duration,
+    updateTime
+  );
+
+  const handleKebabToggled = (isOpen: boolean): void => {
+    setIsKebabOpen(isOpen);
+  };
+
+  return (
+    <SummaryPanelNodeComponent
+      tracingState={tracingState}
+      kiosk={kiosk}
+      kioskData={kioskData}
+      rankResult={rankResult}
+      showRank={showRank}
+      serviceDetails={isServiceDetailsLoading ? undefined : serviceDetails}
+      gateways={gateways}
+      peerAuthentications={peerAuthentications}
+      onKebabToggled={handleKebabToggled}
+      {...props}
+    />
+  );
+};

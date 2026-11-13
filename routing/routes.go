@@ -3,12 +3,28 @@ package routing
 import (
 	"net/http"
 
+	"golang.org/x/exp/maps"
+
+	ai "github.com/kiali/kiali/ai/types"
+	"github.com/kiali/kiali/business"
+	"github.com/kiali/kiali/cache"
+	"github.com/kiali/kiali/config"
+	"github.com/kiali/kiali/grafana"
+	"github.com/kiali/kiali/graph"
 	"github.com/kiali/kiali/handlers"
+	"github.com/kiali/kiali/handlers/authentication"
+	"github.com/kiali/kiali/istio"
+	"github.com/kiali/kiali/kubernetes"
+	"github.com/kiali/kiali/log"
+	"github.com/kiali/kiali/perses"
+	"github.com/kiali/kiali/prometheus"
+	"github.com/kiali/kiali/tracing"
 )
 
 // Route describes a single route
 type Route struct {
 	Name          string
+	LogGroupName  string
 	Method        string
 	Pattern       string
 	HandlerFunc   http.HandlerFunc
@@ -22,1206 +38,2076 @@ type Routes struct {
 }
 
 // NewRoutes creates and returns all the API routes
-func NewRoutes() (r *Routes) {
+func NewRoutes(
+	conf *config.Config,
+	kialiCache cache.KialiCache,
+	clientFactory kubernetes.ClientFactory,
+	cpm business.ControlPlaneMonitor,
+	prom prometheus.ClientInterface,
+	traceClientLoader func() tracing.ClientInterface,
+	authController authentication.AuthController,
+	grafana *grafana.Service,
+	perses *perses.Service,
+	discovery *istio.Discovery,
+	graphCache graph.GraphCache,
+	refreshJobManager *graph.RefreshJobManager,
+	aiStore ai.AIStore,
+) (r *Routes) {
 	r = new(Routes)
 
 	r.Routes = []Route{
 		// swagger:route GET /healthz kiali healthz
-		// ---
+		//
 		// Endpoint to get the health of Kiali
 		//
-		//     Produces:
-		//     - application/json
+		// Produces:
+		// - application/json
 		//
-		//     Schemes: http, https
-		// responses:
-		//		500: internalError
-		//		200
+		// Schemes: http, https
+		// Responses:
+		//    500: internalError
+		//    200
 		{
 			"Healthz",
+			log.StatusLogName,
 			"GET",
 			"/healthz",
 			handlers.Healthz,
 			false,
 		},
 		// swagger:route GET / kiali root
-		// ---
+		//
 		// Endpoint to get the status of Kiali
 		//
-		//     Produces:
-		//     - application/json
+		// Produces:
+		// - application/json
 		//
-		//     Schemes: http, https
-		// responses:
-		//      500: internalError
-		//      200: statusInfo
+		// Schemes: http, https
+		// Responses:
+		//    500: internalError
+		//    200: statusInfo
 		{
 			"Root",
+			log.StatusLogName,
 			"GET",
 			"/api",
-			handlers.Root,
-			false,
+			handlers.Root(conf, clientFactory, kialiCache, grafana, perses, prom),
+			conf.Server.RequireAuth,
 		},
 		// swagger:route GET /authenticate auth authenticate
-		// ---
+		//
 		// Endpoint to authenticate the user
 		//
-		//     Produces:
-		//     - application/json
+		// Produces:
+		// - application/json
 		//
-		//     Schemes: http, https
+		// Schemes: http, https
 		//
-		//    Security:
-		//     authorization: user, password
+		// Security:
+		// - authorization
 		//
-		// responses:
-		//      500: internalError
-		//      200: tokenResponse
+		// Responses:
+		//    500: internalError
+		//    200: userSessionData
 		{
 			"Authenticate",
+			log.AuthenticateLogName,
 			"GET",
 			"/api/authenticate",
-			handlers.Authenticate,
+			handlers.Authenticate(conf, authController),
 			false,
 		},
 		// swagger:route POST /authenticate auth openshiftCheckToken
-		// ---
+		//
 		// Endpoint to check if a token from Openshift is working correctly
 		//
-		//     Produces:
-		//     - application/json
+		// Produces:
+		// - application/json
 		//
-		//     Schemes: http, https
+		// Schemes: http, https
 		//
-		// responses:
-		//      500: internalError
-		//      200: tokenResponse
+		// Responses:
+		//    500: internalError
+		//    200: userSessionData
 		{
 			"OpenshiftCheckToken",
+			log.AuthenticateLogName,
 			"POST",
 			"/api/authenticate",
-			handlers.Authenticate,
+			handlers.Authenticate(conf, authController),
 			false,
 		},
 		// swagger:route GET /logout auth logout
-		// ---
+		//
 		// Endpoint to logout an user (unset the session cookie)
 		//
-		//     Schemes: http, https
+		// Schemes: http, https
 		//
-		// responses:
-		//      204: noContent
+		// Responses:
+		//    204: noContent
 		{
 			"Logout",
+			log.AuthenticateLogName,
 			"GET",
 			"/api/logout",
-			handlers.Logout,
+			handlers.Logout(conf, authController),
 			false,
 		},
 		// swagger:route GET /auth/info auth authenticationInfo
-		// ---
+		//
 		// Endpoint to get login info, such as strategy, authorization endpoints
 		// for OAuth providers and so on.
 		//
-		//     Consumes:
-		//     - application/json
+		// Consumes:
+		// - application/json
 		//
-		//     Produces:
-		//     - application/json
+		// Produces:
+		// - application/json
 		//
-		//     Schemes: http, https
+		// Schemes: http, https
 		//
-		// responses:
-		//      500: internalError
-		//      200: authenticationInfo
+		// Responses:
+		//    500: internalError
+		//    200: authenticationInfo
 		{
 			"AuthenticationInfo",
+			log.AuthenticateLogName,
 			"GET",
 			"/api/auth/info",
-			handlers.AuthenticationInfo,
-			false,
-		},
-		// swagger:route GET /auth/openid_redirect auth openidRedirect
-		// ---
-		// Endpoint to redirect the browser of the user to the authentication
-		// endpoint of the configured OpenId provider.
-		//
-		//     Consumes:
-		//     - application/json
-		//
-		//     Produces:
-		//     - application/html
-		//
-		//     Schemes: http, https
-		//
-		// responses:
-		//      500: internalError
-		//      200: noContent
-		{
-			"AuthenticationInfo",
-			"GET",
-			"/api/auth/openid_redirect",
-			handlers.OpenIdRedirect,
+			handlers.AuthenticationInfo(conf, authController, maps.Keys(clientFactory.GetSAClients())),
 			false,
 		},
 		// swagger:route GET /status status getStatus
-		// ---
+		//
 		// Endpoint to get the status of Kiali
 		//
-		//     Produces:
-		//     - application/json
+		// Produces:
+		// - application/json
 		//
-		//     Schemes: http, https
+		// Schemes: http, https
 		//
-		// responses:
-		//      500: internalError
-		//      200: statusInfo
+		// Responses:
+		//    500: internalError
+		//    200: statusInfo
 		{
 			"Status",
+			log.StatusLogName,
 			"GET",
 			"/api/status",
-			handlers.Root,
+			handlers.Root(conf, clientFactory, kialiCache, grafana, perses, prom),
+			true,
+		},
+		// swagger:route GET /test/metrics/graph/cache test testGraphCacheMetrics
+		//
+		// Endpoint to get Kiali's graph cache metrics
+		//
+		// Produces:
+		// - application/json
+		//
+		// Schemes: http, https
+		//
+		// Responses:
+		//    200: graphCacheMetricsResponse
+		{
+			"TestGraphCacheMetrics",
+			log.StatusLogName,
+			"GET",
+			"/api/test/metrics/graph/cache",
+			handlers.GraphCacheMetricsHandler(),
+			true,
+		},
+		// swagger:route GET /test/metrics/health/cache testMetrics testHealthCacheMetrics
+		//
+		// Endpoint to get Kiali's health cache metrics for testing purposes
+		//
+		// Produces:
+		// - application/json
+		//
+		// Schemes: http, https
+		//
+		// Responses:
+		//    200: healthCacheMetricsResponse
+		{
+			"TestHealthCacheMetrics",
+			log.StatusLogName,
+			"GET",
+			"/api/test/metrics/health/cache",
+			handlers.HealthCacheMetricsHandler(),
+			true,
+		},
+		// swagger:route GET /test/metrics/health/status testMetrics testHealthStatusMetrics
+		//
+		// Endpoint to get Kiali's health status metrics for testing purposes
+		//
+		// Produces:
+		// - application/json
+		//
+		// Schemes: http, https
+		//
+		// Responses:
+		//    200: healthStatusMetricsResponse
+		{
+			"TestHealthStatusMetrics",
+			log.StatusLogName,
+			"GET",
+			"/api/test/metrics/health/status",
+			handlers.HealthStatusMetricsHandler(conf, kialiCache, discovery, clientFactory),
+			true,
+		},
+		// swagger:route GET /tracing/diagnose tracing tracingDiagnose
+		//
+		// Endpoint to get a diagnose for the tracing endpoint
+		//
+		// Produces:
+		// - application/json
+		//
+		// Schemes: http, https
+		//
+		// Responses:
+		//    500: internalError
+		//    200: tracingDiagnose
+		{
+			"Diagnose",
+			log.TracingLogName,
+			"GET",
+			"/api/tracing/diagnose",
+			handlers.TracingDiagnose(conf, kialiCache, clientFactory, prom, cpm, traceClientLoader, grafana, discovery),
+			true,
+		},
+		// swagger:route POST /tracing/check tracing tracingCheck
+		//
+		// Endpoint to test a specific configuration for tracing
+		//
+		// Produces:
+		// - application/json
+		//
+		// Schemes: http, https
+		//
+		// Responses:
+		//    500: internalError
+		//    200: configurationValidation
+		{
+			"Tracing check",
+			log.TracingLogName,
+			"POST",
+			"/api/tracing/check",
+			handlers.TracingConfigurationCheck(conf, kialiCache, clientFactory, prom, cpm, traceClientLoader, grafana, discovery),
 			true,
 		},
 		// swagger:route GET /config kiali getConfig
-		// ---
+		//
 		// Endpoint to get the config of Kiali
 		//
-		//     Produces:
-		//     - application/json
+		// Produces:
+		// - application/json
 		//
-		//     Schemes: http, https
+		// Schemes: http, https
 		//
-		// responses:
-		//      500: internalError
-		//      200: statusInfo
+		// Responses:
+		//    500: internalError
+		//    200: statusInfo
 		{
 			"Config",
+			log.ConfigLogName,
 			"GET",
 			"/api/config",
-			handlers.Config,
+			handlers.Config(conf, kialiCache, discovery, clientFactory, prom),
+			true,
+		},
+		// swagger:route GET /config/disabled kiali getDisabledFeatures
+		//
+		// Endpoint to get the disabled features of Kiali
+		//
+		// Produces:
+		// - application/json
+		//
+		// Schemes: http, https
+		//
+		// Responses:
+		//    500: internalError
+		//    200: disabledFeaturesResponse
+		{
+			"DisabledFeatures",
+			log.ConfigLogName,
+			"GET",
+			"/api/config/disabled",
+			handlers.DisabledFeaturesHandler(conf, prom),
 			true,
 		},
 		// swagger:route GET /istio/permissions config getPermissions
-		// ---
+		//
 		// Endpoint to get the caller permissions on new Istio Config objects
 		//
-		//     Produces:
-		//     - application/json
+		// Produces:
+		// - application/json
 		//
-		//     Schemes: http, https
+		// Schemes: http, https
 		//
-		// responses:
-		//      500: internalError
-		//      200: istioConfigPermissions
+		// Responses:
+		//    500: internalError
+		//    200: istioConfigPermissions
 		{
 			"IstioConfigPermissions",
+			log.IstioConfigLogName,
 			"GET",
 			"/api/istio/permissions",
-			handlers.IstioConfigPermissions,
+			handlers.IstioConfigPermissions(conf, kialiCache, clientFactory, prom, traceClientLoader, discovery, cpm, grafana),
 			true,
 		},
 		// swagger:route GET /namespaces/{namespace}/istio config istioConfigList
-		// ---
+		//
 		// Endpoint to get the list of Istio Config of a namespace
 		//
-		//     Produces:
-		//     - application/json
+		// Produces:
+		// - application/json
 		//
-		//     Schemes: http, https
+		// Schemes: http, https
 		//
-		// responses:
-		//      500: internalError
-		//      200: istioConfigList
+		// Responses:
+		//    403: forbiddenError
+		//    500: internalError
+		//    200: istioConfigList
 		//
 		{
 			"IstioConfigList",
+			log.IstioConfigLogName,
 			"GET",
 			"/api/namespaces/{namespace}/istio",
-			handlers.IstioConfigList,
+			handlers.IstioConfigList(conf, kialiCache, clientFactory, prom, traceClientLoader, discovery, cpm, grafana),
 			true,
 		},
-		// swagger:route GET /namespaces/{namespace}/istio/{object_type}/{object} config istioConfigDetails
-		// ---
+		// swagger:route GET /istio config istioConfigListAll
+		//
+		// Endpoint to get the list of Istio Config of all namespaces
+		//
+		// Produces:
+		// - application/json
+		//
+		// Schemes: http, https
+		//
+		// Responses:
+		//    500: internalError
+		//    200: istioConfigList
+		//
+		{
+			"IstioConfigListAll",
+			log.IstioConfigLogName,
+			"GET",
+			"/api/istio/config",
+			handlers.IstioConfigList(conf, kialiCache, clientFactory, prom, traceClientLoader, discovery, cpm, grafana),
+			true,
+		},
+		// swagger:route GET /namespaces/{namespace}/istio/{group}/{version}/{kind}/{object} config istioConfigDetails
+		//
 		// Endpoint to get the Istio Config of an Istio object
 		//
-		//     Produces:
-		//     - application/json
+		// Produces:
+		// - application/json
 		//
-		//     Schemes: http, https
+		// Schemes: http, https
 		//
-		// responses:
-		//      400: badRequestError
-		//      404: notFoundError
-		//      500: internalError
-		//      200: istioConfigDetailsResponse
+		// Responses:
+		//    400: badRequestError
+		//    403: forbiddenError
+		//    404: notFoundError
+		//    500: internalError
+		//    200: istioConfigDetailsResponse
 		//
 		{
 			"IstioConfigDetails",
+			log.IstioConfigLogName,
 			"GET",
-			"/api/namespaces/{namespace}/istio/{object_type}/{object}",
-			handlers.IstioConfigDetails,
+			"/api/namespaces/{namespace}/istio/{group}/{version}/{kind}/{object}",
+			handlers.IstioConfigDetails(conf, kialiCache, clientFactory, prom, traceClientLoader, discovery, cpm, grafana),
 			true,
 		},
-		// swagger:route DELETE /namespaces/{namespace}/istio/{object_type}/{object} config istioConfigDelete
-		// ---
+		// swagger:route DELETE /namespaces/{namespace}/istio/{group}/{version}/{kind}/{object} config istioConfigDelete
+		//
 		// Endpoint to delete the Istio Config of an (arbitrary) Istio object
 		//
-		//     Produces:
-		//     - application/json
+		// Produces:
+		// - application/json
 		//
-		//     Schemes: http, https
+		// Schemes: http, https
 		//
-		// responses:
-		//      404: notFoundError
-		//      500: internalError
-		//      200
+		// Responses:
+		//    403: forbiddenError
+		//    404: notFoundError
+		//    500: internalError
+		//    200
 		//
 		{
 			"IstioConfigDelete",
+			log.IstioConfigLogName,
 			"DELETE",
-			"/api/namespaces/{namespace}/istio/{object_type}/{object}",
-			handlers.IstioConfigDelete,
+			"/api/namespaces/{namespace}/istio/{group}/{version}/{kind}/{object}",
+			handlers.IstioConfigDelete(conf, kialiCache, clientFactory, prom, traceClientLoader, discovery, cpm, grafana),
 			true,
 		},
-		// swagger:route PATCH /namespaces/{namespace}/istio/{object_type}/{object} config istioConfigUpdate
-		// ---
+		// swagger:route PATCH /namespaces/{namespace}/istio/{group}/{version}/{kind}/{object} config istioConfigUpdate
+		//
 		// Endpoint to update the Istio Config of an Istio object used for templates and adapters using Json Merge Patch strategy.
 		//
-		//     Consumes:
-		//	   - application/json
+		// Consumes:
+		// - application/json
 		//
-		//     Produces:
-		//     - application/json
+		// Produces:
+		// - application/json
 		//
-		//     Schemes: http, https
+		// Schemes: http, https
 		//
-		// responses:
-		//      400: badRequestError
-		//      404: notFoundError
-		//      500: internalError
-		//      200: istioConfigDetailsResponse
+		// Responses:
+		//    400: badRequestError
+		//    403: forbiddenError
+		//    404: notFoundError
+		//    500: internalError
+		//    200: istioConfigDetailsResponse
 		//
 		{
 			"IstioConfigUpdate",
+			log.IstioConfigLogName,
 			"PATCH",
-			"/api/namespaces/{namespace}/istio/{object_type}/{object}",
-			handlers.IstioConfigUpdate,
+			"/api/namespaces/{namespace}/istio/{group}/{version}/{kind}/{object}",
+			handlers.IstioConfigUpdate(conf, kialiCache, clientFactory, prom, traceClientLoader, discovery, cpm, grafana),
 			true,
 		},
-		// swagger:route POST /namespaces/{namespace}/istio/{object_type} config istioConfigCreate
-		// ---
+		// swagger:route POST /namespaces/{namespace}/istio/{group}/{version}/{kind} config istioConfigCreate
+		//
 		// Endpoint to create an Istio object by using an Istio Config item
 		//
-		//     Produces:
-		//     - application/json
+		// Produces:
+		// - application/json
 		//
-		//     Schemes: http, https
+		// Schemes: http, https
 		//
-		// responses:
-		//      404: notFoundError
-		//      500: internalError
-		//		202
-		//		201: istioConfigDetailsResponse
-		//      200: istioConfigDetailsResponse
+		// Responses:
+		//    403: forbiddenError
+		//    404: notFoundError
+		//    500: internalError
+		//    202
+		//    201: istioConfigDetailsResponse
+		//    200: istioConfigDetailsResponse
 		//
 		{
 			"IstioConfigCreate",
+			log.IstioConfigLogName,
 			"POST",
-			"/api/namespaces/{namespace}/istio/{object_type}",
-			handlers.IstioConfigCreate,
+			"/api/namespaces/{namespace}/istio/{group}/{version}/{kind}",
+			handlers.IstioConfigCreate(conf, kialiCache, clientFactory, prom, traceClientLoader, discovery, cpm, grafana),
 			true,
 		},
-		// swagger:route GET /namespaces/{namespace}/services services serviceList
-		// ---
-		// Endpoint to get the details of a given service
+		// swagger:route GET /clusters/services services serviceList
 		//
-		//     Produces:
-		//     - application/json
+		// Endpoint to get the list of services for a given cluster
 		//
-		//     Schemes: http, https
+		// Produces:
+		// - application/json
 		//
-		// responses:
-		//      500: internalError
-		//      200: serviceListResponse
+		// Schemes: http, https
+		//
+		// Responses:
+		//    500: internalError
+		//    200: serviceListResponse
 		//
 		{
-			"ServiceList",
+			"ClustersServices",
+			log.ClustersLogName,
 			"GET",
-			"/api/namespaces/{namespace}/services",
-			handlers.ServiceList,
+			"/api/clusters/services",
+			handlers.ClustersServices(conf, kialiCache, clientFactory, prom, cpm, traceClientLoader, grafana, discovery),
 			true,
 		},
 		// swagger:route GET /namespaces/{namespace}/services/{service} services serviceDetails
-		// ---
+		//
 		// Endpoint to get the details of a given service
 		//
-		//     Produces:
-		//     - application/json
+		// Produces:
+		// - application/json
 		//
-		//     Schemes: http, https
+		// Schemes: http, https
 		//
-		// responses:
-		//      404: notFoundError
-		//      500: internalError
-		//      200: serviceDetailsResponse
+		// Responses:
+		//    403: forbiddenError
+		//    404: notFoundError
+		//    500: internalError
+		//    200: serviceDetailsResponse
 		//
 		{
 			"ServiceDetails",
+			log.ResourcesLogName,
 			"GET",
 			"/api/namespaces/{namespace}/services/{service}",
-			handlers.ServiceDetails,
+			handlers.ServiceDetails(conf, kialiCache, clientFactory, prom, cpm, traceClientLoader, grafana, discovery),
 			true,
 		},
 		// swagger:route PATCH /namespaces/{namespace}/services/{service} services serviceUpdate
-		// ---
+		//
 		// Endpoint to update the Service configuration using Json Merge Patch strategy.
 		//
-		//     Consumes:
-		//	   - application/json
+		// Consumes:
+		// - application/json
 		//
-		//     Produces:
-		//     - application/json
+		// Produces:
+		// - application/json
 		//
-		//     Schemes: http, https
+		// Schemes: http, https
 		//
-		// responses:
-		//      400: badRequestError
-		//      404: notFoundError
-		//      500: internalError
-		//      200: serviceDetailsResponse
+		// Responses:
+		//    400: badRequestError
+		//    403: forbiddenError
+		//    404: notFoundError
+		//    500: internalError
+		//    200: serviceDetailsResponse
 		//
 		{
 			"ServiceUpdate",
+			log.ResourcesLogName,
 			"PATCH",
 			"/api/namespaces/{namespace}/services/{service}",
-			handlers.ServiceUpdate,
+			handlers.ServiceUpdate(conf, kialiCache, clientFactory, prom, cpm, traceClientLoader, grafana, discovery),
 			true,
 		},
 		// swagger:route GET /namespaces/{namespace}/apps/{app}/spans traces appSpans
-		// ---
-		// Endpoint to get Jaeger spans for a given app
 		//
-		//		Produces:
-		//		- application/json
+		// Endpoint to get Tracing spans for a given app
 		//
-		//		Schemes: http, https
+		// Produces:
+		// - application/json
 		//
-		// responses:
-		// 		500: internalError
-		//		200: spansResponse
+		// Schemes: http, https
+		//
+		// Responses:
+		//    403: forbiddenError
+		//    500: internalError
+		//    200: spansResponse
 		{
 			"AppSpans",
+			log.TracingLogName,
 			"GET",
 			"/api/namespaces/{namespace}/apps/{app}/spans",
-			handlers.AppSpans,
+			handlers.AppSpans(conf, kialiCache, clientFactory, prom, cpm, traceClientLoader, grafana, discovery),
 			true,
 		},
 		// swagger:route GET /namespaces/{namespace}/workloads/{workload}/spans traces workloadSpans
-		// ---
-		// Endpoint to get Jaeger spans for a given workload
 		//
-		//		Produces:
-		//		- application/json
+		// Endpoint to get Tracing spans for a given workload
 		//
-		//		Schemes: http, https
+		// Produces:
+		// - application/json
 		//
-		// responses:
-		// 		500: internalError
-		//		200: spansResponse
+		// Schemes: http, https
+		//
+		// Responses:
+		//    403: forbiddenError
+		//    500: internalError
+		//    200: spansResponse
 		{
 			"WorkloadSpans",
+			log.TracingLogName,
 			"GET",
 			"/api/namespaces/{namespace}/workloads/{workload}/spans",
-			handlers.WorkloadSpans,
+			handlers.WorkloadSpans(conf, kialiCache, clientFactory, prom, cpm, traceClientLoader, grafana, discovery),
 			true,
 		},
 		// swagger:route GET /namespaces/{namespace}/services/{service}/spans traces serviceSpans
-		// ---
-		// Endpoint to get Jaeger spans for a given service
 		//
-		//		Produces:
-		//		- application/json
+		// Endpoint to get Tracing spans for a given service
 		//
-		//		Schemes: http, https
+		// Produces:
+		// - application/json
 		//
-		// responses:
-		// 		500: internalError
-		//		200: spansResponse
+		// Schemes: http, https
+		//
+		// Responses:
+		//    403: forbiddenError
+		//    500: internalError
+		//    200: spansResponse
 		{
 			"ServiceSpans",
+			log.TracingLogName,
 			"GET",
 			"/api/namespaces/{namespace}/services/{service}/spans",
-			handlers.ServiceSpans,
+			handlers.ServiceSpans(conf, kialiCache, clientFactory, prom, cpm, traceClientLoader, grafana, discovery),
 			true,
 		},
 		// swagger:route GET /namespaces/{namespace}/apps/{app}/traces traces appTraces
-		// ---
+		//
 		// Endpoint to get the traces of a given app
 		//
-		//     Produces:
-		//     - application/json
+		// Produces:
+		// - application/json
 		//
-		//     Schemes: http, https
+		// Schemes: http, https
 		//
-		// responses:
-		//      404: notFoundError
-		//      500: internalError
-		//      200: traceDetailsResponse
+		// Responses:
+		//    403: forbiddenError
+		//    404: notFoundError
+		//    500: internalError
+		//    200: traceDetailsResponse
 		//
 		{
 			"AppTraces",
+			log.TracingLogName,
 			"GET",
 			"/api/namespaces/{namespace}/apps/{app}/traces",
-			handlers.AppTraces,
+			handlers.AppTraces(conf, kialiCache, clientFactory, prom, cpm, traceClientLoader, grafana, discovery),
 			true,
 		},
 		// swagger:route GET /namespaces/{namespace}/services/{service}/traces traces serviceTraces
-		// ---
+		//
 		// Endpoint to get the traces of a given service
 		//
-		//     Produces:
-		//     - application/json
+		// Produces:
+		// - application/json
 		//
-		//     Schemes: http, https
+		// Schemes: http, https
 		//
-		// responses:
-		//      404: notFoundError
-		//      500: internalError
-		//      200: traceDetailsResponse
+		// Responses:
+		//    403: forbiddenError
+		//    404: notFoundError
+		//    500: internalError
+		//    200: traceDetailsResponse
 		//
 		{
 			"ServiceTraces",
+			log.TracingLogName,
 			"GET",
 			"/api/namespaces/{namespace}/services/{service}/traces",
-			handlers.ServiceTraces,
+			handlers.ServiceTraces(conf, kialiCache, clientFactory, prom, cpm, traceClientLoader, grafana, discovery),
 			true,
 		},
 		// swagger:route GET /namespaces/{namespace}/workloads/{workload}/traces traces workloadTraces
-		// ---
+		//
 		// Endpoint to get the traces of a given workload
 		//
-		//     Produces:
-		//     - application/json
+		// Produces:
+		// - application/json
 		//
-		//     Schemes: http, https
+		// Schemes: http, https
 		//
-		// responses:
-		//      404: notFoundError
-		//      500: internalError
-		//      200: traceDetailsResponse
+		// Responses:
+		//    403: forbiddenError
+		//    404: notFoundError
+		//    500: internalError
+		//    200: traceDetailsResponse
 		//
 		{
 			"WorkloadTraces",
+			log.TracingLogName,
 			"GET",
 			"/api/namespaces/{namespace}/workloads/{workload}/traces",
-			handlers.WorkloadTraces,
+			handlers.WorkloadTraces(conf, kialiCache, clientFactory, prom, cpm, traceClientLoader, grafana, discovery),
 			true,
 		},
 		// swagger:route GET /namespaces/{namespace}/apps/{app}/errortraces traces errorTraces
-		// ---
+		//
 		// Endpoint to get the number of traces in error for a given service
 		//
-		//     Produces:
-		//     - application/json
+		// Produces:
+		// - application/json
 		//
-		//     Schemes: http, https
+		// Schemes: http, https
 		//
-		// responses:
-		//      404: notFoundError
-		//      500: internalError
-		//      200: errorTracesResponse
+		// Responses:
+		//    403: forbiddenError
+		//    404: notFoundError
+		//    500: internalError
+		//    200: errorTracesResponse
 		//
 		{
 			"ErrorTraces",
+			log.TracingLogName,
 			"GET",
 			"/api/namespaces/{namespace}/apps/{app}/errortraces",
-			handlers.ErrorTraces,
+			handlers.ErrorTraces(conf, kialiCache, clientFactory, prom, cpm, traceClientLoader, grafana, discovery),
 			true,
 		},
 		// swagger:route GET /traces/{traceID} traces traceDetails
-		// ---
+		//
 		// Endpoint to get a specific trace from ID
 		//
-		//     Produces:
-		//     - application/json
+		// Produces:
+		// - application/json
 		//
-		//     Schemes: http, https
+		// Schemes: http, https
 		//
-		// responses:
-		//      404: notFoundError
-		//      500: internalError
-		//      200: traceDetailsResponse
+		// Responses:
+		//    404: notFoundError
+		//    500: internalError
+		//    200: traceDetailsResponse
 		//
 		{
 			"TracesDetails",
+			log.TracingLogName,
 			"GET",
 			"/api/traces/{traceID}",
-			handlers.TraceDetails,
+			handlers.TraceDetails(conf, kialiCache, clientFactory, prom, cpm, traceClientLoader, grafana, discovery),
 			true,
 		},
-		// swagger:route GET /namespaces/{namespace}/workloads workloads workloadList
-		// ---
-		// Endpoint to get the list of workloads for a namespace
+		// swagger:route GET /clusters/workloads workloads workloadList
 		//
-		//     Produces:
-		//     - application/json
+		// Endpoint to get the list of workloads for a cluster
 		//
-		//     Schemes: http, https
+		// Produces:
+		// - application/json
 		//
-		// responses:
-		//      500: internalError
-		//      200: workloadListResponse
+		// Schemes: http, https
+		//
+		// Responses:
+		//    500: internalError
+		//    200: workloadListResponse
 		//
 		{
-			"WorkloadList",
+			"ClusterWorkloads",
+			log.ClustersLogName,
 			"GET",
-			"/api/namespaces/{namespace}/workloads",
-			handlers.WorkloadList,
+			"/api/clusters/workloads",
+			handlers.ClusterWorkloads(conf, kialiCache, clientFactory, cpm, prom, traceClientLoader, grafana, discovery),
 			true,
 		},
 		// swagger:route GET /namespaces/{namespace}/workloads/{workload} workloads workloadDetails
-		// ---
+		//
 		// Endpoint to get the workload details
 		//
-		//     Produces:
-		//     - application/json
+		// Produces:
+		// - application/json
 		//
-		//     Schemes: http, https
+		// Schemes: http, https
 		//
-		// responses:
-		//      500: internalError
-		//      404: notFoundError
-		//      200: workloadDetails
+		// Responses:
+		//    403: forbiddenError
+		//    500: internalError
+		//    404: notFoundError
+		//    200: workloadDetails
 		//
 		{
 			"WorkloadDetails",
+			log.ResourcesLogName,
 			"GET",
 			"/api/namespaces/{namespace}/workloads/{workload}",
-			handlers.WorkloadDetails,
+			handlers.WorkloadDetails(conf, kialiCache, clientFactory, cpm, prom, traceClientLoader, grafana, discovery),
 			true,
 		},
 		// swagger:route PATCH /namespaces/{namespace}/workloads/{workload} workloads workloadUpdate
-		// ---
+		//
 		// Endpoint to update the Workload configuration using Json Merge Patch strategy.
 		//
-		//     Consumes:
-		//	   - application/json
+		// Consumes:
+		// - application/json
 		//
-		//     Produces:
-		//     - application/json
+		// Produces:
+		// - application/json
 		//
-		//     Schemes: http, https
+		// Schemes: http, https
 		//
-		// responses:
-		//      400: badRequestError
-		//      404: notFoundError
-		//      500: internalError
-		//      200: workloadDetails
+		// Responses:
+		//    400: badRequestError
+		//    403: forbiddenError
+		//    404: notFoundError
+		//    500: internalError
+		//    200: workloadDetails
 		//
 		{
 			"WorkloadUpdate",
+			log.ResourcesLogName,
 			"PATCH",
 			"/api/namespaces/{namespace}/workloads/{workload}",
-			handlers.WorkloadUpdate,
+			handlers.WorkloadUpdate(conf, kialiCache, clientFactory, cpm, prom, traceClientLoader, grafana, discovery),
 			true,
 		},
-		// swagger:route GET /namespaces/{namespace}/apps apps appList
-		// ---
-		// Endpoint to get the list of apps for a namespace
+		// swagger:route GET /clusters/apps apps appList
 		//
-		//     Produces:
-		//     - application/json
+		// Endpoint to get the list of apps for a cluster
 		//
-		//     Schemes: http, https
+		// Produces:
+		// - application/json
 		//
-		// responses:
-		//      500: internalError
-		//      200: appListResponse
+		// Schemes: http, https
+		//
+		// Responses:
+		//    500: internalError
+		//    200: appListResponse
 		//
 		{
-			"AppList",
+			"ClustersApps",
+			log.ClustersLogName,
 			"GET",
-			"/api/namespaces/{namespace}/apps",
-			handlers.AppList,
+			"/api/clusters/apps",
+			handlers.ClusterApps(conf, kialiCache, clientFactory, prom, cpm, traceClientLoader, grafana, discovery),
 			true,
 		},
 		// swagger:route GET /namespaces/{namespace}/apps/{app} apps appDetails
-		// ---
+		//
 		// Endpoint to get the app details
 		//
-		//     Produces:
-		//     - application/json
+		// Produces:
+		// - application/json
 		//
-		//     Schemes: http, https
+		// Schemes: http, https
 		//
-		// responses:
-		//      500: internalError
-		//      404: notFoundError
-		//      200: appDetails
+		// Responses:
+		//    403: forbiddenError
+		//    500: internalError
+		//    404: notFoundError
+		//    200: appDetails
 		//
 		{
 			"AppDetails",
+			log.ResourcesLogName,
 			"GET",
 			"/api/namespaces/{namespace}/apps/{app}",
-			handlers.AppDetails,
+			handlers.AppDetails(conf, kialiCache, clientFactory, prom, cpm, traceClientLoader, grafana, discovery),
 			true,
 		},
 		// swagger:route GET /namespaces namespaces namespaceList
-		// ---
+		//
 		// Endpoint to get the list of the available namespaces
 		//
-		//     Produces:
-		//     - application/json
+		// Produces:
+		// - application/json
 		//
-		//     Schemes: http, https
+		// Schemes: http, https
 		//
-		// responses:
-		//      500: internalError
-		//      200: namespaceList
+		// Responses:
+		//    500: internalError
+		//    200: namespaceList
 		//
 		{
 			"NamespaceList",
+			log.ResourcesLogName,
 			"GET",
 			"/api/namespaces",
-			handlers.NamespaceList,
+			handlers.NamespaceList(conf, kialiCache, clientFactory, discovery),
 			true,
 		},
 		// swagger:route PATCH /namespaces/{namespace} namespaces namespaceUpdate
-		// ---
+		//
 		// Endpoint to update the Namespace configuration using Json Merge Patch strategy.
 		//
-		//     Consumes:
-		//	   - application/json
+		// Consumes:
+		// - application/json
 		//
-		//     Produces:
-		//     - application/json
+		// Produces:
+		// - application/json
 		//
-		//     Schemes: http, https
+		// Schemes: http, https
 		//
-		// responses:
-		//      400: badRequestError
-		//      404: notFoundError
-		//      500: internalError
-		//      200: namespaceResponse
+		// Responses:
+		//    400: badRequestError
+		//    403: forbiddenError
+		//    404: notFoundError
+		//    500: internalError
+		//    200: namespaceResponse
 		//
 		{
 			"NamespaceUpdate",
+			log.ResourcesLogName,
 			"PATCH",
 			"/api/namespaces/{namespace}",
-			handlers.NamespaceUpdate,
+			handlers.NamespaceUpdate(conf, kialiCache, clientFactory, discovery),
+			true,
+		},
+		// swagger:route GET /namespaces/{namespace}/info namespaces namespaceInfo
+		//
+		// Endpoint to get info about a single namespace
+		//
+		// Produces:
+		// - application/json
+		//
+		// Schemes: http, https
+		//
+		// Responses:
+		//    403: forbiddenError
+		//    500: internalError
+		//    200: namespaceList
+		//
+		{
+			"NamespaceInfo",
+			log.ResourcesLogName,
+			"GET",
+			"/api/namespaces/{namespace}/info",
+			handlers.NamespaceInfo(conf, kialiCache, clientFactory, discovery),
 			true,
 		},
 		// swagger:route GET /namespaces/{namespace}/services/{service}/metrics services serviceMetrics
-		// ---
+		//
 		// Endpoint to fetch metrics to be displayed, related to a single service
 		//
-		//     Produces:
-		//     - application/json
+		// Produces:
+		// - application/json
 		//
-		//     Schemes: http, https
+		// Schemes: http, https
 		//
-		// responses:
-		//      400: badRequestError
-		//      503: serviceUnavailableError
-		//      200: metricsResponse
+		// Responses:
+		//    400: badRequestError
+		//    403: forbiddenError
+		//    503: serviceUnavailableError
+		//    200: metricsResponse
 		//
 		{
 			"ServiceMetrics",
+			log.MetricsLogName,
 			"GET",
 			"/api/namespaces/{namespace}/services/{service}/metrics",
-			handlers.ServiceMetrics,
+			handlers.ServiceMetrics(conf, kialiCache, discovery, clientFactory, prom),
 			true,
 		},
 		// swagger:route GET /namespaces/{namespace}/aggregates/{aggregate}/{aggregateValue}/metrics aggregates aggregateMetrics
-		// ---
+		//
 		// Endpoint to fetch metrics to be displayed, related to a single aggregate
 		//
-		//     Produces:
-		//     - application/json
+		// Produces:
+		// - application/json
 		//
-		//     Schemes: http, https
+		// Schemes: http, https
 		//
-		// responses:
-		//      400: badRequestError
-		//      503: serviceUnavailableError
-		//      200: metricsResponse
+		// Responses:
+		//    400: badRequestError
+		//    403: forbiddenError
+		//    503: serviceUnavailableError
+		//    200: metricsResponse
 		//
 		{
 			"AggregateMetrics",
+			log.MetricsLogName,
 			"GET",
 			"/api/namespaces/{namespace}/aggregates/{aggregate}/{aggregateValue}/metrics",
-			handlers.AggregateMetrics,
+			handlers.AggregateMetrics(conf, kialiCache, discovery, clientFactory, prom),
 			true,
 		},
 		// swagger:route GET /namespaces/{namespace}/apps/{app}/metrics apps appMetrics
-		// ---
+		//
 		// Endpoint to fetch metrics to be displayed, related to a single app
 		//
-		//     Produces:
-		//     - application/json
+		// Produces:
+		// - application/json
 		//
-		//     Schemes: http, https
+		// Schemes: http, https
 		//
-		// responses:
-		//      400: badRequestError
-		//      503: serviceUnavailableError
-		//      200: metricsResponse
+		// Responses:
+		//    400: badRequestError
+		//    403: forbiddenError
+		//    503: serviceUnavailableError
+		//    200: metricsResponse
 		//
 		{
 			"AppMetrics",
+			log.MetricsLogName,
 			"GET",
 			"/api/namespaces/{namespace}/apps/{app}/metrics",
-			handlers.AppMetrics,
+			handlers.AppMetrics(conf, kialiCache, discovery, clientFactory, prom),
 			true,
 		},
 		// swagger:route GET /namespaces/{namespace}/workloads/{workload}/metrics workloads workloadMetrics
-		// ---
+		//
 		// Endpoint to fetch metrics to be displayed, related to a single workload
 		//
-		//     Produces:
-		//     - application/json
+		// Produces:
+		// - application/json
 		//
-		//     Schemes: http, https
+		// Schemes: http, https
 		//
-		// responses:
-		//      400: badRequestError
-		//      503: serviceUnavailableError
-		//      200: metricsResponse
+		// Responses:
+		//    400: badRequestError
+		//    403: forbiddenError
+		//    503: serviceUnavailableError
+		//    200: metricsResponse
 		//
 		{
 			"WorkloadMetrics",
+			log.MetricsLogName,
 			"GET",
 			"/api/namespaces/{namespace}/workloads/{workload}/metrics",
-			handlers.WorkloadMetrics,
+			handlers.WorkloadMetrics(conf, kialiCache, discovery, clientFactory, prom),
+			true,
+		},
+		// swagger:route GET /namespaces/{namespace}/workloads/{workload}/health/history workloads workloadHealthStatusHistory
+		//
+		// Endpoint to fetch kiali_health_status time series for a workload
+		//
+		// Produces:
+		// - application/json
+		//
+		// Schemes: http, https
+		//
+		// Responses:
+		//    400: badRequestError
+		//    403: forbiddenError
+		//    503: serviceUnavailableError
+		//    200: metricsResponse
+		//
+		{
+			"WorkloadHealthStatusHistory",
+			log.MetricsLogName,
+			"GET",
+			"/api/namespaces/{namespace}/workloads/{workload}/health/history",
+			handlers.HealthStatusHistory(conf, kialiCache, discovery, clientFactory, prom, "workload", "workload"),
+			true,
+		},
+		// swagger:route GET /namespaces/{namespace}/apps/{app}/health/history apps appHealthStatusHistory
+		//
+		// Endpoint to fetch kiali_health_status time series for an app
+		//
+		// Produces:
+		// - application/json
+		//
+		// Schemes: http, https
+		//
+		// Responses:
+		//    400: badRequestError
+		//    403: forbiddenError
+		//    503: serviceUnavailableError
+		//    200: metricsResponse
+		//
+		{
+			"AppHealthStatusHistory",
+			log.MetricsLogName,
+			"GET",
+			"/api/namespaces/{namespace}/apps/{app}/health/history",
+			handlers.HealthStatusHistory(conf, kialiCache, discovery, clientFactory, prom, "app", "app"),
+			true,
+		},
+		// swagger:route GET /namespaces/{namespace}/services/{service}/health/history services serviceHealthStatusHistory
+		//
+		// Endpoint to fetch kiali_health_status time series for a service
+		//
+		// Produces:
+		// - application/json
+		//
+		// Schemes: http, https
+		//
+		// Responses:
+		//    400: badRequestError
+		//    403: forbiddenError
+		//    503: serviceUnavailableError
+		//    200: metricsResponse
+		//
+		{
+			"ServiceHealthStatusHistory",
+			log.MetricsLogName,
+			"GET",
+			"/api/namespaces/{namespace}/services/{service}/health/history",
+			handlers.HealthStatusHistory(conf, kialiCache, discovery, clientFactory, prom, "service", "service"),
+			true,
+		},
+		// swagger:route GET /namespaces/{namespace}/health/history namespaces namespaceHealthStatusHistory
+		//
+		// Endpoint to fetch kiali_health_status time series for a namespace
+		//
+		// Produces:
+		// - application/json
+		//
+		// Schemes: http, https
+		//
+		// Responses:
+		//    400: badRequestError
+		//    403: forbiddenError
+		//    503: serviceUnavailableError
+		//    200: metricsResponse
+		//
+		{
+			"NamespaceHealthStatusHistory",
+			log.MetricsLogName,
+			"GET",
+			"/api/namespaces/{namespace}/health/history",
+			handlers.HealthStatusHistory(conf, kialiCache, discovery, clientFactory, prom, "namespace", ""),
+			true,
+		},
+		// swagger:route GET /namespaces/{namespace}/workloads/{workload}/envoymemory workloads workloadEnvoyMemory
+		//
+		// Endpoint to fetch Envoy proxy memory diagnostics for a workload
+		//
+		// Produces:
+		// - application/json
+		//
+		// Schemes: http, https
+		//
+		// Responses:
+		//    400: badRequestError
+		//    404: notFoundError
+		//    503: serviceUnavailableError
+		//    200: workloadEnvoyMemoryResponse
+		//
+		{
+			"WorkloadEnvoyMemory",
+			log.MetricsLogName,
+			"GET",
+			"/api/namespaces/{namespace}/workloads/{workload}/envoymemory",
+			handlers.WorkloadEnvoyMemory(conf, kialiCache, clientFactory, cpm, prom, traceClientLoader, grafana, discovery),
+			true,
+		},
+		// swagger:route GET /namespaces/{namespace}/controlplanes/{controlplane}/metrics controlplanes controlPlaneMetrics
+		//
+		// Endpoint to fetch metrics to be displayed, related to a single control plane
+		//
+		// Produces:
+		// - application/json
+		//
+		// Schemes: http, https
+		//
+		// Responses:
+		//    400: badRequestError
+		//    403: forbiddenError
+		//    503: serviceUnavailableError
+		//    200: metricsResponse
+		//
+		{
+			"ControlPlaneMetrics",
+			log.MetricsLogName,
+			"GET",
+			"/api/namespaces/{namespace}/controlplanes/{controlplane}/metrics",
+			handlers.ControlPlaneMetrics(conf, kialiCache, discovery, clientFactory, prom, cpm, traceClientLoader, grafana),
+			true,
+		},
+		// swagger:route GET /namespaces/{namespace}/{app}/usage_metrics resource usageMetrics
+		//
+		// Endpoint to fetch metrics to be displayed, related to cpu and memory usage
+		//
+		// Produces:
+		// - application/json
+		//
+		// Schemes: http, https
+		//
+		// Responses:
+		//    400: badRequestError
+		//    403: forbiddenError
+		//    503: serviceUnavailableError
+		//    200: metricsResponse
+		//
+		{
+			"UsageMetrics",
+			log.MetricsLogName,
+			"GET",
+			"/api/namespaces/{namespace}/{app}/usage_metrics",
+			handlers.ResourceUsageMetrics(conf, kialiCache, discovery, clientFactory, prom),
 			true,
 		},
 		// swagger:route GET /namespaces/{namespace}/services/{service}/dashboard services serviceDashboard
-		// ---
+		//
 		// Endpoint to fetch dashboard to be displayed, related to a single service
 		//
-		//     Produces:
-		//     - application/json
+		// Produces:
+		// - application/json
 		//
-		//     Schemes: http, https
+		// Schemes: http, https
 		//
-		// responses:
-		//      400: badRequestError
-		//      503: serviceUnavailableError
-		//      200: dashboardResponse
+		// Responses:
+		//    400: badRequestError
+		//    403: forbiddenError
+		//    503: serviceUnavailableError
+		//    200: dashboardResponse
 		//
 		{
 			"ServiceDashboard",
+			log.MetricsLogName,
 			"GET",
 			"/api/namespaces/{namespace}/services/{service}/dashboard",
-			handlers.ServiceDashboard,
+			handlers.ServiceDashboard(conf, kialiCache, clientFactory, cpm, prom, traceClientLoader, discovery, grafana),
 			true,
 		},
 		// swagger:route GET /namespaces/{namespace}/apps/{app}/dashboard apps appDashboard
-		// ---
+		//
 		// Endpoint to fetch dashboard to be displayed, related to a single app
 		//
-		//     Produces:
-		//     - application/json
+		// Produces:
+		// - application/json
 		//
-		//     Schemes: http, https
+		// Schemes: http, https
 		//
-		// responses:
-		//      400: badRequestError
-		//      503: serviceUnavailableError
-		//      200: dashboardResponse
+		// Responses:
+		//    400: badRequestError
+		//    403: forbiddenError
+		//    503: serviceUnavailableError
+		//    200: dashboardResponse
 		//
 		{
 			"AppDashboard",
+			log.MetricsLogName,
 			"GET",
 			"/api/namespaces/{namespace}/apps/{app}/dashboard",
-			handlers.AppDashboard,
+			handlers.AppDashboard(conf, kialiCache, discovery, clientFactory, prom, grafana),
 			true,
 		},
 		// swagger:route GET /namespaces/{namespace}/workloads/{workload}/dashboard workloads workloadDashboard
-		// ---
+		//
 		// Endpoint to fetch dashboard to be displayed, related to a single workload
 		//
-		//     Produces:
-		//     - application/json
+		// Produces:
+		// - application/json
 		//
-		//     Schemes: http, https
+		// Schemes: http, https
 		//
-		// responses:
-		//      400: badRequestError
-		//      503: serviceUnavailableError
-		//      200: dashboardResponse
+		// Responses:
+		//    400: badRequestError
+		//    403: forbiddenError
+		//    503: serviceUnavailableError
+		//    200: dashboardResponse
 		//
 		{
 			"WorkloadDashboard",
+			log.MetricsLogName,
 			"GET",
 			"/api/namespaces/{namespace}/workloads/{workload}/dashboard",
-			handlers.WorkloadDashboard,
+			handlers.WorkloadDashboard(conf, kialiCache, clientFactory, discovery, prom, grafana),
+			true,
+		},
+		// swagger:route GET /namespaces/{namespace}/ztunnel/{workload}/dashboard workloads ztunnelDashboard
+		//
+		// Endpoint to fetch dashboard to be displayed, related to a ztunnel workload
+		//
+		// Produces:
+		// - application/json
+		//
+		// Schemes: http, https
+		//
+		// Responses:
+		//    400: badRequestError
+		//    403: forbiddenError
+		//    503: serviceUnavailableError
+		//    200: dashboardResponse
+		//
+		{
+			"ZtunnelDashboard",
+			log.MetricsLogName,
+			"GET",
+			"/api/namespaces/{namespace}/ztunnel/{workload}/dashboard",
+			handlers.ZtunnelDashboard(conf, kialiCache, discovery, clientFactory, grafana, prom),
 			true,
 		},
 		// swagger:route GET /namespaces/{namespace}/customdashboard/{dashboard} dashboards customDashboard
-		// ---
+		//
 		// Endpoint to fetch a custom dashboard
 		//
-		//     Produces:
-		//     - application/json
+		// Produces:
+		// - application/json
 		//
-		//     Schemes: http, https
+		// Schemes: http, https
 		//
-		// responses:
-		//      400: badRequestError
-		//      503: serviceUnavailableError
-		//      200: dashboardResponse
+		// Responses:
+		//    400: badRequestError
+		//    403: forbiddenError
+		//    503: serviceUnavailableError
+		//    200: dashboardResponse
 		//
 		{
 			"CustomDashboard",
+			log.MetricsLogName,
 			"GET",
 			"/api/namespaces/{namespace}/customdashboard/{dashboard}",
-			handlers.CustomDashboard,
-			true,
-		},
-		// swagger:route GET /namespaces/{namespace}/services/{service}/health services serviceHealth
-		// ---
-		// Get health associated to the given service
-		//
-		//     Produces:
-		//     - application/json
-		//
-		//     Schemes: http, https
-		//
-		// responses:
-		//      200: serviceHealthResponse
-		//      404: notFoundError
-		//      500: internalError
-		//
-		{
-			"ServiceHealth",
-			"GET",
-			"/api/namespaces/{namespace}/services/{service}/health",
-			handlers.ServiceHealth,
-			true,
-		},
-		// swagger:route GET /namespaces/{namespace}/apps/{app}/health apps appHealth
-		// ---
-		// Get health associated to the given app
-		//
-		//     Produces:
-		//     - application/json
-		//
-		//     Schemes: http, https
-		//
-		// responses:
-		//      200: appHealthResponse
-		//      404: notFoundError
-		//      500: internalError
-		//
-		{
-			"AppHealth",
-			"GET",
-			"/api/namespaces/{namespace}/apps/{app}/health",
-			handlers.AppHealth,
-			true,
-		},
-		// swagger:route GET /namespaces/{namespace}/workloads/{workload}/health workloads workloadHealth
-		// ---
-		// Get health associated to the given workload
-		//
-		//     Produces:
-		//     - application/json
-		//
-		//     Schemes: http, https
-		//
-		// responses:
-		//      200: workloadHealthResponse
-		//      404: notFoundError
-		//      500: internalError
-		//
-		{
-			"WorkloadHealth",
-			"GET",
-			"/api/namespaces/{namespace}/workloads/{workload}/health",
-			handlers.WorkloadHealth,
+			handlers.CustomDashboard(conf, kialiCache, clientFactory, discovery, grafana, prom, traceClientLoader, cpm),
 			true,
 		},
 		// swagger:route GET /namespaces/{namespace}/metrics namespaces namespaceMetrics
-		// ---
+		//
 		// Endpoint to fetch metrics to be displayed, related to a namespace
 		//
-		//     Produces:
-		//     - application/json
+		// Produces:
+		// - application/json
 		//
-		//     Schemes: http, https
+		// Schemes: http, https
 		//
-		// responses:
-		//      400: badRequestError
-		//      503: serviceUnavailableError
-		//      200: metricsResponse
+		// Responses:
+		//    400: badRequestError
+		//    403: forbiddenError
+		//    503: serviceUnavailableError
+		//    200: metricsResponse
 		//
 		{
 			"NamespaceMetrics",
+			log.MetricsLogName,
 			"GET",
 			"/api/namespaces/{namespace}/metrics",
-			handlers.NamespaceMetrics,
+			handlers.NamespaceMetrics(conf, kialiCache, discovery, clientFactory, prom),
 			true,
 		},
-		// swagger:route GET /namespaces/{namespace}/health namespaces namespaceHealth
-		// ---
-		// Get health for all objects in the given namespace
+		// swagger:route GET /clusters/health cluster namespaces Health
 		//
-		//     Produces:
-		//     - application/json
+		// Get health for all objects in namespaces of the given cluster
 		//
-		//     Schemes: http, https
+		// Produces:
+		// - application/json
 		//
-		// responses:
-		//      200: namespaceAppHealthResponse
-		//      400: badRequestError
-		//      500: internalError
+		// Schemes: http, https
+		//
+		// Responses:
+		//    200: clustersNamespaceHealthResponse
+		//    400: badRequestError
+		//    500: internalError
 		//
 		{
-			"NamespaceHealth",
+			"ClustersHealth",
+			log.ClustersLogName,
 			"GET",
-			"/api/namespaces/{namespace}/health",
-			handlers.NamespaceHealth,
+			"/api/clusters/health",
+			handlers.ClusterHealth(conf, kialiCache, clientFactory, prom, traceClientLoader, discovery, cpm, grafana),
 			true,
 		},
 		// swagger:route GET /namespaces/{namespace}/validations namespaces namespaceValidations
-		// ---
+		//
 		// Get validation summary for all objects in the given namespace
 		//
-		//     Produces:
-		//     - application/json
+		// Produces:
+		// - application/json
 		//
-		//     Schemes: http, https
+		// Schemes: http, https
 		//
-		// responses:
-		//      200: namespaceValidationSummaryResponse
-		//      400: badRequestError
-		//      500: internalError
+		// Responses:
+		//    200: namespaceValidationSummaryResponse
+		//    400: badRequestError
+		//    403: forbiddenError
+		//    500: internalError
 		//
 		{
 			"NamespaceValidationSummary",
+			log.ValidationLogName,
 			"GET",
 			"/api/namespaces/{namespace}/validations",
-			handlers.NamespaceValidationSummary,
+			handlers.NamespaceValidationSummary(conf, kialiCache, clientFactory, prom, cpm, traceClientLoader, grafana, discovery),
+			true,
+		},
+		// swagger:route GET /istio/validations namespaces namespacesValidations
+		//
+		// Get validation summary for all objects in the given namespaces
+		//
+		// Produces:
+		// - application/json
+		//
+		// Schemes: http, https
+		//
+		// Responses:
+		//    200: namespaceValidationSummaryResponse
+		//    400: badRequestError
+		//    500: internalError
+		//
+		{
+			"ConfigValidationSummary",
+			log.ValidationLogName,
+			"GET",
+			"/api/istio/validations",
+			handlers.IstioConfigValidationSummary(conf, kialiCache, clientFactory, prom, cpm, traceClientLoader, grafana, discovery),
 			true,
 		},
 		// swagger:route GET /mesh/tls tls meshTls
-		// ---
+		//
 		// Get TLS status for the whole mesh
 		//
-		//     Produces:
-		//     - application/json
+		// Produces:
+		// - application/json
 		//
-		//     Schemes: http, https
+		// Schemes: http, https
 		//
-		// responses:
-		//      200: meshTlsResponse
-		//      400: badRequestError
-		//      500: internalError
+		// Responses:
+		//    200: meshTlsResponse
+		//    400: badRequestError
+		//    500: internalError
 		//
 		{
-			"NamespaceTls",
+			"MeshTls",
+			log.StatusLogName,
 			"GET",
 			"/api/mesh/tls",
-			handlers.MeshTls,
+			handlers.MeshTls(conf, kialiCache, clientFactory, prom, cpm, traceClientLoader, grafana, discovery),
 			true,
 		},
 		// swagger:route GET /namespaces/{namespace}/tls tls namespaceTls
-		// ---
+		//
 		// Get TLS status for the given namespace
 		//
-		//     Produces:
-		//     - application/json
+		// Produces:
+		// - application/json
 		//
-		//     Schemes: http, https
+		// Schemes: http, https
 		//
-		// responses:
-		//      200: namespaceTlsResponse
-		//      400: badRequestError
-		//      500: internalError
+		// Responses:
+		//    200: namespaceTlsResponse
+		//    400: badRequestError
+		//    403: forbiddenError
+		//    500: internalError
 		//
 		{
 			"NamespaceTls",
+			log.StatusLogName,
 			"GET",
 			"/api/namespaces/{namespace}/tls",
-			handlers.NamespaceTls,
+			handlers.NamespaceTls(conf, kialiCache, clientFactory, prom, cpm, traceClientLoader, grafana, discovery),
+			true,
+		},
+		// swagger:route GET /clusters/tls tls ClustersTls
+		//
+		// Get TLS statuses for given namespaces of the given cluster
+		//
+		// Produces:
+		// - application/json
+		//
+		// Schemes: http, https
+		//
+		// Responses:
+		//    200: clusterTlsResponse
+		//    400: badRequestError
+		//    500: internalError
+		//
+		{
+			"ClusterTls",
+			log.ClustersLogName,
+			"GET",
+			"/api/clusters/tls",
+			handlers.ClustersTls(conf, kialiCache, clientFactory, prom, cpm, traceClientLoader, grafana, discovery),
 			true,
 		},
 		// swagger:route GET /istio/status status istioStatus
-		// ---
+		//
 		// Get the status of each components needed in the control plane
 		//
-		//     Produces:
-		//     - application/json
+		// Produces:
+		// - application/json
 		//
-		//     Schemes: http, https
+		// Schemes: http, https
 		//
-		// responses:
-		//      200: istioStatusResponse
-		//      400: badRequestError
-		//      500: internalError
+		// Responses:
+		//    200: istioStatusResponse
+		//    400: badRequestError
+		//    500: internalError
 		//
 		{
 			"IstioStatus",
+			log.StatusLogName,
 			"GET",
 			"/api/istio/status",
-			handlers.IstioStatus,
+			handlers.IstioStatus(conf, kialiCache, clientFactory, prom, traceClientLoader, discovery, cpm, grafana),
 			true,
 		},
 		// swagger:route GET /namespaces/graph graphs graphNamespaces
-		// ---
+		//
 		// The backing JSON for a namespaces graph.
 		//
-		//     Produces:
-		//     - application/json
+		// Produces:
+		// - application/json
 		//
-		//     Schemes: http, https
+		// Schemes: http, https
 		//
-		// responses:
-		//      400: badRequestError
-		//      500: internalError
-		//      200: graphResponse
+		// Responses:
+		//    400: badRequestError
+		//    500: internalError
+		//    200: graphResponse
 		//
 		{
 			"GraphNamespaces",
+			log.GraphLogName,
 			"GET",
 			"/api/namespaces/graph",
-			handlers.GraphNamespaces,
+			handlers.GraphNamespaces(conf, kialiCache, clientFactory, prom, cpm, traceClientLoader, grafana, discovery, graphCache, refreshJobManager),
 			true,
 		},
 		// swagger:route GET /namespaces/{namespace}/aggregates/{aggregate}/{aggregateValue}/graph graphs graphAggregate
-		// ---
+		//
 		// The backing JSON for an aggregate node detail graph. (supported graphTypes: app | versionedApp | workload)
 		//
-		//     Produces:
-		//     - application/json
+		// Produces:
+		// - application/json
 		//
-		//     Schemes: http, https
+		// Schemes: http, https
 		//
-		// responses:
-		//      400: badRequestError
-		//      500: internalError
-		//      200: graphResponse
+		// Responses:
+		//    400: badRequestError
+		//    403: forbiddenError
+		//    500: internalError
+		//    200: graphResponse
 		//
 		{
-
 			"GraphAggregate",
+			log.GraphLogName,
 			"GET",
 			"/api/namespaces/{namespace}/aggregates/{aggregate}/{aggregateValue}/graph",
-			handlers.GraphNode,
+			handlers.GraphNode(conf, kialiCache, clientFactory, prom, cpm, traceClientLoader, grafana, discovery),
 			true,
 		},
 		// swagger:route GET /namespaces/{namespace}/aggregates/{aggregate}/{aggregateValue}/{service}/graph graphs graphAggregateByService
-		// ---
+		//
 		// The backing JSON for an aggregate node detail graph, specific to a service. (supported graphTypes: app | versionedApp | workload)
 		//
-		//     Produces:
-		//     - application/json
+		// Produces:
+		// - application/json
 		//
-		//     Schemes: http, https
+		// Schemes: http, https
 		//
-		// responses:
-		//      400: badRequestError
-		//      500: internalError
-		//      200: graphResponse
+		// Responses:
+		//    400: badRequestError
+		//    403: forbiddenError
+		//    500: internalError
+		//    200: graphResponse
 		//
 		{
-
 			"GraphAggregateByService",
+			log.GraphLogName,
 			"GET",
 			"/api/namespaces/{namespace}/aggregates/{aggregate}/{aggregateValue}/{service}/graph",
-			handlers.GraphNode,
+			handlers.GraphNode(conf, kialiCache, clientFactory, prom, cpm, traceClientLoader, grafana, discovery),
 			true,
 		},
 		// swagger:route GET /namespaces/{namespace}/applications/{app}/versions/{version}/graph graphs graphAppVersion
-		// ---
+		//
 		// The backing JSON for a versioned app node detail graph. (supported graphTypes: app | versionedApp)
 		//
-		//     Produces:
-		//     - application/json
+		// Produces:
+		// - application/json
 		//
-		//     Schemes: http, https
+		// Schemes: http, https
 		//
-		// responses:
-		//      400: badRequestError
-		//      500: internalError
-		//      200: graphResponse
+		// Responses:
+		//    400: badRequestError
+		//    403: forbiddenError
+		//    500: internalError
+		//    200: graphResponse
 		//
 		{
-
 			"GraphAppVersion",
+			log.GraphLogName,
 			"GET",
 			"/api/namespaces/{namespace}/applications/{app}/versions/{version}/graph",
-			handlers.GraphNode,
+			handlers.GraphNode(conf, kialiCache, clientFactory, prom, cpm, traceClientLoader, grafana, discovery),
 			true,
 		},
 		// swagger:route GET /namespaces/{namespace}/applications/{app}/graph graphs graphApp
-		// ---
+		//
 		// The backing JSON for an app node detail graph. (supported graphTypes: app | versionedApp)
 		//
-		//     Produces:
-		//     - application/json
+		// Produces:
+		// - application/json
 		//
-		//     Schemes: http, https
+		// Schemes: http, https
 		//
-		// responses:
-		//      400: badRequestError
-		//      500: internalError
-		//      200: graphResponse
+		// Responses:
+		//    400: badRequestError
+		//    403: forbiddenError
+		//    500: internalError
+		//    200: graphResponse
 		//
 		{
 			"GraphApp",
+			log.GraphLogName,
 			"GET",
 			"/api/namespaces/{namespace}/applications/{app}/graph",
-			handlers.GraphNode,
+			handlers.GraphNode(conf, kialiCache, clientFactory, prom, cpm, traceClientLoader, grafana, discovery),
 			true,
 		},
 		// swagger:route GET /namespaces/{namespace}/services/{service}/graph graphs graphService
-		// ---
+		//
 		// The backing JSON for a service node detail graph.
 		//
-		//     Produces:
-		//     - application/json
+		// Produces:
+		// - application/json
 		//
-		//     Schemes: http, https
+		// Schemes: http, https
 		//
-		// responses:
-		//      400: badRequestError
-		//      500: internalError
-		//      200: graphResponse
+		// Responses:
+		//    400: badRequestError
+		//    403: forbiddenError
+		//    500: internalError
+		//    200: graphResponse
 		//
 		{
 			"GraphService",
+			log.GraphLogName,
 			"GET",
 			"/api/namespaces/{namespace}/services/{service}/graph",
-			handlers.GraphNode,
+			handlers.GraphNode(conf, kialiCache, clientFactory, prom, cpm, traceClientLoader, grafana, discovery),
 			true,
 		},
 		// swagger:route GET /namespaces/{namespace}/workloads/{workload}/graph graphs graphWorkload
-		// ---
+		//
 		// The backing JSON for a workload node detail graph.
 		//
-		//     Produces:
-		//     - application/json
+		// Produces:
+		// - application/json
 		//
-		//     Schemes: http, https
+		// Schemes: http, https
 		//
-		// responses:
-		//      400: badRequestError
-		//      500: internalError
-		//      200: graphResponse
+		// Responses:
+		//    400: badRequestError
+		//    403: forbiddenError
+		//    500: internalError
+		//    200: graphResponse
 		//
 		{
 			"GraphWorkload",
+			log.GraphLogName,
 			"GET",
 			"/api/namespaces/{namespace}/workloads/{workload}/graph",
-			handlers.GraphNode,
+			handlers.GraphNode(conf, kialiCache, clientFactory, prom, cpm, traceClientLoader, grafana, discovery),
+			true,
+		},
+		// swagger:route GET /mesh/graph meshGraph
+		//
+		// The backing JSON for a mesh graph
+		//
+		// Produces:
+		// - application/json
+		//
+		// Schemes: http, https
+		//
+		// Responses:
+		//    400: badRequestError
+		//    500: internalError
+		//    200: graphResponse
+		//
+		{
+			"MeshGraph",
+			log.GraphLogName,
+			"GET",
+			"/api/mesh/graph",
+			handlers.MeshGraph(conf, clientFactory, kialiCache, grafana, perses, prom, traceClientLoader, discovery, cpm),
+			true,
+		},
+		// swagger:route GET /mesh/controlplanes controlplanes
+		//
+		// The backing JSON for mesh controlplanes
+		//
+		// Produces:
+		// - application/json
+		//
+		// Schemes: http, https
+		//
+		// Responses:
+		//    400: badRequestError
+		//    500: internalError
+		//    200: graphResponse
+		//
+		{
+			"MeshControlPlanes",
+			log.MeshLogName,
+			"GET",
+			"/api/mesh/controlplanes",
+			handlers.ControlPlanes(kialiCache, clientFactory, conf, discovery, cpm, prom, traceClientLoader, grafana),
 			true,
 		},
 		// swagger:route GET /grafana integrations grafanaInfo
-		// ---
+		//
 		// Get the grafana URL and other descriptors
+		//
+		// Produces:
+		// - application/json
+		//
+		// Schemes: http, https
+		//
+		// Responses:
+		//    500: internalError
+		//    503: serviceUnavailableError
+		//    200: grafanaInfoResponse
+		//    204: noContent
+		//
+		{
+			"GrafanaURL",
+			log.ConfigLogName,
+			"GET",
+			"/api/grafana",
+			handlers.GetGrafanaInfo(conf, grafana),
+			true,
+		},
+		// swagger:route GET /perses integrations persesInfo
+		//
+		// Get the perses URL and other descriptors
+		//
+		// Produces:
+		// - application/json
+		//
+		// Schemes: http, https
+		//
+		// Responses:
+		//    500: internalError
+		//    503: serviceUnavailableError
+		//    200: persesInfoResponse
+		//    204: noContent
+		//
+		{
+			"PersesURL",
+			log.ConfigLogName,
+			"GET",
+			"/api/perses",
+			handlers.GetPersesInfo(conf, perses),
+			true,
+		},
+		// swagger:route GET /tracing integrations tracingInfo
+		//
+		// Get the tracing URL and other descriptors
+		//
+		// Produces:
+		// - application/json
+		//
+		// Schemes: http, https
+		//
+		// Responses:
+		//    404: notFoundError
+		//    406: notAcceptableError
+		//    200: tracingInfoResponse
+		//
+		{
+			"TracingURL",
+			log.ConfigLogName,
+			"GET",
+			"/api/tracing",
+			handlers.GetTracingInfo(conf),
+			true,
+		},
+		// swagger:route GET /namespaces/{namespace}/pods/{pod} pods podDetails
+		//
+		// Endpoint to get pod details
+		//
+		// Produces:
+		// - application/json
+		//
+		// Schemes: http, https
+		//
+		// Responses:
+		//    403: forbiddenError
+		//    500: internalError
+		//    404: notFoundError
+		//    200: workloadDetails
+		//
+		{
+			"PodDetails",
+			log.ResourcesLogName,
+			"GET",
+			"/api/namespaces/{namespace}/pods/{pod}",
+			handlers.PodDetails(conf, kialiCache, clientFactory, cpm, prom, traceClientLoader, grafana, discovery),
+			true,
+		},
+		// swagger:route GET /namespaces/{namespace}/pods/{pod}/logs pods podLogs
+		//
+		// Endpoint to get pod logs
+		//
+		// Produces:
+		// - application/json
+		//
+		// Schemes: http, https
+		//
+		// Responses:
+		//    403: forbiddenError
+		//    500: internalError
+		//    404: notFoundError
+		//    200: workloadDetails
+		//
+		{
+			"PodLogs",
+			log.ResourcesLogName,
+			"GET",
+			"/api/namespaces/{namespace}/pods/{pod}/logs",
+			handlers.PodLogs(conf, kialiCache, clientFactory, cpm, prom, traceClientLoader, grafana, discovery),
+			true,
+		},
+		// swagger:route GET /namespaces/{namespace}/pods/{pod}/config_dump pods podProxyDump
+		//
+		// Endpoint to get pod proxy dump
+		//
+		// Produces:
+		// - application/json
+		//
+		// Schemes: http, https
+		//
+		// Responses:
+		//    403: forbiddenError
+		//    500: internalError
+		//    404: notFoundError
+		//    200: configDump
+		//
+		{
+			"PodConfigDump",
+			log.ResourcesLogName,
+			"GET",
+			"/api/namespaces/{namespace}/pods/{pod}/config_dump",
+			handlers.ConfigDump(conf, kialiCache, clientFactory, discovery),
+			true,
+		},
+		// swagger:route GET /namespaces/{namespace}/pods/{pod}/config_dump/{resource} pods podProxyResource
+		//
+		// Endpoint to get pod resource entries
+		//
+		// Produces:
+		// - application/json
+		//
+		// Schemes: http, https
+		//
+		// Responses:
+		//    403: forbiddenError
+		//    500: internalError
+		//    404: notFoundError
+		//    200: configDumpResource
+		//
+		{
+			"PodProxyResource",
+			log.ResourcesLogName,
+			"GET",
+			"/api/namespaces/{namespace}/pods/{pod}/config_dump/{resource}",
+			handlers.ConfigDumpResourceEntries(conf, kialiCache, clientFactory, discovery),
+			true,
+		},
+		// swagger:route GET /namespaces/{namespace}/pods/{pod}/config_dump_ztunnel pods ztunnelConfigDump
+		//
+		// Endpoint to get ztunnel pod config dump
+		//
+		// Produces:
+		// - application/json
+		//
+		// Schemes: http, https
+		//
+		// Responses:
+		//    403: forbiddenError
+		//    500: internalError
+		//    404: notFoundError
+		//    200: ztunnelConfigDump
+		//
+		{
+			"ZtunnelConfigDump",
+			log.ResourcesLogName,
+			"GET",
+			"/api/namespaces/{namespace}/pods/{pod}/config_dump_ztunnel",
+			handlers.ConfigDumpZtunnel(conf, kialiCache, clientFactory, cpm, prom, traceClientLoader, grafana, discovery),
+			true,
+		},
+		// swagger:route POST /namespaces/{namespace}/pods/{pod}/logging pods podProxyLogging
+		//
+		// Endpoint to set pod proxy log level
+		//
+		// Produces:
+		// - application/json
+		//
+		// Schemes: http, https
+		//
+		// Responses:
+		//    500: internalError
+		//    404: notFoundError
+		//    400: badRequestError
+		//    403: forbiddenError
+		//    200: noContent
+		//
+		{
+			"PodProxyLogging",
+			log.ResourcesLogName,
+			"POST",
+			"/api/namespaces/{namespace}/pods/{pod}/logging",
+			handlers.LoggingUpdate(conf, kialiCache, clientFactory, cpm, prom, traceClientLoader, grafana, discovery),
+			true,
+		},
+		// swagger:route GET /clusters/metrics clusterName namespaces clustersMetrics
+		//
+		// Endpoint to fetch metrics to be displayed, related to all provided namespaces of provided cluster
+		//
+		// Produces:
+		// - application/json
+		//
+		// Schemes: http, https
+		//
+		// Responses:
+		//    400: badRequestError
+		//    503: serviceUnavailableError
+		//    200: metricsResponse
+		//
+		{
+			"ClustersMetrics",
+			log.ClustersLogName,
+			"GET",
+			"/api/clusters/metrics",
+			handlers.ClustersMetrics(conf, kialiCache, discovery, clientFactory, prom),
+			true,
+		},
+		// swagger:route POST /stats/metrics stats metricsStats
+		//
+		// Produces metrics statistics
+		//
+		// Produces:
+		// - application/json
+		//
+		// Schemes: http, https
+		//
+		// Responses:
+		//    400: badRequestError
+		//    403: forbiddenError
+		//    503: serviceUnavailableError
+		//    500: internalError
+		//    200: metricsStatsResponse
+		{
+			Name:          "MetricsStats",
+			LogGroupName:  log.MetricsLogName,
+			Method:        "POST",
+			Pattern:       "/api/stats/metrics",
+			HandlerFunc:   handlers.MetricsStats(conf, kialiCache, discovery, clientFactory, prom),
+			Authenticated: true,
+		},
+		// swagger:route GET /overview/metrics/services/latency overview overviewServiceLatencies
+		//
+		// Endpoint to fetch top service latencies (p95) across all clusters and namespaces
+		//
+		// Produces:
+		// - application/json
+		//
+		// Schemes: http, https
+		//
+		// Responses:
+		//    400: badRequestError
+		//    503: serviceUnavailableError
+		//    200: serviceLatencyResponse
+		{
+			Name:          "OverviewServiceLatencies",
+			LogGroupName:  log.MetricsLogName,
+			Method:        "GET",
+			Pattern:       "/api/overview/metrics/services/latency",
+			HandlerFunc:   handlers.OverviewServiceLatencies(conf, kialiCache, clientFactory, cpm, prom, traceClientLoader, grafana, discovery),
+			Authenticated: true,
+		},
+		// swagger:route GET /overview/metrics/services/rates overview overviewServiceRates
+		//
+		// Endpoint to fetch top service error rates across all clusters and namespaces
+		//
+		// Produces:
+		// - application/json
+		//
+		// Schemes: http, https
+		//
+		// Responses:
+		//    400: badRequestError
+		//    503: serviceUnavailableError
+		//    200: serviceRequestsResponse
+		{
+			Name:          "OverviewServiceRates",
+			LogGroupName:  log.MetricsLogName,
+			Method:        "GET",
+			Pattern:       "/api/overview/metrics/services/rates",
+			HandlerFunc:   handlers.OverviewServiceRates(conf, kialiCache, clientFactory, cpm, prom, traceClientLoader, grafana, discovery),
+			Authenticated: true,
+		},
+		// swagger:route GET /overview/metrics/services/throughput overview overviewServiceThroughput
+		//
+		// Endpoint to fetch top service throughput (bytes/s) across all clusters and namespaces
+		//
+		// Produces:
+		// - application/json
+		//
+		// Schemes: http, https
+		//
+		// Responses:
+		//    400: badRequestError
+		//    503: serviceUnavailableError
+		//    200: serviceThroughputResponse
+		{
+			Name:          "OverviewServiceThroughput",
+			LogGroupName:  log.MetricsLogName,
+			Method:        "GET",
+			Pattern:       "/api/overview/metrics/services/throughput",
+			HandlerFunc:   handlers.OverviewServiceThroughput(conf, kialiCache, clientFactory, cpm, prom, traceClientLoader, grafana, discovery),
+			Authenticated: true,
+		},
+		// swagger:route GET /overview/metrics/apps/rates overview overviewAppRates
+		//
+		// Endpoint to fetch app request rates across all clusters and namespaces
+		//
+		// Produces:
+		// - application/json
+		//
+		// Schemes: http, https
+		//
+		// Responses:
+		//    400: badRequestError
+		//    503: serviceUnavailableError
+		//    200: appRatesResponse
+		{
+			Name:          "OverviewAppRates",
+			LogGroupName:  log.MetricsLogName,
+			Method:        "GET",
+			Pattern:       "/api/overview/metrics/apps/rates",
+			HandlerFunc:   handlers.OverviewAppRates(conf, kialiCache, clientFactory, cpm, prom, traceClientLoader, grafana, discovery),
+			Authenticated: true,
+		},
+		// swagger:route GET /chat/prompts chat chatPrompts
+		//
+		// Endpoint to list built-in chatbot prompt suggestions
+		//
+		// Produces:
+		// - application/json
+		//
+		// Schemes: http, https
+		//
+		// Responses:
+		//    500: internalError
+		//    200
+		//
+		{
+			"ChatPrompts",
+			log.ChatAILogName,
+			"GET",
+			"/api/chat/prompts",
+			handlers.ChatPrompts(conf, kialiCache, clientFactory),
+			true,
+		},
+		// swagger:route POST /chat/{provider}/{model}/ai chat aiChatAI
+		//
+		// Endpoint to chat with AI
+		//
+		// Produces:
+		// - application/json
+		//
+		// Schemes: http, https
+		//
+		// Responses:
+		//    500: internalError
+		//    404: notFoundError
+		//    400: badRequestError
+		//    200: noContent
+		//
+		{
+			"ChatAI",
+			log.ChatAILogName,
+			"POST",
+			"/api/chat/{provider}/{model}/ai",
+			handlers.ChatAI(conf, kialiCache, aiStore, clientFactory, prom, cpm, traceClientLoader, grafana, perses, discovery),
+			true,
+		},
+		// swagger:route POST /chat/mcp/{tool_name} chat MCPTools
+		//
+		// Endpoint to call MCP tool
+		//
+		// Produces:
+		// - application/json
+		//
+		// Schemes: http, https
+		//
+		// Responses:
+		//    500: internalError
+		//    404: notFoundError
+		//    400: badRequestError
+		//    200: noContent
+		//
+		{
+			"ChatMCP",
+			log.ChatAILogName,
+			"POST",
+			"/api/chat/mcp/{tool_name}",
+			handlers.ChatMCP(conf, kialiCache, aiStore, clientFactory, prom, cpm, traceClientLoader, grafana, perses, discovery),
+			true,
+		},
+		// swagger:route DELETE /chat/conversations ChatConversations
+		//
+		// Endpoint to delete AI chat conversations
+		//
+		// Produces:
+		// - application/json
+		//
+		// Schemes: http, https
+		//
+		// Responses:
+		//    500: internalError
+		//    400: badRequestError
+		//    200: noContent
+		//
+		{
+			"DeleteConversations",
+			log.ChatAILogName,
+			"DELETE",
+			"/api/chat/conversations",
+			handlers.DeleteConversations(conf, aiStore),
+			true,
+		},
+		// swagger:route GET /ai/usage/user chat aiUserUsage
+		// ---
+		// Endpoint to get current-session token usage, user-scoped historical metrics, and budget status
 		//
 		//     Produces:
 		//     - application/json
@@ -1231,316 +2117,38 @@ func NewRoutes() (r *Routes) {
 		// responses:
 		//      500: internalError
 		//      503: serviceUnavailableError
-		//      200: grafanaInfoResponse
-		//      204: noContent
+		//      400: badRequestError
 		//
 		{
-			"GrafanaURL",
+			"AIUserUsage",
+			log.ChatAILogName,
 			"GET",
-			"/api/grafana",
-			handlers.GetGrafanaInfo,
+			"/api/ai/usage/user",
+			handlers.AIUserUsage(conf, aiStore, prom),
 			true,
 		},
-		// swagger:route GET /jaeger integrations jaegerInfo
+		// swagger:route GET /api/ai/usage chat aiChatUsage
 		// ---
-		// Get the jaeger URL and other descriptors
+		// Endpoint to get token usage statistics for the current cluster
 		//
-		//     Produces:
-		//     - application/json
+		// Produces:
+		// - application/json
 		//
-		//     Schemes: http, https
+		// Schemes: http, https
 		//
-		// responses:
-		//      404: notFoundError
-		//      406: notAcceptableError
-		//      200: jaegerInfoResponse
-		//
-		{
-			"JaegerURL",
-			"GET",
-			"/api/jaeger",
-			handlers.GetJaegerInfo,
-			true,
-		},
-		// swagger:route GET /namespaces/{namespace}/pods/{pod} pods podDetails
-		// ---
-		// Endpoint to get pod details
-		//
-		//     Produces:
-		//     - application/json
-		//
-		//     Schemes: http, https
-		//
-		// responses:
-		//      500: internalError
-		//      404: notFoundError
-		//      200: workloadDetails
-		//
-		{
-			"PodDetails",
-			"GET",
-			"/api/namespaces/{namespace}/pods/{pod}",
-			handlers.PodDetails,
-			true,
-		},
-		// swagger:route GET /namespaces/{namespace}/pods/{pod}/logs pods podLogs
-		// ---
-		// Endpoint to get pod logs
-		//
-		//     Produces:
-		//     - application/json
-		//
-		//     Schemes: http, https
-		//
-		// responses:
-		//      500: internalError
-		//      404: notFoundError
-		//      200: workloadDetails
-		//
-		{
-			"PodLogs",
-			"GET",
-			"/api/namespaces/{namespace}/pods/{pod}/logs",
-			handlers.PodLogs,
-			true,
-		},
-		// swagger:route GET /namespaces/{namespace}/pods/{pod}/config_dump pods podProxyDump
-		// ---
-		// Endpoint to get pod proxy dump
-		//
-		//     Produces:
-		//     - application/json
-		//
-		//     Schemes: http, https
-		//
-		// responses:
-		//      500: internalError
-		//      404: notFoundError
-		//      200: configDump
-		//
-		{
-			"PodConfigDump",
-			"GET",
-			"/api/namespaces/{namespace}/pods/{pod}/config_dump",
-			handlers.ConfigDump,
-			true,
-		},
-		// swagger:route GET /namespaces/{namespace}/pods/{pod}/config_dump/{resource} pods podProxyResource
-		// ---
-		// Endpoint to get pod logs
-		//
-		//     Produces:
-		//     - application/json
-		//
-		//     Schemes: http, https
-		//
-		// responses:
-		//      500: internalError
-		//      404: notFoundError
-		//      200: configDumpResource
-		//
-		{
-			"PodConfigDump",
-			"GET",
-			"/api/namespaces/{namespace}/pods/{pod}/config_dump/{resource}",
-			handlers.ConfigDumpResourceEntries,
-			true,
-		},
-		// swagger:route GET /iter8
-		// ---
-		// Endpoint to check if iter8 adapter is present in the cluster and if user can write adapter config
-		//
-		//		Produces:
-		//		- application/json
-		//
-		//		Schemes: http, https
-		//
-		// responses:
-		//		500: internalError
-		//		200: iter8StatusResponse
-		{
-			"Iter8Info",
-			"GET",
-			"/api/iter8",
-			handlers.Iter8Status,
-			true,
-		},
-		// swagger:route GET /iter8/namespaces/{namespace}/experiments/{name} iter8 getIter8Experiments
-		// ---
-		// Endpoint to fetch iter8 experiments by namespace and name
-		//
-		// 		Produces:
-		//		- application/json
-		//
-		//		Schemes: http, https
-		//
-		// responses:
-		//		500: internalError
-		//		200: iter8ExperimentGetDetailResponse
-		{
-			"Iter8ExperimentsByNamespaceAndName",
-			"GET",
-			"/api/iter8/namespaces/{namespace}/experiments/{name}",
-			handlers.Iter8ExperimentGet,
-			true,
-		},
-		// swagger:route GET /iter8/experiments iter8 iter8Experiments
-		// ---
-		// Endpoint to fetch iter8 experiments for all namespaces user have access.
-		// User can define a comman separated list of namespaces.
-		//
-		// 		Produces:
-		//		- application/json
-		//
-		//		Schemes: http, https
-		//
-		// responses:
-		//		500: internalError
-		//		200: iter8ExperimentsResponse
-		{
-			"Iter8Experiments",
-			"GET",
-			"/api/iter8/experiments",
-			handlers.Iter8Experiments,
-			true,
-		},
-
-		// swagger:route POST /iter8/namespaces/{namespace}/experiments iter8 postIter8Experiments
-		// ---
-		// Endpoint to create new iter8 experiments for a given namespace.
-		//
-		// 		Produces:
-		//		- application/json
-		//
-		//		Schemes: http, https
-		//
-		// responses:
-		//		500: internalError
-		//		200: iter8ExperimentGetDetailResponse
-		{
-			Name:          "Iter8ExperimentCreate",
-			Method:        "POST",
-			Pattern:       "/api/iter8/namespaces/{namespace}/experiments",
-			HandlerFunc:   handlers.Iter8ExperimentCreate,
-			Authenticated: true,
-		},
-		// swagger:route PATCH /iter8/experiments/{namespace}/name/{name} iter8 patchIter8Experiments
-		// ---
-		// Endpoint to update new iter8 experiment (for abort purpose)
-		//
-		// 		Produces:
-		//		- application/json
-		//
-		//		Schemes: http, https
-		//
-		// responses:
-		//		500: internalError
-		//		200: iter8ExperimentGetDetailResponse
-		{
-			Name:          "Iter8ExperimentsUpdate",
-			Method:        "PATCH",
-			Pattern:       "/api/iter8/namespaces/{namespace}/experiments/{name}",
-			HandlerFunc:   handlers.Iter8ExperimentUpdate,
-			Authenticated: true,
-		},
-		// swagger:route DELETE /iter8/experiments/namespaces/{namespace}/name/{name} iter8 deleteIter8Experiments
-		// ---
-		// Endpoint to delete   iter8 experiments
-		//
-		// 		Produces:
-		//		- application/json
-		//
-		//		Schemes: http, https
-		//
-		// responses:
-		//		500: internalError
-		//		200: iter8StatusResponse
-		{
-			Name:          "Iter8ExperimentDelete",
-			Method:        "DELETE",
-			Pattern:       "/api/iter8/namespaces/{namespace}/experiments/{name}",
-			HandlerFunc:   handlers.Iter8ExperimentDelete,
-			Authenticated: true,
-		},
-		// swagger:route GET /iter8/metrics
-		// ---
-		// Endpoint to get the analytics metrics
-		//
-		//              Produces:
-		//              - application/json
-		//
-		//              Schemes: http, https
-		//
-		// responses:
-		//              500: internalError
-		//              200: iter8StatusResponse
-		{
-			"Iter8Metrics",
-			"GET",
-			"/api/iter8/metrics",
-			handlers.Iter8Metrics,
-			true,
-		},
-		// swagger:route GET /api/iter8/namespaces/{namespace}/experiments/{name}/yaml
-		// ---
-		// Endpoint to get the analytics metrics
-		//
-		//              Produces:
-		//              - application/json
-		//
-		//              Schemes: http, https
-		//
-		// responses:
-		//              500: internalError
-		//              200: iter8StatusResponse
-		{
-			"Iter8ExperimentGetYaml",
-			"GET",
-			"/api/iter8/namespaces/{namespace}/experiments/{name}/yaml",
-			handlers.Iter8ExperimentGetYaml,
-			true,
-		},
-
-		// swagger:route POST /stats/metrics stats metricsStats
-		// ---
-		// Produces metrics statistics
-		//
-		// 		Produces:
-		//		- application/json
-		//
-		//		Schemes: http, https
-		//
-		// responses:
+		// Responses:
+		//    500: internalError
 		//    400: badRequestError
-		//    503: serviceUnavailableError
-		//		500: internalError
-		//		200: metricsStatsResponse
-		{
-			Name:          "MetricsStats",
-			Method:        "POST",
-			Pattern:       "/api/stats/metrics",
-			HandlerFunc:   handlers.MetricsStats,
-			Authenticated: true,
-		},
-		// swagger:route GET /api/clusters
-		// ---
-		// Endpoint to get the list of the clusters that are hosting the service mesh.
-		//              Produces:
-		//              - application/json
+		//    200: noContent
 		//
-		//              Schemes: http, https
-		//
-		// responses:
-		//              500: internalError
-		//              200: clustersResponse
 		{
-			"GetClusters",
+			"ChatUsage",
+			log.ChatAILogName,
 			"GET",
-			"/api/clusters",
-			handlers.GetClusters,
+			"/api/ai/usage",
+			handlers.AIUsage(conf, aiStore, prom),
 			true,
 		},
 	}
-
 	return
 }

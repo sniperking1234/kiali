@@ -1,0 +1,133 @@
+package references
+
+import (
+	networking_v1 "istio.io/client-go/pkg/apis/networking/v1"
+	security_v1 "istio.io/client-go/pkg/apis/security/v1"
+
+	"github.com/kiali/kiali/config"
+	"github.com/kiali/kiali/kubernetes"
+	"github.com/kiali/kiali/models"
+	"github.com/kiali/kiali/util"
+)
+
+type ServiceEntryReferences struct {
+	AuthorizationPolicies []*security_v1.AuthorizationPolicy
+	Conf                  *config.Config
+	DestinationRules      []*networking_v1.DestinationRule
+	IdentityDomain        string
+	KubeServiceHosts      kubernetes.KubeServiceHosts
+	Namespace             string
+	Namespaces            []string
+	ServiceEntries        []*networking_v1.ServiceEntry
+	Sidecars              []*networking_v1.Sidecar
+}
+
+func (n ServiceEntryReferences) References() models.IstioReferencesMap {
+	result := models.IstioReferencesMap{}
+
+	for _, se := range n.ServiceEntries {
+		key := models.IstioReferenceKey{Namespace: se.Namespace, Name: se.Name, ObjectGVK: kubernetes.ServiceEntries}
+		references := &models.IstioReferences{}
+		references.ObjectReferences = append(references.ObjectReferences, n.getConfigReferences(se)...)
+		references.ServiceReferences = append(references.ServiceReferences, n.getServiceReferences(se)...)
+		result.MergeReferencesMap(models.IstioReferencesMap{key: references})
+	}
+
+	return result
+}
+
+func (n ServiceEntryReferences) getConfigReferences(se *networking_v1.ServiceEntry) []models.IstioReference {
+	result := make([]models.IstioReference, 0)
+	for _, dr := range n.DestinationRules {
+		fqdn := kubernetes.GetHost(dr.Spec.Host, dr.Namespace, n.Namespaces, n.IdentityDomain)
+		if !fqdn.IsWildcard() {
+			for _, seHost := range se.Spec.Hosts {
+				if seHost == fqdn.String() {
+					result = append(result, models.IstioReference{Name: dr.Name, Namespace: dr.Namespace, ObjectGVK: kubernetes.DestinationRules})
+					continue
+				}
+			}
+		}
+	}
+	for _, sc := range n.Sidecars {
+		for _, ei := range sc.Spec.Egress {
+			if ei == nil {
+				continue
+			}
+			if len(ei.Hosts) > 0 {
+				for _, h := range ei.Hosts {
+					hostNs, dnsName, _ := getHostComponents(h)
+					if hostNs == "*" || hostNs == "~" || hostNs == "." || dnsName == "*" {
+						continue
+					}
+					fqdn := kubernetes.ParseHost(dnsName, hostNs, n.IdentityDomain)
+
+					if se.Namespace != hostNs {
+						continue
+					}
+					for _, seHost := range se.Spec.Hosts {
+						if seHost == fqdn.String() {
+							result = append(result, models.IstioReference{Name: sc.Name, Namespace: sc.Namespace, ObjectGVK: kubernetes.Sidecars})
+							break
+						}
+					}
+				}
+			}
+		}
+	}
+	result = append(result, n.getAuthPoliciesReferences(se)...)
+	return result
+}
+
+func (n ServiceEntryReferences) getAuthPoliciesReferences(se *networking_v1.ServiceEntry) []models.IstioReference {
+	result := make([]models.IstioReference, 0)
+	for _, ap := range n.AuthorizationPolicies {
+		namespace := ap.Namespace
+		for _, rule := range ap.Spec.Rules {
+			if rule == nil {
+				continue
+			}
+			if len(rule.To) > 0 {
+				for _, t := range rule.To {
+					if t == nil || t.Operation == nil || len(t.Operation.Hosts) == 0 {
+						continue
+					}
+					for _, h := range t.Operation.Hosts {
+						fqdn := kubernetes.GetHost(h, namespace, n.Namespaces, n.IdentityDomain)
+						if !fqdn.IsWildcard() {
+							for _, seHost := range se.Spec.Hosts {
+								if seHost == fqdn.String() {
+									result = append(result, models.IstioReference{Name: ap.Name, Namespace: ap.Namespace, ObjectGVK: kubernetes.AuthorizationPolicies})
+									continue
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	return result
+}
+
+func (n ServiceEntryReferences) getServiceReferences(se *networking_v1.ServiceEntry) []models.ServiceReference {
+	result := make([]models.ServiceReference, 0)
+	keys := make(map[string]bool)
+	for _, seHost := range se.Spec.Hosts {
+		if n.KubeServiceHosts.HasHost(seHost) {
+			if !n.KubeServiceHosts.IsValidForNamespace(seHost, se.Namespace) {
+				continue
+			}
+		} else if !kubernetes.IsExportedTo(se.Spec.ExportTo, se.Namespace, se.Namespace) {
+			continue
+		}
+
+		ref := models.ServiceReference{IsServiceEntry: true, Name: seHost, Namespace: se.Namespace}
+		key := util.BuildNameNSKey(ref.Name, ref.Namespace)
+		if !keys[key] {
+			result = append(result, ref)
+			keys[key] = true
+		}
+	}
+	return result
+}

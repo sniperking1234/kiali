@@ -1,0 +1,193 @@
+name: Kiali Molecule Tests
+
+on:
+  schedule:
+  # These are in UTC time (EDT = UTC-4).
+  # Scheduled after the nightly builds (04:00 UTC) to ensure the latest published images are available on quay.io.
+  # If you change any of these, you must also change the switch statement in the determine-istio-version-to-use task.
+  - cron: '0 6 * * *'
+  - cron: '0 8 * * *'
+  - cron: '0 10 * * *'
+  workflow_dispatch:
+    inputs:
+      all_tests:
+        description: "Molecule Test Names (space-separated)"
+        required: false
+        default: ""
+        type: string
+      olm_version:
+        description: "Version of OLM to install or 'latest'. e.g. v0.28.0. Can be 'skip' if you want to skip the OLM tests."
+        required: false
+        default: "latest"
+        type: string
+      istio_minor_version_offset:
+        description: 'By default, the latest Istio minor version is tested. But you can test the previous minor version by asking for an Istio minor version offset of 1 (i.e. 1 minor version prior to the latest minor version)'
+        required: false
+        default: 0
+        type: number
+  workflow_call:
+    inputs:
+      all_tests:
+        required: false
+        type: string
+      olm_version:
+        required: false
+        type: string
+        default: "latest"
+      istio_minor_version_offset:
+        required: false
+        type: number
+        default: 0
+permissions: read-all
+
+jobs:
+  molecules:
+    permissions:
+      contents: read
+    name: Molecule tests
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout the hack script that runs the tests
+      id: checkout-source
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        sparse-checkout: |
+          hack/ci-kind-molecule-tests.sh
+          hack/install-hydra-kind.sh
+          hack/start-kind.sh
+          hack/ory-hydra/scripts/gencert.sh
+          hack/ory-hydra/scripts/install-hydra.sh
+          hack/ory-hydra/scripts/setup-clients.sh
+          hack/ory-hydra/manifests/postgresql.yaml
+          hack/ory-hydra/manifests/hydra-ui-simple.yaml
+    - name: Install Helm
+      uses: Azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+      with:
+        version: 'v3.18.4'
+    - name: Free Disk Space
+      run: |
+        echo "=== Disk space before cleanup ==="
+        df -h
+
+        echo "=== Cleaning up large directories ==="
+        # Remove large pre-installed packages that we don't need
+        [ -d /usr/share/dotnet ] && sudo rm -rf /usr/share/dotnet || echo "No dotnet to remove"
+        [ -d /usr/local/lib/android ] && sudo rm -rf /usr/local/lib/android || echo "No android to remove"
+        [ -d /opt/ghc ] && sudo rm -rf /opt/ghc || echo "No ghc to remove"
+        [ -d /opt/hostedtoolcache/CodeQL ] && sudo rm -rf /opt/hostedtoolcache/CodeQL || echo "No CodeQL to remove"
+
+        echo "=== Cleaning up Docker/container resources ==="
+        # Clean up docker and podman resources - podman is used for molecule image builds
+        docker system prune -af --volumes
+        podman system prune -af --volumes
+
+        echo "=== Cleaning apt cache ==="
+        sudo apt-get clean
+
+        echo "=== Disk space after cleanup ==="
+        df -h
+    - name: Print the names of the tests that are to be run
+      id: log-test-names
+      run: |
+        if [ -z "${{ inputs.all_tests }}" ]; then
+          echo "all tests"
+        else
+          echo "tests=${{ inputs.all_tests }}"
+        fi
+    - name: Determine Istio version to use
+      id: determine-istio-version-to-use
+      run: |
+        OFFSET="${{ inputs.istio_minor_version_offset }}"
+        # Convert to absolute value - we want a positive offset, though some people might find it more intuitive to say "-1" offset for the previous version
+        OFFSET=$(( OFFSET < 0 ? -OFFSET : OFFSET ))
+
+        if [[ -z "${OFFSET}" ]]; then
+          case "${{ github.event.schedule }}" in
+            "0 6 * * *") OFFSET=0 ;;
+            "0 8 * * *") OFFSET=1 ;;
+            "0 10 * * *") OFFSET=2 ;;
+            *) echo "Invalid schedule or unknown trigger! Cannot determine Istio version." && exit 1 ;;
+          esac
+        fi
+
+        # Retry fetching Istio versions every 60 seconds for 2 hours (120 retries)
+        echo "Fetching Istio versions from GitHub API (with retry logic)..."
+        for retry in {1..120}; do
+          echo "Attempt $retry/120: Fetching Istio release data..."
+          CURL_RESULT=$(curl -s https://api.github.com/repos/istio/istio/releases)
+          if [ $? -eq 0 ] && [ -n "$CURL_RESULT" ] && echo "$CURL_RESULT" | jq -e '.[].tag_name' >/dev/null 2>&1; then
+            echo "Successfully fetched Istio release data."
+            LATEST_ISTIO_VERSIONS="$(echo "$CURL_RESULT" | jq -r '.[].tag_name' | sort -rV | awk -F'[-.]' '
+              {
+                minor = $1"."$2
+                is_rc = ($4 == "rc")
+                z = is_rc ? $3 : $3
+                rc_ver = is_rc ? $5 : ""
+
+                if (!minor_ga[minor] && !minor_rc[minor]) {
+                  if (is_rc) { minor_rc[minor] = $0; minor_rc_z[minor] = z; minor_rc_rc[minor] = rc_ver }
+                  else { minor_ga[minor] = $0; minor_ga_z[minor] = z }
+                } else if (!is_rc && minor_ga[minor]) {
+                  if (z > minor_ga_z[minor]) { minor_ga[minor] = $0; minor_ga_z[minor] = z }
+                } else if (!is_rc && !minor_ga[minor]) {
+                  minor_ga[minor] = $0; minor_ga_z[minor] = z; delete minor_rc[minor]; delete minor_rc_z[minor]; delete minor_rc_rc[minor]
+                } else if (is_rc && !minor_ga[minor]) {
+                  current_rc_stored = minor_rc[minor]
+                  split(current_rc_stored, current_rc_parts, "[-.]")
+                  current_rc_num_stored = current_rc_parts[5]
+
+                  if (!minor_rc[minor] || z > minor_rc_z[minor] || (z == minor_rc_z[minor] && rc_ver > current_rc_num_stored)) {
+                    minor_rc[minor] = $0; minor_rc_z[minor] = z; minor_rc_rc[minor] = rc_ver
+                  }
+                }
+              }
+              END {
+                for (m in minor_ga) { print minor_ga[m] }
+                for (m in minor_rc) { print minor_rc[m] }
+              }' | sort -Vr | grep -v '^$' | head -n $((OFFSET + 1)))"
+            break
+          else
+            if [ $retry -eq 120 ]; then
+              echo "ERROR: Failed to fetch Istio release data after 2 hours (120 retries). Giving up."
+              exit 1
+            fi
+            echo "Failed to fetch valid Istio release data. Retrying in 60 seconds..."
+            sleep 60
+          fi
+        done
+
+        ISTIO_VERSION=$(echo "${LATEST_ISTIO_VERSIONS}" | tail -n 1)
+        echo "The latest Istio versions are:"
+        echo "${LATEST_ISTIO_VERSIONS}"
+        echo "The Istio minor version offset is [${OFFSET}], thus the Istio version to be used in the tests will be: ${ISTIO_VERSION}"
+        echo "ISTIO_VERSION=${ISTIO_VERSION}" >> $GITHUB_ENV
+    - name: Run molecule tests HELM
+      id: run-molecule-tests-helm
+      run: |
+        ISTIO_VERSION="${{ env.ISTIO_VERSION }}"
+        if [ -z "${ISTIO_VERSION}" ]; then
+          echo "Could not determine the Istio version to use." && exit 1
+        fi
+        echo
+        echo "================================================================"
+        echo "Testing with Istio version [${ISTIO_VERSION}] using helm install"
+        echo "================================================================"
+        echo
+        ./hack/ci-kind-molecule-tests.sh --istio-version ${ISTIO_VERSION} --client-exe $(which kubectl) --kind-exe $(which kind) --all-tests "${{ inputs.all_tests }}" --git-clone-protocol https --irc-room "" --upload-logs false --rebuild-cluster true -ci true --operator-installer helm --olm-enabled false
+    - name: Run molecule tests OLM
+      id: run-molecule-tests-olm
+      run: |
+        if [ "${{ inputs.olm_version }}" == "skip" ]; then
+          echo "OLM version is [skip] - will skip OLM tests." && exit 0
+        fi
+
+        ISTIO_VERSION="${{ env.ISTIO_VERSION }}"
+        if [ -z "${ISTIO_VERSION}" ]; then
+          echo "Could not determine the Istio version to use." && exit 1
+        fi
+        echo
+        echo "================================================================"
+        echo "Testing with Istio version [${ISTIO_VERSION}] using OLM install"
+        echo "================================================================"
+        echo
+        ./hack/ci-kind-molecule-tests.sh --istio-version ${ISTIO_VERSION} --client-exe $(which kubectl) --kind-exe $(which kind) --all-tests "default" --git-clone-protocol https --irc-room "" --upload-logs false --rebuild-cluster false -ci true --operator-installer skip --olm-enabled true --olm-version "${{ inputs.olm_version }}"

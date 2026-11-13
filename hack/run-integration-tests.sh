@@ -1,0 +1,1253 @@
+#!/bin/bash
+
+infomsg() {
+  echo "[INFO] ${1}"
+}
+
+# Suites
+AI_CHATBOT="ai-chatbot"
+AMBIENT=""
+AUTH_STRATEGY=""
+BACKEND="backend"
+BACKEND_EXTERNAL_CONTROLPLANE="backend-external-controlplane"
+BOOKINFO_ONLY="false"
+CLUSTER_TYPE="kind"
+CLUSTER2_AMBIENT="true"
+SAIL=""
+FRONTEND="frontend"
+FRONTEND_AMBIENT="frontend-ambient"
+FRONTEND_CORE_1="frontend-core-1"
+FRONTEND_CORE_2="frontend-core-2"
+FRONTEND_CORE_CACHING="frontend-core-caching"
+FRONTEND_CORE_OPTIONAL="frontend-core-optional"
+FRONTEND_PRIMARY_REMOTE="frontend-primary-remote"
+FRONTEND_MULTI_PRIMARY="frontend-multi-primary"
+FRONTEND_MULTI_MESH="frontend-multi-mesh"
+FRONTEND_EXTERNAL_KIALI="frontend-external-kiali"
+FRONTEND_TEMPO="frontend-tempo"
+LOCAL="local"
+MCP_TOOLS="false"
+OFFLINE="offline"
+HELM_CHARTS_DIR=""
+ISTIO_VERSION=""
+KIALI_VERSION=""
+KIALI_IMAGE_NAME=""
+KEYCLOAK_LIMIT_MEMORY=""
+KEYCLOAK_REQUESTS_MEMORY=""
+SAIL_OPERATOR_CHART_VERSION=""
+SAIL_OPERATOR_GIT_REF=""
+SAIL_OPERATOR_GIT_REPO=""
+SAIL_OPERATOR_HELM_REPO=""
+SETUP_ONLY="false"
+STERN="false"
+TEMPO="false"
+TEST_SUITE="${BACKEND}"
+TESTS_ONLY="false"
+WAYPOINT="false"
+WITH_VIDEO="false"
+KIALI_PID=""
+PERSES_PORT_FORWARD_PID=""
+OFFLINE_SEEDED_TRAFFIC_ROUTING_ASSET=""
+
+cleanup_offline_seeded_traffic_routing() {
+  if [ -n "${OFFLINE_SEEDED_TRAFFIC_ROUTING_ASSET}" ]; then
+    kubectl delete -n bookinfo -f "${OFFLINE_SEEDED_TRAFFIC_ROUTING_ASSET}" --ignore-not-found=true >/dev/null 2>&1 || true
+  fi
+}
+
+cleanup_kiali() {
+  cleanup_offline_seeded_traffic_routing
+  if [ -n "${KIALI_PID}" ]; then
+    kill "${KIALI_PID}" 2>/dev/null || true
+  fi
+}
+
+start_perses_port_forward() {
+  if kubectl get svc perses -n istio-system &>/dev/null; then
+    infomsg "Starting Perses port-forward on localhost:4000"
+    kubectl port-forward -n istio-system svc/perses 4000:8080 &
+    PERSES_PORT_FORWARD_PID=$!
+    for _ in $(seq 1 30); do
+      if curl -s --fail "http://localhost:4000/api/v1/health" > /dev/null 2>&1; then
+        infomsg "Perses port-forward is ready"
+        return 0
+      fi
+      sleep 1
+    done
+    infomsg "WARNING: Perses port-forward may not be ready"
+  fi
+}
+
+stop_perses_port_forward() {
+  if [ -n "${PERSES_PORT_FORWARD_PID}" ]; then
+    kill "${PERSES_PORT_FORWARD_PID}" 2>/dev/null || true
+  fi
+}
+
+# process command line args
+while [[ $# -gt 0 ]]; do
+  key="$1"
+  case $key in
+    -am|--ambient)
+      AMBIENT="${2}"
+      shift;shift
+      ;;
+    -au|--auth-strategy)
+      AUTH_STRATEGY="${2}"
+      shift;shift
+      ;;
+    -bo|--bookinfo-only)
+      BOOKINFO_ONLY="${2}"
+      shift;shift
+      ;;
+    -ct|--cluster-type)
+      CLUSTER_TYPE="${2}"
+      if [ "${CLUSTER_TYPE}" != "kind" ] && [ "${CLUSTER_TYPE}" != "minikube" ]; then
+        echo "--cluster-type option must be one of 'kind' or 'minikube'"
+        exit 1
+      fi
+      shift;shift
+      ;;
+    -c2a|--cluster2-ambient)
+      CLUSTER2_AMBIENT="${2}"
+      if [ "${CLUSTER2_AMBIENT}" != "true" ] && [ "${CLUSTER2_AMBIENT}" != "false" ]; then
+        echo "--cluster2-ambient option must be one of 'true' or 'false'"
+        exit 1
+      fi
+      shift;shift
+      ;;
+    -hcd|--helm-charts-dir)
+      HELM_CHARTS_DIR="${2}"
+      shift;shift
+      ;;
+    -iv|--istio-version)
+      ISTIO_VERSION="${2}"
+      shift;shift
+      ;;
+    -kv|--kiali-version)
+      KIALI_VERSION="${2}"
+      shift;shift
+      ;;
+    -kin|--kiali-image-name)
+      KIALI_IMAGE_NAME="${2}"
+      shift;shift
+      ;;
+    -klm|--keycloak-limit-memory)
+      KEYCLOAK_LIMIT_MEMORY="${2}"
+      shift;shift
+      ;;
+    -krm|--keycloak-requests-memory)
+      KEYCLOAK_REQUESTS_MEMORY="${2}"
+      shift;shift
+      ;;
+    -mcp|--mcp-tools)
+      MCP_TOOLS="${2}"
+      if [ "${MCP_TOOLS}" != "true" ] && [ "${MCP_TOOLS}" != "false" ]; then
+        echo "--mcp-tools option must be one of 'true' or 'false'"
+        exit 1
+      fi
+      shift;shift
+      ;;
+    -so|--setup-only)
+      SETUP_ONLY="${2}"
+      if [ "${SETUP_ONLY}" != "true" ] && [ "${SETUP_ONLY}" != "false" ]; then
+        echo "--setup-only option must be one of 'true' or 'false'"
+        exit 1
+      fi
+      shift;shift
+      ;;
+    -s|--sail)
+      SAIL="${2}"
+      if [ "${SAIL}" != "true" ] && [ "${SAIL}" != "false" ]; then
+        echo "--sail option must be one of 'true' or 'false'"
+        exit 1
+      fi
+      shift;shift
+      ;;
+    -st|--stern)
+      STERN="${2}"
+      if [ "${STERN}" != "true" ] && [ "${STERN}" != "false" ]; then
+        echo "--stern option must be one of 'true' or 'false'"
+        exit 1
+      fi
+      shift;shift
+      ;;
+    --sail-operator-chart-version)
+      SAIL_OPERATOR_CHART_VERSION="${2}"
+      shift;shift
+      ;;
+    --sail-operator-git-ref)
+      SAIL_OPERATOR_GIT_REF="${2}"
+      shift;shift
+      ;;
+    --sail-operator-git-repo)
+      SAIL_OPERATOR_GIT_REPO="${2}"
+      shift;shift
+      ;;
+    --sail-operator-helm-repo)
+      SAIL_OPERATOR_HELM_REPO="${2}"
+      shift;shift
+      ;;
+    -t|--tempo)
+      TEMPO="${2}"
+      shift;shift
+      ;;
+    -to|--tests-only)
+      TESTS_ONLY="${2}"
+      if [ "${TESTS_ONLY}" != "true" ] && [ "${TESTS_ONLY}" != "false" ]; then
+        echo "--tests-only option must be one of 'true' or 'false'"
+        exit 1
+      fi
+      shift;shift
+      ;;
+    -ts|--test-suite)
+      TEST_SUITE="${2}"
+      if [ "${TEST_SUITE}" != "${BACKEND}" ] && [ "${TEST_SUITE}" != "${BACKEND_EXTERNAL_CONTROLPLANE}" ] && [ "${TEST_SUITE}" != "${FRONTEND}" ] && [ "${TEST_SUITE}" != "${FRONTEND_AMBIENT}" ] && [ "${TEST_SUITE}" != "${FRONTEND_CORE_1}" ] && [ "${TEST_SUITE}" != "${FRONTEND_CORE_2}" ] && [ "${TEST_SUITE}" != "${FRONTEND_CORE_CACHING}" ] && [ "${TEST_SUITE}" != "${FRONTEND_CORE_OPTIONAL}" ] && [ "${TEST_SUITE}" != "${FRONTEND_PRIMARY_REMOTE}" ] && [ "${TEST_SUITE}" != "${FRONTEND_MULTI_PRIMARY}" ] && [ "${TEST_SUITE}" != "${FRONTEND_MULTI_MESH}" ] && [ "${TEST_SUITE}" != "${FRONTEND_EXTERNAL_KIALI}" ] && [ "${TEST_SUITE}" != "${FRONTEND_TEMPO}" ] && [ "${TEST_SUITE}" != "${AI_CHATBOT}" ] && [ "${TEST_SUITE}" != "${LOCAL}" ] && [ "${TEST_SUITE}" != "${OFFLINE}" ]; then
+        echo "--test-suite option must be one of '${BACKEND}', '${BACKEND_EXTERNAL_CONTROLPLANE}', '${FRONTEND}', '${FRONTEND_AMBIENT}', '${FRONTEND_CORE_1}', '${FRONTEND_CORE_2}', '${FRONTEND_CORE_CACHING}', '${FRONTEND_CORE_OPTIONAL}', '${FRONTEND_PRIMARY_REMOTE}', '${FRONTEND_MULTI_PRIMARY}', '${FRONTEND_EXTERNAL_KIALI}', '${FRONTEND_TEMPO}', '${AI_CHATBOT}', '${LOCAL}' or '${OFFLINE}'"
+        exit 1
+      fi
+      shift;shift
+      ;;
+    -w|--waypoint)
+      WAYPOINT="${2}"
+      if [ "${WAYPOINT}" != "true" ] && [ "${WAYPOINT}" != "false" ]; then
+        echo "--waypoint option must be one of 'true' or 'false'"
+        exit 1
+      fi
+      shift;shift
+      ;;
+    -wv|--with-video)
+      WITH_VIDEO="${2}"
+      if [ "${WITH_VIDEO}" != "true" ] && [ "${WITH_VIDEO}" != "false" ]; then
+        echo "--with-video option must be one of 'true' or 'false'"
+        exit 1
+      fi
+      shift;shift
+      ;;
+    -h|--help)
+      cat <<HELPMSG
+Valid command line arguments:
+  -am|--ambient <true|false>
+    If true, install istio ambient profile. Just valid for multi primary suite (alpha).
+    Default: false
+  -au|--auth-strategy <anonymous>
+    Allows to change to anonymous for the backend test suit
+  -bo|--bookinfo-only <true|false>
+    If true, only install bookinfo demo instead of all demos.
+    Default: false
+  -ct|--cluster-type <kind|minikube>
+    Which cluster type to use for testing. 
+    Default: kind
+  -c2a|--cluster2-ambient <true|false>
+    If true, install istio ambient profile on cluster 2 (west). Only valid when --ambient is true.
+    If false, cluster 2 will use regular Istio while cluster 1 uses ambient.
+    Default: true (both clusters use ambient when --ambient is true)
+  -hcd|--helm-charts-dir
+    The directory where the Helm charts are located. If not specified, the Helm charts for the target branch will be used.
+  -iv|--istio-version <version>
+    Which Istio version to test with. For releases, specify "#.#.#". For dev builds, specify in the form "#.#-dev"
+    Default: The latest release
+  -kv|--kiali-version <version>
+    Kiali image version to deploy during cluster setup. Use "dev" for a local dev image
+    (default). Use a release tag such as "v2.27" to deploy a published image instead.
+    Default: dev
+  -kin|--kiali-image-name <name>
+    Container image name (without tag) when --kiali-version is not "dev".
+    Examples: quay.io/kiali/kiali (default), quay.io/kiali/kiali_mcp.
+    Default: quay.io/kiali/kiali
+  -klm|--keycloak-limit-memory <value>
+    Set the keycloak resources limit memory in the keycloak helm charts. Ex. 1Gi
+  -krm|--keycloak-requests-memory <value>
+    Set the keycloak resources requests memory in the keycloak helm charts. Ex. 1Gi
+  -so|--setup-only <true|false>
+    If true, only setup the test environment and exit without running the tests.
+    Default: false
+  -s|--sail <true|false>
+    If true, install Istio using Sail (default for multicluster scripts).
+    If false, install Istio using istioctl where supported.
+    Default: unset (suite-dependent; for frontend-multi-primary ambient, Sail remains the default unless you pass false)
+  -st|--stern <true|false>
+    If true, will setup stern logging binary.
+    Default: false
+  --sail-operator-chart-version <version>
+    Sail Operator Helm chart version to install (useful for RCs if published in the chart repo).
+    Example: 1.27.0-rc.0
+    Default: <latest>
+  --sail-operator-git-ref <ref>
+    Install Sail Operator Helm chart directly from a git ref (branch or tag), such as 'main'/'master' or an RC tag.
+    Examples: main, master, v1.27.0-rc.0
+    Default: <unset> (install from Helm repo)
+  --sail-operator-git-repo <url>
+    Git repository URL for Sail Operator (used when --sail-operator-git-ref is set).
+    Default: https://github.com/istio-ecosystem/sail-operator.git
+  --sail-operator-helm-repo <url>
+    Helm repository URL where the Sail Operator chart is hosted.
+    Default: https://istio-ecosystem.github.io/sail-operator
+  -t|--tempo <true|false>
+    If true, Tempo will be installed instead of Jaeger. Just for primary-remote suite
+    Default: false
+  -to|--tests-only <true|false>
+    If true, only run the tests and skip the setup.
+    Default: false
+  -ts|--test-suite <${BACKEND}|${BACKEND_EXTERNAL_CONTROLPLANE}|${FRONTEND}|${FRONTEND_AMBIENT}|${FRONTEND_CORE_1}|${FRONTEND_CORE_2}|${FRONTEND_CORE_CACHING}|${FRONTEND_CORE_OPTIONAL}|${FRONTEND_PRIMARY_REMOTE}|${FRONTEND_MULTI_PRIMARY}|${FRONTEND_MULTI_MESH}|${FRONTEND_MULTIPLE_CONTROLPLANES}|${FRONTEND_EXTERNAL_KIALI}|${FRONTEND_TEMPO}|${AI_CHATBOT}|${LOCAL}|${OFFLINE}>
+    Which test suite to run.
+    Default: ${BACKEND}
+  -w|--waypoint <true|false>
+    If true, configure waypoint for bookinfo namespace in ambient multi-primary setup.
+    Default: false
+  -wv|--with-video <true|false>
+    If true, will record video for the cypress test run.
+    Default: ${WITH_VIDEO}
+  -h|--help:
+    This message
+
+NOTE: When running the multi-cluster tests locally, it might be necessary to
+edit some kernel settings to allow for the kind clusters to be created.
+
+The following settings added to your sysctl config file should work (the filename will be something like '/etc/sysctl.d/local.conf' - refer to your operating system 'man sysctl' docs to determine which file should be changed):
+fs.inotify.max_user_watches=524288
+fs.inotify.max_user_instances=512
+HELPMSG
+      exit 1
+      ;;
+    *)
+      echo "ERROR: Unknown argument [$key]. Aborting."
+      exit 1
+      ;;
+  esac
+done
+
+if [ "${SETUP_ONLY}" == "true" ] && [ "${TESTS_ONLY}" == "true" ]; then
+  echo "ERROR: --setup-only and --tests-only cannot both be true. Aborting."
+  exit 1
+fi
+
+# print out our settings for debug purposes
+cat <<EOM
+=== SETTINGS ===
+AMBIENT=$AMBIENT
+AUTH_STRATEGY=$AUTH_STRATEGY
+BOOKINFO_ONLY=$BOOKINFO_ONLY
+CLUSTER_TYPE=$CLUSTER_TYPE
+CLUSTER2_AMBIENT=$CLUSTER2_AMBIENT
+HELM_CHARTS_DIR=$HELM_CHARTS_DIR
+ISTIO_VERSION=$ISTIO_VERSION
+KEYCLOAK_LIMIT_MEMORY=$KEYCLOAK_LIMIT_MEMORY
+KEYCLOAK_REQUESTS_MEMORY=$KEYCLOAK_LIMIT_MEMORY
+SAIL_OPERATOR_CHART_VERSION=$SAIL_OPERATOR_CHART_VERSION
+SAIL_OPERATOR_GIT_REF=$SAIL_OPERATOR_GIT_REF
+SAIL_OPERATOR_GIT_REPO=$SAIL_OPERATOR_GIT_REPO
+SAIL_OPERATOR_HELM_REPO=$SAIL_OPERATOR_HELM_REPO
+SETUP_ONLY=$SETUP_ONLY
+SAIL=$SAIL
+STERN=$STERN
+TESTS_ONLY=$TESTS_ONLY
+TEST_SUITE=$TEST_SUITE
+WAYPOINT=$WAYPOINT
+WITH_VIDEO=$WITH_VIDEO
+TEMPO=$TEMPO
+=== SETTINGS ===
+EOM
+
+set -eo pipefail
+
+#
+# Propagate Sail operator install configuration to all underlying hack scripts.
+# This is required for multicluster flows where Sail install happens deep in nested scripts.
+#
+if [ -n "${SAIL_OPERATOR_CHART_VERSION}" ]; then
+  export SAIL_OPERATOR_CHART_VERSION
+fi
+if [ -n "${SAIL_OPERATOR_GIT_REF}" ]; then
+  export SAIL_OPERATOR_GIT_REF
+fi
+if [ -n "${SAIL_OPERATOR_GIT_REPO}" ]; then
+  export SAIL_OPERATOR_GIT_REPO
+fi
+if [ -n "${SAIL_OPERATOR_HELM_REPO}" ]; then
+  export SAIL_OPERATOR_HELM_REPO
+fi
+
+if [ -n "${ISTIO_VERSION}" ]; then
+  ISTIO_VERSION_ARG="--istio-version ${ISTIO_VERSION}"
+else
+  ISTIO_VERSION_ARG=""
+fi
+
+if [ -n "${KIALI_VERSION}" ]; then
+  KIALI_VERSION_ARG="--kiali-version ${KIALI_VERSION}"
+else
+  KIALI_VERSION_ARG=""
+fi
+
+if [ -n "${KIALI_IMAGE_NAME}" ]; then
+  KIALI_IMAGE_NAME_ARG="--kiali-image-name ${KIALI_IMAGE_NAME}"
+else
+  KIALI_IMAGE_NAME_ARG=""
+fi
+
+if [ -n "${HELM_CHARTS_DIR}" ]; then
+  HELM_CHARTS_DIR_ARG="--helm-charts-dir ${HELM_CHARTS_DIR}"
+else
+  HELM_CHARTS_DIR_ARG=""
+fi
+
+if [ -n "${SAIL}" ]; then
+  SAIL_ARG="--sail ${SAIL}"
+else
+  SAIL_ARG=""
+fi
+
+# Install go-junit-report if not already installed
+if ! command -v go-junit-report &> /dev/null; then
+  go install github.com/jstemmer/go-junit-report@latest
+fi
+
+# Determine where this script is and make it the cwd
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" &> /dev/null && pwd)"
+
+# This is used in multiple places and you need to call 'setKialiURL' first.
+KIALI_URL=""
+# Generate the kiali url. Will wait for kiali service's ingress to have an ip so this can timeout.
+setKialiURL() {
+  kubectl wait --for=jsonpath='{.status.loadBalancer.ingress}' -n istio-system service/kiali --timeout=5m
+  local ingress_ip
+  ingress_ip="$(kubectl get svc kiali -n istio-system -o=jsonpath='{.status.loadBalancer.ingress[0].ip}')"
+  KIALI_URL="http://${ingress_ip}/kiali"
+}
+
+detectRaceConditions() {
+  local kubecontext=$1
+
+  local context_arg=${kubecontext:+--context ${kubecontext}}
+  if ! kubectl ${context_arg} logs -l app.kubernetes.io/name=kiali --tail=-1 --all-containers -n istio-system | grep -vzq "WARNING: DATA RACE"; then
+    echo "ERROR: Data race detected in Kiali logs!"
+    echo "Showing a preview of Kiali logs with data race warnings:"
+    echo "=========================================="
+    kubectl ${context_arg} logs -l app.kubernetes.io/name=kiali --tail=-1 --all-containers -n istio-system | grep -A5 -B5 "WARNING: DATA RACE" || true
+    echo "=========================================="
+    echo "Integration tests failed due to a data race in Kiali."
+    echo "Download and review the Kiali server logs for more details."
+    exit 1
+  else
+    echo "No data race conditions detected in Kiali logs"
+  fi
+}
+
+ensureCypressReady() {
+  cd "${SCRIPT_DIR}"/../frontend
+  if ! yarn cypress --help &> /dev/null; then
+    echo "cypress binary was not detected in your PATH. Did you install the frontend directory? Before running the frontend tests you must run 'make build-ui'."
+    exit 1
+  fi
+  infomsg "Validating Gherkin feature files..."
+  yarn lint:gherkin
+  cd -
+}
+
+ensureKialiServerReady() {
+  infomsg "Waiting for Kiali server pods to be healthy"
+  kubectl rollout status deployment/kiali -n istio-system --timeout=120s
+
+  # Ensure the server is responding to health checks externally.
+  # It can take a minute for the Kube service and ingress to sync
+  # and wire up the endpoints.
+  setKialiURL
+  infomsg "Waiting for Kiali server to respond externally to health checks at ${KIALI_URL}"
+  local start_time
+  local end_time
+  start_time=$(date +%s)
+  end_time=$((start_time + 30))
+  while true; do
+    if curl -k -s --fail "${KIALI_URL}/healthz"; then
+      break
+    fi
+    local now
+    now=$(date +%s)
+    if [ "${now}" -gt "${end_time}" ]; then
+      infomsg "Timed out waiting for Kiali server to respond to health checks"
+      kubectl logs -l app=kiali -n istio-system
+      exit 1
+    fi
+    sleep 1
+  done
+  infomsg "Kiali server is healthy"
+}
+
+ensureKialiTracesReady() {
+  infomsg "Waiting for Kiali to have traces"
+  local start_time
+  local end_time
+  local multicluster=$1
+  local traces_date
+  start_time=$(date +%s)
+  end_time=$((start_time + 120))
+
+  # Get traces from the last 5m
+  traces_date=$((($(date +%s) - 300) * 1000))
+  local trace_url="${KIALI_URL}/api/namespaces/bookinfo/workloads/productpage-v1/traces?startMicros=${traces_date}&tags=&limit=100"
+  if [ "$multicluster" == "true" ]; then
+    echo "Multicluster request"
+    trace_url="${KIALI_URL}/api/namespaces/bookinfo/workloads/reviews-v2/traces?startMicros=${traces_date}&tags=&limit=100&clusterName=west"
+  fi
+  infomsg "Traces url: ${trace_url}"
+  set +o pipefail
+  while true; do
+    result=$(curl -k -s --fail "$trace_url" \
+        -H 'Accept: application/json, text/plain, */*' \
+        -H 'Content-Type: application/json' | jq -r '.data')
+
+    if [ -z "$result" ] || [ "$result" == "[]" ]; then
+      local now
+      now=$(date +%s)
+      if [ "${now}" -gt "${end_time}" ]; then
+        echo "Timed out waiting for Kiali to get any trace. Examine open telemetry collector logs below:"
+        kubectl logs -l app.kubernetes.io/name=opentelemetry-collector --tail=-1 --context kind-west -n istio-system
+        exit 1
+      fi
+      sleep 10
+    else
+      echo "Got traces."
+      break
+    fi
+
+  done
+  set -o pipefail
+}
+
+ensureBookinfoGraphReady() {
+  infomsg "Waiting for Kiali to have graph data"
+  local start_time
+  local end_time
+  local kiali_token
+  start_time=$(date +%s)
+  end_time=$((start_time + 120))
+
+  # Authenticate first
+  kiali_token=$(kubectl -n istio-system create token kiali)
+  curl --cookie-jar cookies.txt "${KIALI_URL}/api/authenticate" \
+      -H 'Accept: application/json, text/plain, */*' \
+      -H 'Content-Type: application/x-www-form-urlencoded' \
+      --request POST \
+      --data-raw "token=${kiali_token}" >/dev/null
+
+  local graph_url="${KIALI_URL}/api/namespaces/graph?duration=120s&graphType=versionedApp&includeIdleEdges=false&injectServiceNodes=true&boxBy=cluster,namespace,app&waypoints=false&appenders=deadNode,istio,serviceEntry,meshCheck,workloadEntry,health,ambient&rateGrpc=requests&rateHttp=requests&rateTcp=sent&namespaces=bookinfo"
+  infomsg "Graph url: ${graph_url}"
+  while true; do
+    result=$(curl -k -s --fail "$graph_url" \
+        -H 'Accept: application/json, text/plain, */*' \
+        -H 'Content-Type: application/json' -b cookies.txt | jq -r '.elements.nodes')
+
+    if [ "$result" == "[]" ]; then
+      local now
+      now=$(date +%s)
+      if [ "${now}" -gt "${end_time}" ]; then
+        echo "Timed out waiting for Kiali to get any graph data"
+        break
+      fi
+      sleep 1
+    else
+      sleep 30
+      break
+    fi
+
+  done
+}
+
+# Wait until the MCP HTTP endpoint answers before starting go tests.
+# Graph readiness alone is not enough: KinD CI can still stall Kiali briefly afterward.
+ensureMCPReady() {
+  infomsg "Waiting for MCP endpoint to respond"
+  local start_time
+  local end_time
+  local mcp_url
+  local http_code
+  start_time=$(date +%s)
+  end_time=$((start_time + 120))
+  mcp_url="${KIALI_URL}/api/chat/mcp/list_clusters"
+
+  while true; do
+    http_code=$(curl -k -s -o /dev/null -w "%{http_code}" --max-time 15 \
+      -X POST "${mcp_url}" \
+      -H 'Content-Type: application/json' \
+      -d '{}' || true)
+
+    if [ "${http_code}" != "000" ] && [ -n "${http_code}" ]; then
+      infomsg "MCP endpoint is ready (HTTP ${http_code})"
+      return 0
+    fi
+
+    local now
+    now=$(date +%s)
+    if [ "${now}" -gt "${end_time}" ]; then
+      echo "Timed out waiting for MCP endpoint at ${mcp_url}"
+      return 1
+    fi
+    sleep 5
+  done
+}
+
+ensureMulticlusterApplicationsAreHealthy() {
+  local start_time
+  local timeout=300
+  local url="${KIALI_URL}/api/clusters/apps?namespaces=bookinfo&clusterName=west&health=true&istioResources=true&rateInterval=60s"
+  start_time=$(date +%s)
+
+  while true; do
+    local current_time
+    local elapsed
+    current_time=$(date +%s)
+    elapsed=$((current_time - start_time))
+
+    if [ "$elapsed" -ge "$timeout" ]; then
+      infomsg "Timeout reached without meeting the condition."
+      infomsg "Response: ${response}"
+      exit 1
+    fi
+
+    response=$(curl -s "$url")
+    has_http_200=$(echo "$response" | jq '[.applications[]? | select(.name=="reviews" and .cluster=="west" and .health.requests.inbound.http."200" > 0)] | length > 0')
+
+    if [ "$has_http_200" = "true" ]; then
+      infomsg "'reviews' app in 'west' cluster is healthy enough."
+      return 0
+    else
+      infomsg "'reviews' app in 'west' cluster is not healthy yet, checking again in 10 seconds..."
+    fi
+
+    sleep 10
+  done
+}
+
+if [ "${STERN}" == "true" ]; then
+  infomsg "Downloading stern binary ..."
+  "${SCRIPT_DIR}"/stern/download-stern.sh
+  export CYPRESS_STERN="true"
+  infomsg "CYPRESS_STERN=${CYPRESS_STERN} exported."
+fi
+
+infomsg "Running ${TEST_SUITE} integration tests"
+if [ "${TEST_SUITE}" == "${BACKEND}" ]; then
+  if [ "${TESTS_ONLY}" == "false" ]; then
+    AUTH_PARAM=""
+    if [ "${TESTS_ONLY}" == "false" ]; then
+      AUTH_PARAM="--auth-strategy anonymous"
+    fi
+    "${SCRIPT_DIR}"/setup-kind-in-ci.sh --sail true ${ISTIO_VERSION_ARG} ${KIALI_VERSION_ARG} ${KIALI_IMAGE_NAME_ARG} ${HELM_CHARTS_DIR_ARG} ${AUTH_PARAM}
+
+    # Install demo apps
+    "${SCRIPT_DIR}"/istio/install-testing-demos.sh -c "kubectl" --use-gateway-api true --bookinfo-only ${BOOKINFO_ONLY}
+
+    ensureKialiServerReady
+
+    # This envvar is used by the backend tests
+    export URL="${KIALI_URL}"
+  fi
+
+  if [ "${SETUP_ONLY}" == "true" ]; then
+    exit 0
+  fi
+
+  if [ "${MCP_TOOLS}" == "true" ]; then
+    echo "Running backend MCP integration tests"
+    ensureBookinfoGraphReady
+    ensureMCPReady
+    cd "${SCRIPT_DIR}"/../tests/integration/mcp_tools
+    go test -tags exclude_frontend -v -failfast ./... 2>&1 | tee >(go-junit-report > ../junit-rest-report-mcp-tools.xml) ../int-test-mcp-tools.log
+  else
+    # Run backend integration tests
+    cd "${SCRIPT_DIR}"/../tests/integration/tests/
+    go test -v -failfast -coverpkg=github.com/kiali/kiali/... -coverprofile=coverage-backend.out 2>&1 | tee >(go-junit-report > ../junit-rest-report.xml) ../int-test.log
+    detectRaceConditions
+  fi
+elif [ "${TEST_SUITE}" == "${BACKEND_EXTERNAL_CONTROLPLANE}" ]; then
+  if [ "${TESTS_ONLY}" == "false" ]; then
+    if [ "${CLUSTER_TYPE}" == "kind" ]; then
+      export CLUSTER1_CONTEXT=kind-controlplane
+      export CLUSTER2_CONTEXT=kind-dataplane
+      "${SCRIPT_DIR}"/setup-kind-in-ci.sh --multicluster "external-controlplane" ${ISTIO_VERSION_ARG} ${HELM_CHARTS_DIR_ARG}
+    elif [ "${CLUSTER_TYPE}" == "minikube" ]; then
+      export CLUSTER1_CONTEXT=controlplane
+      export CLUSTER2_CONTEXT=dataplane
+      "${SCRIPT_DIR}"/setup-minikube-in-ci.sh --multicluster "external-controlplane" ${ISTIO_VERSION_ARG} ${HELM_CHARTS_DIR_ARG}
+    fi
+
+    # Switch to the dataplane cluster before installing the demo apps because
+    # that's where all the workloads should be in the external controlplane deployment.
+    kubectl config use-context "${CLUSTER2_CONTEXT}"
+    "${SCRIPT_DIR}/istio/install-bookinfo-demo.sh" -c kubectl -tg -in istio-system --auto-injection-label istio.io/rev=external-istiod
+
+    # Switch back to controlplane since that is where kiali is installed.
+    kubectl config use-context "${CLUSTER1_CONTEXT}"
+    ensureKialiServerReady
+
+    # This envvar is used by the backend tests
+    export URL="${KIALI_URL}"
+  fi
+
+  if [ "${SETUP_ONLY}" == "true" ]; then
+    exit 0
+  fi
+
+  # Run backend multicluster integration tests
+  cd "${SCRIPT_DIR}"/../tests/integration/multicluster/
+  go test -v -failfast -coverpkg=github.com/kiali/kiali/... -coverprofile=coverage-multicluster.out 2>&1 | tee >(go-junit-report > ../junit-rest-report.xml) ../int-test.log
+  detectRaceConditions "${CLUSTER1_CONTEXT}"
+elif [ "${TEST_SUITE}" == "${FRONTEND}" ]; then
+  ensureCypressReady
+
+  if [ "${TESTS_ONLY}" == "false" ]; then
+    "${SCRIPT_DIR}"/setup-kind-in-ci.sh --auth-strategy token --sail true ${ISTIO_VERSION_ARG} ${HELM_CHARTS_DIR_ARG} --install-perses "true"
+
+    # Install demo apps
+    "${SCRIPT_DIR}"/istio/install-testing-demos.sh -c "kubectl" --bookinfo-only ${BOOKINFO_ONLY}
+  fi
+
+  ensureKialiServerReady
+
+  export CYPRESS_BASE_URL="${KIALI_URL}"
+  export CYPRESS_NUM_TESTS_KEPT_IN_MEMORY=0
+  # Recorded video is unusable due to low resources in CI: https://github.com/cypress-io/cypress/issues/4722
+  export CYPRESS_VIDEO="${WITH_VIDEO}"
+
+  if [ "${SETUP_ONLY}" == "true" ]; then
+    exit 0
+  fi
+
+  start_perses_port_forward
+
+  cd "${SCRIPT_DIR}"/../frontend
+  yarn run cypress:run
+  stop_perses_port_forward
+  detectRaceConditions
+elif [ "${TEST_SUITE}" == "${AI_CHATBOT}" ]; then
+  ensureCypressReady
+
+  if [ "${TESTS_ONLY}" == "false" ]; then
+    "${SCRIPT_DIR}"/setup-kind-in-ci.sh --auth-strategy token --sail true ${ISTIO_VERSION_ARG} ${HELM_CHARTS_DIR_ARG} --install-perses "true" --enable-ai "true"
+
+    # Install demo apps (skip beta namespace -- not needed by chatbot tests)
+    "${SCRIPT_DIR}"/istio/install-testing-demos.sh -c "kubectl" --install-errorrates-beta false
+  fi
+
+  ensureKialiServerReady
+
+  export CYPRESS_BASE_URL="${KIALI_URL}"
+  export CYPRESS_NUM_TESTS_KEPT_IN_MEMORY=0
+  # Recorded video is unusable due to low resources in CI: https://github.com/cypress-io/cypress/issues/4722
+  export CYPRESS_VIDEO="${WITH_VIDEO}"
+
+  if [ "${SETUP_ONLY}" == "true" ]; then
+    exit 0
+  fi
+
+  cd "${SCRIPT_DIR}"/../frontend
+  yarn run cypress:run:ai-chatbot
+  detectRaceConditions
+  exit ${CYPRESS_EXIT}
+elif [ "${TEST_SUITE}" == "${FRONTEND_CORE_1}" ]; then
+  ensureCypressReady
+
+  if [ "${TESTS_ONLY}" == "false" ]; then
+    "${SCRIPT_DIR}"/setup-kind-in-ci.sh --auth-strategy token --sail true ${ISTIO_VERSION_ARG} ${HELM_CHARTS_DIR_ARG} --install-perses "true"
+
+    # Install demo apps
+    "${SCRIPT_DIR}"/istio/install-testing-demos.sh -c "kubectl"
+  fi
+
+  ensureKialiServerReady
+
+  export CYPRESS_BASE_URL="${KIALI_URL}"
+  export CYPRESS_NUM_TESTS_KEPT_IN_MEMORY=0
+  # Recorded video is unusable due to low resources in CI: https://github.com/cypress-io/cypress/issues/4722
+  export CYPRESS_VIDEO="${WITH_VIDEO}"
+
+  if [ "${SETUP_ONLY}" == "true" ]; then
+    exit 0
+  fi
+
+  cd "${SCRIPT_DIR}"/../frontend
+  set +e
+  TEST_GROUP="@core-1" yarn run cypress:run:test-group:junit
+  CYPRESS_EXIT=$?
+  set -e
+  yarn run cypress:combine:reports
+  detectRaceConditions
+  exit ${CYPRESS_EXIT}
+elif [ "${TEST_SUITE}" == "${FRONTEND_CORE_2}" ]; then
+  ensureCypressReady
+
+  if [ "${TESTS_ONLY}" == "false" ]; then
+    "${SCRIPT_DIR}"/setup-kind-in-ci.sh --auth-strategy token --sail true ${ISTIO_VERSION_ARG} ${HELM_CHARTS_DIR_ARG} --install-perses "true"
+
+    # Install demo apps (skip beta namespace -- not needed by core-2 tests)
+    "${SCRIPT_DIR}"/istio/install-testing-demos.sh -c "kubectl" --install-errorrates-beta false
+  fi
+
+  ensureKialiServerReady
+
+  export CYPRESS_BASE_URL="${KIALI_URL}"
+  export CYPRESS_NUM_TESTS_KEPT_IN_MEMORY=0
+  # Recorded video is unusable due to low resources in CI: https://github.com/cypress-io/cypress/issues/4722
+  export CYPRESS_VIDEO="${WITH_VIDEO}"
+
+  if [ "${SETUP_ONLY}" == "true" ]; then
+    exit 0
+  fi
+
+  cd "${SCRIPT_DIR}"/../frontend
+  set +e
+  TEST_GROUP="@core-2" yarn run cypress:run:test-group:junit
+  CYPRESS_EXIT=$?
+  set -e
+  yarn run cypress:combine:reports
+  detectRaceConditions
+  exit ${CYPRESS_EXIT}
+elif [ "${TEST_SUITE}" == "${FRONTEND_CORE_CACHING}" ]; then
+  ensureCypressReady
+
+  if [ "${TESTS_ONLY}" == "false" ]; then
+    # Set up the cluster and Istio but skip Kiali deployment so that demo
+    # apps are present before Kiali starts.  This lets the health cache
+    # pre-compute bookinfo health on its first refresh.
+    "${SCRIPT_DIR}"/setup-kind-in-ci.sh --auth-strategy token --sail true ${ISTIO_VERSION_ARG} ${HELM_CHARTS_DIR_ARG} --install-perses "true" --deploy-kiali false
+
+    # Install only bookinfo — the only demo app needed by @core-caching scenarios
+    "${SCRIPT_DIR}"/istio/install-testing-demos.sh -c "kubectl" --bookinfo-only true
+
+    # Reuse the helm charts dir from the first setup invocation so we
+    # don't have to clone and build again.
+    if [ -z "${HELM_CHARTS_DIR_ARG}" ] && [ -f /tmp/kiali-helm-charts-dir ]; then
+      HELM_CHARTS_DIR_ARG="--helm-charts-dir $(cat /tmp/kiali-helm-charts-dir)"
+    fi
+
+    # Now deploy Kiali with caching enabled. We deploy after demo apps so
+    # that the health cache sees bookinfo on its initial refresh.
+    "${SCRIPT_DIR}"/setup-kind-in-ci.sh --auth-strategy token ${HELM_CHARTS_DIR_ARG} --enable-cache "true" --kiali-only
+  fi
+
+  ensureKialiServerReady
+
+  export CYPRESS_BASE_URL="${KIALI_URL}"
+  export CYPRESS_NUM_TESTS_KEPT_IN_MEMORY=0
+  # Recorded video is unusable due to low resources in CI: https://github.com/cypress-io/cypress/issues/4722
+  export CYPRESS_VIDEO="${WITH_VIDEO}"
+
+  if [ "${SETUP_ONLY}" == "true" ]; then
+    exit 0
+  fi
+
+  cd "${SCRIPT_DIR}"/../frontend
+  set +e
+  TEST_GROUP="@core-caching" yarn run cypress:run:test-group:junit
+  CYPRESS_EXIT=$?
+  set -e
+  yarn run cypress:combine:reports
+  detectRaceConditions
+  exit ${CYPRESS_EXIT}
+elif [ "${TEST_SUITE}" == "${FRONTEND_CORE_OPTIONAL}" ]; then
+  ensureCypressReady
+
+  if [ "${TESTS_ONLY}" == "false" ]; then
+    "${SCRIPT_DIR}"/setup-kind-in-ci.sh --auth-strategy token --sail true ${ISTIO_VERSION_ARG} ${HELM_CHARTS_DIR_ARG} --install-perses "true"
+
+    # Install only bookinfo + sleep (crd-validation/perses tests don't need error-rates or loggers).
+    # Skipping error-rates (11 pods) and loggers (2 pods) saves ~26 sidecar containers.
+    "${SCRIPT_DIR}"/istio/install-testing-demos.sh -c "kubectl" --bookinfo-only true
+    "${SCRIPT_DIR}"/istio/install-sleep-demo.sh -c kubectl
+    kubectl rollout status deployment/sleep -n sleep --timeout=120s
+  fi
+
+  ensureKialiServerReady
+
+  export CYPRESS_BASE_URL="${KIALI_URL}"
+  export CYPRESS_NUM_TESTS_KEPT_IN_MEMORY=0
+  # Recorded video is unusable due to low resources in CI: https://github.com/cypress-io/cypress/issues/4722
+  export CYPRESS_VIDEO="${WITH_VIDEO}"
+
+  if [ "${SETUP_ONLY}" == "true" ]; then
+    exit 0
+  fi
+
+  start_perses_port_forward
+
+  cd "${SCRIPT_DIR}"/../frontend
+  set +e
+  TEST_GROUP="@crd-validation or @perses" yarn run cypress:run:test-group:junit
+  CYPRESS_EXIT=$?
+  set -e
+  yarn run cypress:combine:reports
+  stop_perses_port_forward
+  detectRaceConditions
+  exit ${CYPRESS_EXIT}
+elif [ "${TEST_SUITE}" == "${FRONTEND_AMBIENT}" ]; then
+  ensureCypressReady
+
+  if [ "${TESTS_ONLY}" == "false" ]; then
+    "${SCRIPT_DIR}"/setup-kind-in-ci.sh --auth-strategy token ${ISTIO_VERSION_ARG} --ambient true --sail true ${HELM_CHARTS_DIR_ARG}
+
+    # Install demo apps
+    "${SCRIPT_DIR}"/istio/install-testing-demos.sh -c "kubectl" --ambient true --use-gateway-api true --bookinfo-only ${BOOKINFO_ONLY}
+    "${SCRIPT_DIR}"/istio/install-travel-agency-demo.sh -c kubectl -ai false -di travel-control,travel-agency,travel-portal -w true
+  fi
+
+  ensureKialiServerReady
+  ensureBookinfoGraphReady
+  # TODO: traces are not available at this time, but tests are passing anyway
+  # ensureKialiTracesReady "false"
+
+  export CYPRESS_BASE_URL="${KIALI_URL}"
+  export CYPRESS_NUM_TESTS_KEPT_IN_MEMORY=0
+  # Recorded video is unusable due to low resources in CI: https://github.com/cypress-io/cypress/issues/4722
+  export CYPRESS_VIDEO="${WITH_VIDEO}"
+
+  if [ "${SETUP_ONLY}" == "true" ]; then
+    exit 0
+  fi
+
+  cd "${SCRIPT_DIR}"/../frontend
+  yarn run cypress:run:ambient
+  detectRaceConditions
+elif [ "${TEST_SUITE}" == "${FRONTEND_PRIMARY_REMOTE}" ]; then
+  ensureCypressReady
+
+  if [ "${TESTS_ONLY}" == "false" ]; then
+    "${SCRIPT_DIR}"/setup-kind-in-ci.sh --multicluster "primary-remote" ${ISTIO_VERSION_ARG} --tempo ${TEMPO} ${HELM_CHARTS_DIR_ARG}
+  fi
+
+  ensureKialiServerReady
+  ensureMulticlusterApplicationsAreHealthy
+  ensureKialiTracesReady "true"
+
+  export CYPRESS_BASE_URL="${KIALI_URL}"
+  export CYPRESS_CLUSTER1_CONTEXT="kind-east"
+  export CYPRESS_CLUSTER2_CONTEXT="kind-west"
+  export CYPRESS_NUM_TESTS_KEPT_IN_MEMORY=0
+  # Recorded video is unusable due to low resources in CI: https://github.com/cypress-io/cypress/issues/4722
+  export CYPRESS_VIDEO="${WITH_VIDEO}"
+  export CYPRESS_USERNAME="kiali"
+  export CYPRESS_PASSWD="kiali"
+
+  if [ "${SETUP_ONLY}" == "true" ]; then
+    exit 0
+  fi
+
+  cd "${SCRIPT_DIR}"/../frontend
+  yarn run cypress:run:multi-cluster
+  detectRaceConditions ${CYPRESS_CLUSTER1_CONTEXT}
+elif [ "${TEST_SUITE}" == "${FRONTEND_MULTI_PRIMARY}" ]; then
+  ensureCypressReady
+
+  # Configure auth strategy based on ambient mode
+  if [ -n "$AMBIENT" ]; then
+     AUTH_STRATEGY="anonymous"
+     AMBIENT_ARG="--ambient true"
+     MEMORY_LIMIT_ARG=""
+     MEMORY_REQUEST_ARG=""
+  else
+     AUTH_STRATEGY="openid"
+     AMBIENT_ARG=""
+     if [ -n "$KEYCLOAK_LIMIT_MEMORY" ]; then
+         MEMORY_LIMIT_ARG="-klm $KEYCLOAK_LIMIT_MEMORY"
+     else
+         MEMORY_LIMIT_ARG=""
+     fi
+     if [ -n "$KEYCLOAK_REQUESTS_MEMORY" ]; then
+        MEMORY_REQUEST_ARG="-krm $KEYCLOAK_REQUESTS_MEMORY"
+     else
+        MEMORY_REQUEST_ARG=""
+     fi
+  fi
+
+  if [ -n "$AMBIENT" ] && [ "$CLUSTER2_AMBIENT" == "false" ]; then
+     CLUSTER2_AMBIENT_ARG="--cluster2-ambient false"
+  else
+     CLUSTER2_AMBIENT_ARG=""
+  fi
+
+  if [ "${WAYPOINT}" == "true" ]; then
+     WAYPOINT_ARG="--waypoint true"
+  else
+     WAYPOINT_ARG=""
+  fi
+
+  if [ "${TESTS_ONLY}" == "false" ]; then
+    "${SCRIPT_DIR}"/setup-kind-in-ci.sh --multicluster "multi-primary" ${ISTIO_VERSION_ARG} --auth-strategy ${AUTH_STRATEGY} ${HELM_CHARTS_DIR_ARG} ${SAIL_ARG} $MEMORY_LIMIT_ARG $MEMORY_REQUEST_ARG $AMBIENT_ARG $CLUSTER2_AMBIENT_ARG $WAYPOINT_ARG
+  fi
+
+  ensureKialiServerReady
+  # We now need a kiali-aes-cookie to be able to talk to the API so checks for the applications
+  # being healthy have moved into the frontend tests where it's easier to get the cookie.
+
+  export CYPRESS_BASE_URL="${KIALI_URL}"
+  export CYPRESS_CLUSTER1_CONTEXT="kind-east"
+  export CYPRESS_CLUSTER2_CONTEXT="kind-west"
+  export CYPRESS_NUM_TESTS_KEPT_IN_MEMORY=0
+  export CYPRESS_VIDEO="${WITH_VIDEO}"
+
+  # Configure Cypress auth based on ambient mode
+  if [ -z "$AMBIENT" ]; then
+    export CYPRESS_AUTH_PROVIDER="keycloak"
+    export CYPRESS_USERNAME="kiali"
+    export CYPRESS_PASSWD="kiali"
+  fi
+
+  if [ "${SETUP_ONLY}" == "true" ]; then
+    exit 0
+  fi
+
+  cd "${SCRIPT_DIR}"/../frontend
+  if [ -n "$AMBIENT" ]; then
+    yarn run cypress:run:ambient-multi-primary
+  else
+    yarn run cypress:run:multi-primary
+  fi
+  detectRaceConditions ${CYPRESS_CLUSTER1_CONTEXT}
+elif [ "${TEST_SUITE}" == "${FRONTEND_EXTERNAL_KIALI}" ]; then
+  ensureCypressReady
+
+  if [ -n "$KEYCLOAK_LIMIT_MEMORY" ]; then
+      MEMORY_LIMIT_ARG="-klm $KEYCLOAK_LIMIT_MEMORY"
+  else
+      MEMORY_LIMIT_ARG=""
+  fi
+  if [ -n "$KEYCLOAK_REQUESTS_MEMORY" ]; then
+     MEMORY_REQUEST_ARG="-krm $KEYCLOAK_REQUESTS_MEMORY"
+  else
+     MEMORY_REQUEST_ARG=""
+  fi
+
+  if [ "${TESTS_ONLY}" == "false" ]; then
+    "${SCRIPT_DIR}"/setup-kind-in-ci.sh --multicluster "external-kiali" ${ISTIO_VERSION_ARG} --auth-strategy openid --tempo ${TEMPO} ${HELM_CHARTS_DIR_ARG} $MEMORY_LIMIT_ARG $MEMORY_REQUEST_ARG
+  fi
+
+  ensureKialiServerReady
+
+  export CYPRESS_BASE_URL="${KIALI_URL}"
+  export CYPRESS_CLUSTER1_CONTEXT="kind-mgmt"
+  export CYPRESS_CLUSTER2_CONTEXT="kind-mesh"
+  export CYPRESS_NUM_TESTS_KEPT_IN_MEMORY=0
+  # Recorded video is unusable due to low resources in CI: https://github.com/cypress-io/cypress/issues/4722
+  export CYPRESS_VIDEO="${WITH_VIDEO}"
+  export CYPRESS_USERNAME="kiali"
+  export CYPRESS_PASSWD="kiali"
+
+  if [ "${SETUP_ONLY}" == "true" ]; then
+    exit 0
+  fi
+
+  cd "${SCRIPT_DIR}"/../frontend
+  yarn run cypress:run:external-kiali
+  detectRaceConditions ${CYPRESS_CLUSTER1_CONTEXT}
+elif [ "${TEST_SUITE}" == "${FRONTEND_TEMPO}" ]; then
+  ensureCypressReady
+
+  if [ "${TESTS_ONLY}" == "false" ]; then
+    "${SCRIPT_DIR}"/setup-kind-in-ci.sh --tempo true --sail true --auth-strategy token ${ISTIO_VERSION_ARG} ${HELM_CHARTS_DIR_ARG}
+
+    # Install demo apps
+    "${SCRIPT_DIR}"/istio/install-testing-demos.sh -c "kubectl" --use-gateway-api true --bookinfo-only ${BOOKINFO_ONLY}
+  fi
+
+  ensureKialiServerReady
+
+  export CYPRESS_BASE_URL="${KIALI_URL}"
+  export CYPRESS_NUM_TESTS_KEPT_IN_MEMORY=0
+  # Recorded video is unusable due to low resources in CI: https://github.com/cypress-io/cypress/issues/4722
+  export CYPRESS_VIDEO="${WITH_VIDEO}"
+
+  if [ "${SETUP_ONLY}" == "true" ]; then
+    exit 0
+  fi
+
+  cd "${SCRIPT_DIR}"/../frontend
+  yarn run cypress:run:tracing
+  detectRaceConditions
+elif [ "${TEST_SUITE}" == "${FRONTEND_MULTI_MESH}" ]; then
+  ensureCypressReady
+
+  if [ "${TESTS_ONLY}" == "false" ]; then
+    # Setup single cluster with multi mesh
+    "${SCRIPT_DIR}"/setup-kind-in-ci.sh --auth-strategy token --sail true ${ISTIO_VERSION_ARG} ${HELM_CHARTS_DIR_ARG}
+
+    # Install demo apps (skip beta namespace -- not needed by multi-mesh tests)
+    "${SCRIPT_DIR}"/istio/install-testing-demos.sh -c "kubectl" --use-gateway-api true --install-errorrates-beta false
+
+     "${SCRIPT_DIR}"/istio/install-istio-via-istioctl.sh -c kubectl -iv 1.26.0 -mid istio_26 -n istio-system-26 -ir "default-v1-26-0"
+
+     "${SCRIPT_DIR}"/istio/install-istio-via-istioctl.sh -c kubectl -iv 1.26.2 -mid istio_26 -n istio-system-26-2 -ir "default-v1-26-2"
+
+  fi
+
+  ensureKialiServerReady
+
+  export CYPRESS_BASE_URL="${KIALI_URL}"
+  export CYPRESS_NUM_TESTS_KEPT_IN_MEMORY=0
+  # Recorded video is unusable due to low resources in CI: https://github.com/cypress-io/cypress/issues/4722
+  export CYPRESS_VIDEO="${WITH_VIDEO}"
+
+  if [ "${SETUP_ONLY}" == "true" ]; then
+    exit 0
+  fi
+
+  cd "${SCRIPT_DIR}"/../frontend
+  yarn run cypress:run:multi-mesh
+  detectRaceConditions
+elif [ "${TEST_SUITE}" == "${LOCAL}" ]; then
+  ensureCypressReady
+
+  GOPATH=$(go env GOPATH)
+  
+  if [ -z "${GOPATH}" ]; then
+    echo "ERROR: Unable to determine GOPATH. Please ensure Go is properly installed."
+    exit 1
+  fi
+  
+  KIALI_BINARY="${GOPATH}/bin/kiali"
+  if [ ! -f "${KIALI_BINARY}" ]; then
+    echo "ERROR: Kiali binary not found at ${KIALI_BINARY}. Please build the kiali binary first."
+    exit 1
+  fi
+
+  if [ "${TESTS_ONLY}" == "false" ]; then
+    "${SCRIPT_DIR}"/setup-kind-in-ci.sh --auth-strategy token --sail true --deploy-kiali false ${ISTIO_VERSION_ARG} ${HELM_CHARTS_DIR_ARG}
+
+    "${SCRIPT_DIR}"/istio/install-testing-demos.sh -c "kubectl" --bookinfo-only ${BOOKINFO_ONLY}
+  fi
+
+  infomsg "Setup complete."
+  
+  if [ "${SETUP_ONLY}" == "true" ]; then
+    exit 0
+  fi
+  
+  # Start Kiali locally in the background
+  infomsg "Starting Kiali locally in the background using binary: ${KIALI_BINARY}"
+  "${KIALI_BINARY}" -c "${SCRIPT_DIR}/ci-yaml/ci-test-config-no-cache.yaml" run --cluster-name-overrides kind-ci=cluster-default --port-forward-tracing --enable-tracing --port-forward-prom --port-forward-grafana --no-browser &
+  KIALI_PID=$!
+
+  # Set the local Kiali URL
+  KIALI_URL="http://localhost:20001"
+
+  # Wait for the Kiali server to become ready by polling its health endpoint.
+  infomsg "Waiting for Kiali server to respond at ${KIALI_URL}"
+  WAIT_START=$(date +%s)
+  WAIT_END=$((WAIT_START + 60))
+  while true; do
+    if ! ps -p ${KIALI_PID} > /dev/null; then
+      echo "Kiali process is not running. An error must have occurred. Check the logs above."
+      exit 1
+    fi
+    if curl -s --fail "${KIALI_URL}/healthz" > /dev/null 2>&1; then
+      break
+    fi
+    WAIT_NOW=$(date +%s)
+    if [ "${WAIT_NOW}" -gt "${WAIT_END}" ]; then
+      echo "Timed out waiting for Kiali server to respond at ${KIALI_URL}/healthz"
+      exit 1
+    fi
+    sleep 2
+  done
+  infomsg "Kiali server is healthy"
+
+  export CYPRESS_BASE_URL="${KIALI_URL}"
+  export CYPRESS_NUM_TESTS_KEPT_IN_MEMORY=0
+  # Recorded video is unusable due to low resources in CI: https://github.com/cypress-io/cypress/issues/4722
+  export CYPRESS_VIDEO="${WITH_VIDEO}"
+
+  # Trap to ensure we clean up the Kiali process on exit
+  trap cleanup_kiali EXIT
+
+  cd "${SCRIPT_DIR}"/../frontend
+  yarn run cypress:run:smoke
+elif [ "${TEST_SUITE}" == "${OFFLINE}" ]; then
+  ensureCypressReady
+  
+  GOPATH=$(go env GOPATH)
+  if [ -z "${GOPATH}" ]; then
+    echo "ERROR: Unable to determine GOPATH. Please ensure Go is properly installed."
+    exit 1
+  fi
+  
+  if [ ! -f "${GOPATH}/bin/kiali" ]; then
+    echo "ERROR: Kiali binary not found at ${GOPATH}/bin/kiali. Please build the kiali binary first."
+    exit 1
+  fi
+  
+  infomsg "Found kiali binary at ${GOPATH}/bin/kiali"
+
+  if [ "${TESTS_ONLY}" == "false" ]; then
+    "${SCRIPT_DIR}"/setup-kind-in-ci.sh --auth-strategy token --sail true ${ISTIO_VERSION_ARG} ${HELM_CHARTS_DIR_ARG}
+
+    # Install demo apps
+    "${SCRIPT_DIR}"/istio/install-testing-demos.sh -c "kubectl"
+
+    ensureKialiServerReady
+  fi
+
+  if [ "${SETUP_ONLY}" == "true" ]; then
+    exit 0
+  fi
+  
+  OFFLINE_SEEDED_TRAFFIC_ROUTING_ASSET="${SCRIPT_DIR}/../tests/integration/assets/bookinfo-offline-fault-injection-reviews.yaml"
+  infomsg "Seeding offline fault injection config for reviews"
+  kubectl apply -n bookinfo -f "${OFFLINE_SEEDED_TRAFFIC_ROUTING_ASSET}"
+
+  # Make a temp dir for the must-gather data
+  MUST_GATHER_DIR=$(mktemp -d)
+
+  # We either need to run oc adm inspect which requires us to download `oc` or we can run the ossm-must-gather image directly.
+  # Opting here to use the ossm-must-gather image directly so as not to make the test suite depend on oc.
+  docker run --network host --volume "$HOME/.kube/config:/root/.kube/config:ro" --volume "$MUST_GATHER_DIR:/must-gather" --rm quay.io/maistra/istio-must-gather:3.0
+
+  "${GOPATH}/bin/kiali" gather --cluster-name-overrides kind-ci=cluster-default --output-dir "${MUST_GATHER_DIR}" --port-forward-prom
+  cleanup_offline_seeded_traffic_routing
+  OFFLINE_SEEDED_TRAFFIC_ROUTING_ASSET=""
+
+  # No longer need the kind cluster after we've gathered the data.
+  # kind delete clusters -A
+
+  export CYPRESS_BASE_URL="${KIALI_URL}"
+
+  # Start kiali in offline mode in the background
+  infomsg "Starting kiali in offline mode with must-gather data on port ${KIALI_PORT}"
+  "${GOPATH}/bin/kiali" -c "${SCRIPT_DIR}/ci-yaml/ci-test-config-no-cache.yaml" run offline --log-level debug --data-path "${MUST_GATHER_DIR}" --without-browser &
+  KIALI_PID=$!
+  
+  # Trap to ensure we clean up the Kiali process on exit
+  trap cleanup_kiali EXIT
+
+  # Wait for the Kiali server to become ready by polling its health endpoint.
+  # Offline mode can take a while to parse all must-gather data before the HTTP server starts.
+  KIALI_OFFLINE_URL="http://localhost:20001"
+  infomsg "Waiting for Kiali offline server to respond at ${KIALI_OFFLINE_URL}"
+  WAIT_START=$(date +%s)
+  WAIT_END=$((WAIT_START + 120))
+  while true; do
+    if ! ps -p ${KIALI_PID} > /dev/null; then
+      echo "Kiali process is not running. An error must have occurred. Check the logs above."
+      exit 1
+    fi
+    if curl -s --fail "${KIALI_OFFLINE_URL}/healthz" > /dev/null 2>&1; then
+      break
+    fi
+    WAIT_NOW=$(date +%s)
+    if [ "${WAIT_NOW}" -gt "${WAIT_END}" ]; then
+      echo "Timed out waiting for Kiali offline server to respond at ${KIALI_OFFLINE_URL}/healthz"
+      exit 1
+    fi
+    sleep 2
+  done
+  infomsg "Kiali offline server is healthy"
+
+  # Set up cypress environment variables
+  export CYPRESS_BASE_URL="${KIALI_OFFLINE_URL}"
+  export CYPRESS_RUN_MODE="offline"
+  export CYPRESS_NUM_TESTS_KEPT_IN_MEMORY=0
+  export CYPRESS_VIDEO="${WITH_VIDEO}"
+
+  # Run cypress tests for offline mode
+  infomsg "Running cypress tests for offline mode"
+  cd "${SCRIPT_DIR}"/../frontend
+  yarn run cypress:run:offline
+fi

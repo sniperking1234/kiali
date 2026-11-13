@@ -1,0 +1,219 @@
+import { getExpr } from '../../../config/HealthConfig';
+import type { RequestHealth, RequestType } from '../../Health';
+import type { HealthAnnotationType } from '../../HealthAnnotation';
+import type { TrafficItem } from '../../../components/TrafficList/TrafficDetails';
+import type { Responses } from '../../Graph';
+import { NodeType } from '../../Graph';
+import type { ServerConfig } from 'types/ServerConfig';
+
+const codes = ['200', '400', '404', '500'];
+export const annotationSample: HealthAnnotationType = { 'health.kiali.io/rate': '4XX,10,20,http,inbound' };
+
+const precision = 100; // 2 decimals
+const randomRequest = (greater = 40): RequestType => {
+  const result = {
+    http: {}
+  };
+  codes.forEach(code => {
+    result['http'][code] =
+      Math.floor(Math.random() * (100 * precision - greater * precision) + greater * precision) / (1 * precision);
+  });
+  return result;
+};
+
+export const generateTrafficItem = (requests: { [key: string]: number[] }): TrafficItem => {
+  const responses: Responses = {};
+
+  Object.keys(requests).forEach(key => {
+    const flags = {};
+    requests[key].forEach((v, i) => (flags[i] = v));
+    responses[key] = {
+      hosts: {},
+      flags
+    };
+  });
+
+  return {
+    direction: 'inbound',
+    node: {
+      id: 'x-server',
+      type: NodeType.SERVICE,
+      namespace: 'alpha',
+      name: 'x-server',
+      isInaccessible: false
+    },
+    traffic: {
+      protocol: 'http',
+      rates: {
+        http: '20'
+      },
+      responses
+    }
+  };
+};
+
+export const generateRequestHealth = (
+  annotation: HealthAnnotationType,
+  inbound?: RequestType,
+  outbound?: RequestType
+): RequestHealth => {
+  return {
+    inbound: inbound || randomRequest(),
+    outbound: outbound || randomRequest(),
+    healthAnnotations: annotation || {}
+  };
+};
+
+export const serverRateConfig = {
+  authStrategy: '',
+  ambientEnabled: false,
+  ai: {
+    enabled: false,
+    chat: {
+      allowed: false,
+      enabled: false,
+      providers: [],
+      defaultProvider: '',
+      store: {
+        enabled: false
+      }
+    },
+    consumption: {
+      enabled: false,
+      allowed: false
+    }
+  },
+  clusters: {},
+  clusterWideAccess: true,
+  controlPlanes: { Kubernetes: 'istio-system' },
+  gatewayAPIClasses: [],
+  gatewayAPIEnabled: false,
+  grafana: {},
+  ignoreHomeCluster: false,
+  logLevel: '',
+  kialiFeatureFlags: {
+    disabledFeatures: [],
+    istioInjectionAction: true,
+    istioAnnotationAction: true,
+    istioUpgradeAction: false,
+    uiDefaults: {
+      graph: {
+        findOptions: [],
+        hideOptions: [],
+        impl: 'pf',
+        settings: {
+          animation: 'point',
+          fontLabel: 13,
+          minFontBadge: 7,
+          minFontLabel: 10
+        },
+        traffic: {
+          ambient: 'total',
+          grpc: 'requests',
+          http: 'requests',
+          tcp: 'sent'
+        }
+      },
+      i18n: {
+        language: 'en',
+        showSelector: false
+      },
+      list: {
+        includeHealth: true,
+        includeIstioResources: true,
+        includeValidations: true,
+        showIncludeToggles: false
+      },
+      mesh: {
+        findOptions: [],
+        hideOptions: []
+      },
+      metricsPerRefresh: '1m',
+      namespaces: [],
+      refreshInterval: '15s',
+      tracing: { limit: 100 }
+    }
+  },
+  healthConfig: {
+    rate: [
+      {
+        namespace: new RegExp('bookinfo'),
+        kind: new RegExp('app'),
+        name: new RegExp('reviews'),
+        tolerance: [
+          {
+            code: new RegExp('4dd'),
+            degraded: 20,
+            failure: 30,
+            protocol: new RegExp('http'),
+            direction: new RegExp('inbound')
+          }
+        ]
+      },
+      {
+        namespace: getExpr(''),
+        kind: getExpr(''),
+        name: getExpr(''),
+        tolerance: [
+          {
+            code: new RegExp(/^5\d\d$/),
+            protocol: new RegExp('http'),
+            direction: new RegExp('.*'),
+            degraded: 0.1,
+            failure: 20
+          },
+          {
+            code: new RegExp(/^[1-9]$|^1[0-6]$/),
+            protocol: new RegExp('grpc'),
+            direction: new RegExp('.*'),
+            degraded: 0.1,
+            failure: 20
+          }
+        ]
+      }
+    ]
+  },
+  healthStatusMetricsEnabled: false,
+  installationTag: 'Kiali Console',
+  istioAnnotations: {
+    ambientAnnotation: 'ambient.istio.io/redirection',
+    ambientAnnotationEnabled: 'enabled',
+    istioInjectionAnnotation: ''
+  },
+  istioAPIInstalled: false,
+  istioGatewayInstalled: false,
+  istioIdentityDomain: 'svc.cluster.local',
+  istioNamespace: 'istio-system',
+  istioLabels: {
+    appLabelName: 'app',
+    versionLabelName: 'version'
+  },
+  prometheus: {
+    enabled: true,
+    globalScrapeInterval: 15,
+    storageTsdbRetention: 21600
+  },
+  durations: {},
+  istioTelemetryV2: true,
+  deployment: {
+    viewOnlyMode: false
+  },
+  runMode: 'app'
+} as ServerConfig;
+
+export const tolerancesDefault = [
+  {
+    code: new RegExp(/^[4-5]\d\d$/),
+    protocol: new RegExp('http'),
+    direction: new RegExp('.*'),
+    degraded: 0.1,
+    failure: 20
+  },
+  {
+    code: new RegExp(/^[1-9]$|^1[0-6]$/),
+    protocol: new RegExp('grpc'),
+    direction: new RegExp('.*'),
+    degraded: 0.1,
+    failure: 20
+  }
+];

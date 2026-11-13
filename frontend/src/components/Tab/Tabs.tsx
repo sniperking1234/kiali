@@ -1,0 +1,166 @@
+// Assisted-by: OpenAI Codex
+import * as React from 'react';
+import { Tabs, type TabProps } from '@patternfly/react-core';
+import { classes } from 'typestyle';
+
+import { location, router } from '../../app/History';
+import { PFColors } from 'components/Pf/PfColors';
+import { isKioskMode } from '../../utils/SearchParamUtils';
+import { kialiStyle } from 'styles/StyleUtils';
+import { contrastContentNest } from 'styles/ThemeSurfaces';
+import { CustomTimeTabsProvider } from './CustomTimeTabs';
+
+type TabsProps = {
+  actionsToolbar?: React.ReactNode;
+  activeTab: string;
+  className?: string;
+  customTimeTabs?: string[];
+  defaultTab: string;
+  id: string;
+  mountOnEnter?: boolean;
+  onPostSelect?: (tabName: string) => void;
+  onSelect: (tabName: string) => void;
+  tabMap: { [key: string]: number };
+  tabName?: string;
+  unmountOnExit?: boolean;
+};
+
+export const activeTab = (tabName: string, defaultTab: string): string => {
+  return new URLSearchParams(location.getSearch()).get(tabName) || defaultTab;
+};
+
+const tabStyle = kialiStyle({
+  backgroundColor: PFColors.BackgroundColor100,
+  $nest: contrastContentNest()
+});
+
+const flexTabWrapperStyle = kialiStyle({
+  display: 'flex',
+  flex: 1,
+  flexDirection: 'column',
+  minHeight: 0,
+  position: 'relative'
+});
+
+const actionsToolbarStyle = kialiStyle({
+  position: 'absolute',
+  right: 0,
+  top: 0,
+  zIndex: 1
+});
+
+type TabElement = React.ReactElement<TabProps, React.JSXElementConstructor<TabProps>>;
+
+type TabMap = { [key: number]: string };
+
+export class ParameterizedTabs extends React.Component<TabsProps> {
+  private indexMap: TabMap;
+  private tabLinks: TabMap;
+
+  constructor(props: TabsProps) {
+    super(props);
+    this.indexMap = this.buildIndexMap();
+    this.tabLinks = this.buildTabLinks();
+  }
+
+  componentDidUpdate(): void {
+    this.indexMap = this.buildIndexMap();
+    this.tabLinks = this.buildTabLinks();
+  }
+
+  buildIndexMap(): TabMap {
+    return Object.keys(this.props.tabMap).reduce((result: { [i: number]: string }, name: string) => {
+      result[this.tabIndexOf(name)] = name;
+      return result;
+    }, {});
+  }
+
+  buildTabLinks(): TabMap {
+    const tabLinks: TabMap = {};
+
+    React.Children.forEach(this.props.children, child => {
+      const childComp = child as React.ReactElement<TabProps>;
+
+      if (childComp.props.href) {
+        tabLinks[childComp.props.eventKey] = childComp.props.href;
+      }
+    });
+
+    return tabLinks;
+  }
+
+  tabIndexOf(tabName: string): number {
+    return this.props.tabMap[tabName];
+  }
+
+  tabNameOf(index: number): string {
+    return this.indexMap[index];
+  }
+
+  activeIndex = (): number => {
+    return this.tabIndexOf(this.props.activeTab);
+  };
+
+  isLinkTab = (index: number): boolean => {
+    return this.tabLinks[index] != null;
+  };
+
+  handleTabSelect = (tabKey: string): void => {
+    const urlParams = new URLSearchParams(location.getSearch());
+
+    if (!!this.props.tabName) {
+      urlParams.set(this.props.tabName, tabKey);
+      router.navigate(`${location.getPathname()}?${urlParams.toString()}`);
+    }
+
+    if (this.props.onPostSelect) {
+      this.props.onPostSelect(tabKey);
+    }
+  };
+
+  handleTabTransition = (tabKey: number): void => {
+    const tabName = this.tabNameOf(tabKey);
+    this.handleTabSelect(tabName);
+    this.props.onSelect(tabName);
+  };
+
+  render(): React.ReactNode {
+    const content = (
+      <div className={classes(flexTabWrapperStyle, this.props.className, tabStyle)}>
+        {this.props.actionsToolbar && !isKioskMode() && (
+          <div className={actionsToolbarStyle}>{this.props.actionsToolbar}</div>
+        )}
+
+        <Tabs
+          id={this.props.id}
+          activeKey={this.activeIndex()}
+          onSelect={(_, ek) => {
+            if (!this.isLinkTab(ek as number)) {
+              this.handleTabTransition(ek as number);
+            }
+          }}
+          mountOnEnter={this.props.mountOnEnter === undefined ? true : this.props.mountOnEnter}
+          unmountOnExit={this.props.unmountOnExit === undefined ? true : this.props.unmountOnExit}
+        >
+          {!Array.isArray(this.props.children)
+            ? (this.props.children as TabElement)
+            : this.props.children.map(child => child)}
+        </Tabs>
+      </div>
+    );
+
+    return this.props.customTimeTabs && this.props.tabName ? (
+      <CustomTimeTabsProvider
+        names={this.props.customTimeTabs}
+        onSelect={this.props.onSelect}
+        tabMap={this.props.tabMap}
+        tabName={this.props.tabName}
+        tabs={this.props.children}
+      >
+        {content}
+      </CustomTimeTabsProvider>
+    ) : (
+      content
+    );
+  }
+}

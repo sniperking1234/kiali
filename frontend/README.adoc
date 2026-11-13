@@ -1,0 +1,406 @@
+:toc: macro
+:toc-title:
+
+toc::[]
+= Kiali UI
+
+== Introduction
+
+A UI for the Kiali Istio Observability Project
+
+== Quick Start
+[source,shell]
+----
+# Get the kiali-ui sources
+git clone https://github.com/kiali/kiali.git
+cd kiali/frontend
+
+# Enable corepack to use yarn (ships with Node.js)
+corepack enable
+
+# Install kiali-ui dependencies
+yarn install
+
+# Start a development server
+yarn start
+----
+
+[NOTE]
+====
+**Yarn Version Management**
+
+Kiali uses Yarn 4 managed via link:https://nodejs.org/api/corepack.html[corepack]. The exact Yarn version is specified in `package.json` via the `packageManager` field, ensuring all developers use the same version.
+
+If you have an older global Yarn installation, you may want to remove it to avoid confusion: `npm uninstall -g yarn`
+
+After enabling corepack, running `yarn` in the frontend directory will automatically download and use the correct version.
+====
+
+[NOTE]
+On some platforms, `yarn start` may fail with an error like `Error: ENOSPC: System limit for number of file watchers reached`. To fix this, you need to increase the limit of file watchers on your system. The command may vary depending on the platform, please refer to link:https://github.com/guard/listen/wiki/Increasing-the-amount-of-inotify-watchers[these instructions].
+
+A new browser window should automatically open.
+But, if it doesn't then use: `http://localhost:3001`
+(or whatever address is told by the `yarn start` command).
+
+This launches a development environment that instantly
+reloads any changes to the browser for rapid development.
+
+== Directory Structure
+* `build`: Production build output
+* `public`: Home of index.html
+* `src`: Source and test code
+* `src/actions`:  Redux actions
+* `src/app`: React top level component
+* `src/assets`: Images and other assets
+* `src/components`: React Components
+* `src/config`: Configuration
+* `src/helpers`:  Utility functions and components
+* `src/hooks`:  Utility hooks
+* `src/pages`: Top level pages and nested components
+* `src/reducers`: Redux reducers
+* `src/routes`: Router wrapper components
+* `src/services`: Api services
+* `src/store`:  Redux store definitions
+* `src/styles`:  Application wide styles
+* `src/types`: Typescript definitions for all kinds of types
+* `src/utils`: Various Utilities
+
+== Developing
+
+The Kiali UI is a React application written in Typescript.
+
+We use yarn as the package manager. When adding dependencies to `package.json`, install them with `yarn install` and commit the `yarn.lock` file
+
+=== Running Kiali Frontend
+
+When developing, it is typical to run the frontend outside of the kiali server in the cluster.
+
+It is possible to proxy the API requests without having to push the changes to kiali.
+The dev server proxy is configured in `rsbuild.config.ts` and defaults to `http://localhost:20001`.
+To override it, set the `KIALI_PROXY_URL` environment variable:
+
+[source, shell]
+----
+KIALI_PROXY_URL=http://localhost:20001 yarn start
+----
+
+Or use the make target:
+
+[source, shell]
+----
+make KIALI_PROXY_URL=http://localhost:20001 run-frontend
+----
+
+If Kiali is configured with a `web_root` other than `/` (e.g. `/kiali`, which is common in cluster deployments), append it to the URL:
+
+[source, shell]
+----
+KIALI_PROXY_URL=http://localhost:20001/kiali yarn start
+----
+
+TIP: You can check the `web_root` value in your Kiali config YAML under `server.web_root`. The default is `/` (used by `run-kiali.sh` and `make run-backend`). Cluster deployments via the Kiali operator typically set it to `/kiali`.
+
+Run `yarn start` and try it!
+
+=== Mock API with MSW (Mock Service Worker)
+
+For frontend development without a running backend, Kiali supports API mocking using link:https://mswjs.io/[Mock Service Worker (MSW)]. This allows you to develop and test the UI with realistic mock data.
+
+==== Starting with Mock API
+
+[source,shell]
+----
+# Start with default mock scenario (healthy)
+yarn start:mock
+----
+
+The mock service worker will intercept all API requests and return mock data that simulates a real Kiali backend.
+
+==== Mock Scenarios
+
+Different scenarios are available to simulate various environments:
+
+[cols="1,3"]
+|===
+|Scenario |Description
+
+|`healthy` (default)
+|All services healthy, no errors or warnings
+
+|`unhealthy`
+|Some services with errors and validation issues
+
+|`multicluster`
+|Multiple clusters (cluster-east, cluster-west, cluster-central) with cross-cluster traffic
+
+|`ambient`
+|Ambient mesh enabled with waypoint proxies
+
+|`ai`
+|ChatAI conversations
+|===
+
+To use a specific scenario, set the `REACT_APP_MOCK_SCENARIO` environment variable:
+
+[source,shell]
+----
+# Example: Run with multicluster scenario
+REACT_APP_MOCK_SCENARIO=multicluster yarn start:mock
+----
+
+==== Mock Data Structure
+
+The mock handlers are located in `src/mocks/handlers/` and organized by feature:
+
+* `auth.ts` - Authentication and session info
+* `config.ts` - Server configuration
+* `health.ts` - Health status and metrics
+* `istio.ts` - Istio configuration and validations
+* `mesh.ts` - Mesh graph data
+* `namespaces.ts` - Namespace list
+* `tracing.ts` - Distributed tracing data
+* `traffic.ts` - Traffic graph data
+* `workloads.ts` - Workloads, services, and dashboards
+* `chatbot/` - AI Chatbot feature
+
+Scenario configuration is defined in `src/mocks/scenarios.ts`.
+
+==== Adding Conversations to ChatAI Mock
+
+To add a new conversation to the mock:
+
+1. Create a JSON file in `mocks/handlers/chatbot/conversations` following the Uppercase pattern. For example: actionNavigationOverview.json
+2. Use `yarn generate:chatbot-conversations` to generate the index, and don't forget to add it to the commit (`mocks/handlers/chatbot/conversations.index.ts`).
+
+==== Adding New Mock Handlers
+
+To add a new mock endpoint:
+
+1. Create or modify a handler file in `src/mocks/handlers/`
+2. Use MSW's `http` module to define request handlers:
+
+[source,typescript]
+----
+import { http, HttpResponse } from 'msw';
+
+export const myHandlers = [
+  http.get('*/api/my-endpoint', () => {
+    return HttpResponse.json({ data: 'mock response' });
+  })
+];
+----
+
+3. Export the handlers in `src/mocks/handlers/index.ts`
+
+[NOTE]
+The `mockServiceWorker.js` file is auto-generated and not committed to the repository. It's created automatically when running `yarn start:mock`.
+
+=== Internationalization (i18n)
+
+Kiali supports internationalization with the `react-i18next` library. String literals to be translated are added automatically to a locale file (stored in `public/locales/<language>/translation.json`), during the development phase, with `i18n-parser` (executed along with `yarn start` or `yarn build` command). At runtime, the i18n library will use these locale files to perform translation to a specific language.
+
+Users change language from *Preferences* in the user dropdown. Language selection is shown by default. The `ui_defaults.i18n.show_selector` setting is deprecated: setting it to `false` hides the language selector, but the setting will be removed in a future release.
+
+**Adding a new language**
+
+These are the steps to add a new language to Kiali:
+
+1. Add a new language entry in the link:https://github.com/kiali/kiali/blob/master/frontend/src/types/Common.ts[`common type`] enum `Language`.
+
+[source, typescript]
+----
+export const enum Language {
+  CHINESE = 'zh',
+  ENGLISH = 'en'
+  // Add new language entry here
+}
+----
+
+2. Add browser locale matching in link:https://github.com/kiali/kiali/blob/master/frontend/src/utils/LanguageUtils.ts[`LanguageUtils.ts`] (`matchBrowserLanguage`) and a new select entry in link:https://github.com/kiali/kiali/blob/master/frontend/src/components/Nav/Masthead/PreferencesModal.tsx[`PreferencesModal.tsx`] (`languageOptions` array).
+
+[source, typescript]
+----
+{
+  description: getLanguageDescription(Language.CHINESE),
+  label: getLanguageLabel(Language.CHINESE),
+  value: Language.CHINESE
+}
+----
+
+If possible, include a new language test case scenario in the language selector unit test `PreferencesModal.test.tsx`.
+
+3. Add the new language in the link:https://github.com/kiali/kiali/blob/master/frontend/i18next-parser.config.ts[`i18next-parser.config.ts`] file so that the `i18n-parser` generates the locale file for the new language.
+
+[source, typescript]
+----
+locales: ['en', 'zh', /* add new language code here */],
+----
+
+3. Execute `yarn build` to generate the new locale file.
+4. Modify the generated locale file as outlined in the next section.
+
+**Modify an existing language translation**
+
+The locale files are stored in `public/locales/<language>/translation.json`. If you find a wrong translation or an English statement (default value when the label is generated), simply modify that file to include the correct language translation.
+
+The English catalog (`public/locales/en/translation.json`) is generated locally by `yarn i18n` for reference and is not committed. English UI text is the i18n key (`t('Traffic Graph')`); at runtime `fallbackLng: 'en'` displays that key when no English file is present. Commit only translated catalogs (`es`, `fr`, `ja`, `ko`, `zh`, and other supported languages).
+
+For shared defaults and language-specific glossary and style conventions used when editing locale files, see link:../I18N-AGENTS.md[`I18N-AGENTS.md`].
+
+**Add i18n support to a React component**
+
+The way to adapt a React component to the i18n framework depends on its type:
+
+- **React class:**
+
+Use the `t` function imported from `utils/i18nUtils`. **Important:** Don't import the `t` function from 'i18next' library; always import it from `utils/i18nUtils`.
+
+Any label (variable or string literal) can be translated with the `t` function within the component.
+
+[source, typescript]
+----
+import { t } from 'utils/I18nUtils';
+
+title = t('Traffic Graph');
+----
+
+In some React classes, labels are not translated on initial load or when the language changes. If this happens, add the language to Redux properties to force the component to re-render when the language is updated.
+
+[source, typescript]
+----
+type ReduxProps = {
+  language: string;
+};
+
+const mapStateToProps = (state: KialiAppState): ReduxProps => ({
+  language: languageSelector(state)
+});
+----
+
+
+- **React hook:**
+
+Use the `useKialiTranslation` hook from `utils/i18nUtils` to get the `t` translation function. This is simply a wrapper for the `useTranslation` hook that includes the Kiali namespace. More info link:https://react.i18next.com/latest/usetranslation-hook[here].
+
+[source, typescript]
+----
+const { t } = useKialiTranslation();
+
+<h1>{t(title)}</h1>
+----
+
+- **External variable:**
+
+String literals that are stored in a variable defined outside of a React component cannot be translated directly. Instead, the translation has to be done when the variable is used within the React component (class, hook or external function).
+
+The problem is that the i18n parser can't extract labels from variables, only from literals. To indicate to the i18n parser to add that kind of string literal to the locale file, use the `t` function imported from `utils/i18nUtils`. Note that in this context, the `t` function does not perform any translation; it returns the same string literal at runtime, so it is used for development purposes only.
+
+[source, typescript]
+----
+import { t } from 'utils/I18nUtils';
+
+const overviewTypes = {
+  app: t('Apps'),
+  workload: t('Workloads'),
+  service: t('Services')
+};
+
+
+const Example: React.FC<Props> = (props: Props) => {
+  const { t } = useKialiTranslation();
+
+  return (
+    <span>{t(overviewTypes.app)}</span>
+    ...
+  )
+}
+----
+
+- **External function:**
+
+External functions can use the `t` function imported from `utils/i18nUtils` to perform the translations like in React classes or external variables.
+
+[source, typescript]
+----
+import { t } from 'utils/I18nUtils';
+
+const externalFunction = (): React.ReactNode => {
+  return (
+    ...
+      <div>{`${t('Label')}:`}</div>
+    ...
+  )
+}
+
+const Example: React.FC<Props> = (props: Props) => {
+  return (
+    <Tooltip position={TooltipPosition.top} content={externalFunction()}>
+    ...
+    </Tooltip>
+  )
+}
+
+----
+
+**Special i18n cases:**
+
+- **Interpolation:**
+
+You can include any variable value within the translated statement with interpolation. More info link:https://www.i18next.com/translation-function/interpolation[here]
+
+[source, typescript]
+----
+<div>{t('Kiali home cluster: {{clusterName}}', { clusterName: homeCluster?.name })}</div>
+----
+
+The variables are represented with `{{$variable}}`. You can set any name to the variable, you have just to be sure that it matches the json field.
+
+This is how it looks like in the translation file:
+
+[source, json]
+----
+"Kiali home cluster: {{clusterName}}": "Kiali主集群: {{clusterName}}",
+----
+
+- **Plurals:**
+
+When a statement is different in singular and plural, you can use `defaultValue_one` and `defaultValue_other` fields to add different plural statements (no need to add 's' manually anymore). Note that in this case the variable name must be `count`. For convenience the key will be the singular statement. More info link:https://www.i18next.com/translation-function/plurals[here]
+
+[source, typescript]
+----
+labelsInfo = t('{{count}} label', {
+        count: labelsLength,
+        defaultValue_one: '{{count}} label',
+        defaultValue_other: '{{count}} labels'
+      });
+----
+
+=== Integration Testing
+
+Integration testing is done with cypress. More information can be found link:./cypress/README.md[here].
+
+=== Style Code Guide
+
+For component conventions, styling rules, and coding patterns, see the link:https://github.com/kiali/kiali/blob/master/STYLE_GUIDE.adoc#frontend-typescript[STYLE CODE GUIDE].
+
+=== Testing
+To run the tests, use the standard command `yarn test`.
+Since some tests use link:https://rstest.rs/guide/basic/snapshot[snapshots], use the `-u` flag to update them:
+[source,shell]
+----
+yarn test -u
+----
+
+After running the tests, if any snapshot has been modified (check git status),
+the diff should be reviewed to make sure it's an intentional or trivial change.
+Modified snapshots must be part of the commit so that they're reviewed collectively and won't make CI build fail.
+
+== Testing Libraries for Vulnerabilities
+We use github Dependabot for vulnerability testing. Dependabot runs regularly on the `kiali/kiali` repository.
+
+== Production Builds
+Use `yarn build` which will bundle the build artifacts using Rsbuild into the `build` directory.
+
+== License and Copyright
+See the link:https://github.com/kiali/kiali/blob/master/LICENSE[LICENSE file].

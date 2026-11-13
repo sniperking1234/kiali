@@ -1,0 +1,9 @@
+{
+  "reporterEnabled": "spec, mocha-junit-reporter",
+  "mochaJunitReporterReporterOptions": {
+    "mochaFile": "cypress/results/results-[hash].xml",
+    "testCaseSwitchClassnameAndName": true,
+    "jenkinsMode": true,
+    "jenkinsClassnamePrefix": "Kiali"
+  }
+}
